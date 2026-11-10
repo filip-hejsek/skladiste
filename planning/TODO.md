@@ -1,0 +1,41 @@
+# TODO
+
+Plans and open questions. Decisions already made are in DECISIONS.md;
+known bugs are in BUGS.md.
+
+Next priorities: dependency resolution, then install scripts and hooks.
+
+## Arch frontend
+
+- Dependency resolution from repo databases (`core.db`, `extra.db`),
+  with Arch version comparison (`vercmp`) supplied by the frontend
+  rather than the core.
+- Download packages from a mirror in `skl` itself
+  (`scripts/fetch-arch-packages.sh` does this for testing now).
+- Run `.INSTALL` scriptlets and alpm hooks inside the image, e.g. with
+  bubblewrap.
+- Device nodes and FIFOs in packages are rejected; support them if a
+  package needs them.
+
+## Images
+
+- Open question: where to record what an image contains (needed for
+  upgrade and verify). Inside the image (e.g. `/var/lib/skl`), or
+  alongside it outside the image.
+- Open question: ownership in unprivileged builds. Alternatives: map a
+  full uid range in a user namespace (needs uids and capabilities
+  granted to the container), or record ownership in the manifest only
+  and apply it on export.
+- Export to OCI images, or use podman's btrfs storage driver directly.
+- Upgrades and generations using subvolume snapshots, with rollback.
+
+## Store
+
+- Garbage collection of objects no package references.
+- Detect modified files cheaply by comparing extents (FIEMAP) with the
+  store object; on a mismatch, rehash instead of reporting a
+  modification, since defrag also breaks sharing.
+- Later: fs-verity on store objects to make them immutable and
+  tamper-evident. Needs a check that `FICLONE` from an fs-verity file
+  is allowed. The fs-verity digest is a Merkle tree root, not a hash of
+  the plain content, so it would be stored next to the BLAKE3 address.
