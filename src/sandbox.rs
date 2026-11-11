@@ -29,6 +29,9 @@ const LANDLOCK_ABI: ABI = ABI::V9;
 /// builds with the `insecure` feature.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layers {
+    /// Start workers in new namespaces with bubblewrap (see [`crate::bwrap`]).
+    /// Applied by the supervisor, not by [`confine`].
+    pub(crate) namespaces: bool,
     pub(crate) landlock: bool,
     pub(crate) seccomp: bool,
 }
@@ -36,6 +39,7 @@ pub(crate) struct Layers {
 impl Default for Layers {
     fn default() -> Self {
         Layers {
+            namespaces: true,
             landlock: true,
             seccomp: true,
         }
@@ -203,6 +207,7 @@ mod tests {
                 ..Policy::default()
             };
             let layers = Layers {
+                namespaces: false,
                 landlock: true,
                 seccomp: false,
             };
@@ -223,6 +228,7 @@ mod tests {
     fn memory_is_limited() {
         let status = in_child("memory_is_limited", || {
             let layers = Layers {
+                namespaces: false,
                 landlock: false,
                 seccomp: false,
             };
@@ -242,6 +248,7 @@ mod tests {
     fn seccomp_kills(name: &str, call: impl FnOnce()) {
         let status = in_child(name, || {
             let layers = Layers {
+                namespaces: false,
                 landlock: false,
                 seccomp: true,
             };

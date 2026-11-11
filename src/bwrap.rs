@@ -1,0 +1,224 @@
+//! Running workers in new namespaces with bubblewrap (`bwrap`).
+//!
+//! The worker's root is an empty read-only tmpfs holding only what is needed
+//! to execute the `skl` binary (`/usr` and the `/lib*` directories or
+//! symlinks of the host, for the dynamic loader) and the directories given
+//! in [`Namespaces`], bound from fds. It gets new pid, network, ipc, uts and
+//! cgroup namespaces, and a new user namespace unless it must keep the
+//! supervisor's ids (see [`Namespaces::root_caps`]).
+
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Result, bail};
+
+/// Where the `skl` binary is bound inside the sandbox.
+pub(crate) const EXE: &str = "/skl";
+
+/// Host directories (or symlinks to them) the dynamic loader may need.
+const LIB_DIRS: &[&str] = &["/lib", "/lib32", "/lib64", "/libx32"];
+
+/// A directory bound into the sandbox.
+pub(crate) struct Mount<'a> {
+    pub(crate) fd: BorrowedFd<'a>,
+    /// Absolute path inside the sandbox.
+    pub(crate) dest: &'static str,
+    pub(crate) writable: bool,
+}
+
+/// The sandbox of one worker.
+#[derive(Default)]
+pub(crate) struct Namespaces<'a> {
+    pub(crate) mounts: &'a [Mount<'a>],
+    /// When skl runs as root: stay in the supervisor's user namespace,
+    /// keeping only these capabilities, so that file owners mean the same
+    /// inside and outside (needed to apply owners in a user namespace with a
+    /// range of ids mapped). `None`: always use a new user namespace, which
+    /// maps only the supervisor's own uid and gid, with no capabilities.
+    pub(crate) root_caps: Option<&'a [&'a str]>,
+}
+
+/// Find `bwrap` in the supervisor's `PATH`.
+pub(crate) fn find() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("bwrap");
+        if dir.is_absolute() && rustix::fs::access(&candidate, rustix::fs::Access::EXEC_OK).is_ok()
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!("bwrap (bubblewrap) not found in PATH; workers need it to run in new namespaces")
+}
+
+/// A command that runs `bwrap` with `ns`, executing the binary `exe` (an
+/// fd, e.g. `O_PATH`) as [`EXE`]. Append the worker's arguments to it.
+/// Returns the fds that the child must inherit (CLOEXEC cleared) for
+/// `bwrap` to bind them; it closes them before executing the worker.
+pub(crate) fn command(
+    bwrap: &Path,
+    exe: BorrowedFd,
+    ns: &Namespaces,
+) -> Result<(Command, Vec<RawFd>)> {
+    let mut cmd = Command::new(bwrap);
+    let mut fds = vec![exe.as_raw_fd()];
+    cmd.args([
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--die-with-parent",
+        "--new-session",
+    ]);
+    let root = rustix::process::getuid().is_root();
+    match ns.root_caps {
+        Some(caps) if root => {
+            cmd.args(["--cap-drop", "ALL"]);
+            for cap in caps {
+                cmd.args(["--cap-add", cap]);
+            }
+        }
+        _ => {
+            cmd.args(["--unshare-user", "--disable-userns"]);
+            if root {
+                cmd.args(["--cap-drop", "ALL"]);
+            }
+        }
+    }
+    cmd.args(["--ro-bind", "/usr", "/usr"]);
+    for dir in LIB_DIRS {
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) if m.is_symlink() => {
+                let target = std::fs::read_link(dir)?;
+                cmd.arg("--symlink").arg(target).arg(dir);
+            }
+            Ok(m) if m.is_dir() => {
+                cmd.args(["--ro-bind", dir, dir]);
+            }
+            _ => {}
+        }
+    }
+    cmd.args(["--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache"]);
+    cmd.arg("--ro-bind-fd").arg(fd_arg(exe)).arg(EXE);
+    for m in ns.mounts {
+        let opt = if m.writable {
+            "--bind-fd"
+        } else {
+            "--ro-bind-fd"
+        };
+        cmd.arg(opt).arg(fd_arg(m.fd)).arg(m.dest);
+        fds.push(m.fd.as_raw_fd());
+    }
+    // Last: makes the tmpfs root read-only, not the mounts beneath it.
+    cmd.args(["--remount-ro", "/", "--chdir", "/", "--", EXE]);
+    Ok((cmd, fds))
+}
+
+fn fd_arg(fd: BorrowedFd) -> String {
+    fd.as_raw_fd().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::os::fd::AsFd;
+    use std::os::unix::process::CommandExt;
+
+    use super::*;
+
+    const CHILD_VAR: &str = "SKL_BWRAP_TEST_CHILD";
+
+    /// Runs this test binary inside the sandbox (as the child) and checks
+    /// what it can see there.
+    #[test]
+    fn sandbox_has_only_its_mounts() {
+        if std::env::var_os(CHILD_VAR).is_some() {
+            return check_inside();
+        }
+        let bwrap = find().unwrap();
+        let ro = tempfile::tempdir().unwrap();
+        let rw = tempfile::tempdir().unwrap();
+        std::fs::write(ro.path().join("f"), "x").unwrap();
+        let ro_fd = File::open(ro.path()).unwrap();
+        let rw_fd = File::open(rw.path()).unwrap();
+        let exe = File::open(std::env::current_exe().unwrap()).unwrap();
+        let ns = Namespaces {
+            mounts: &[
+                Mount {
+                    fd: ro_fd.as_fd(),
+                    dest: "/ro",
+                    writable: false,
+                },
+                Mount {
+                    fd: rw_fd.as_fd(),
+                    dest: "/rw",
+                    writable: true,
+                },
+            ],
+            root_caps: None,
+        };
+        let (mut cmd, fds) = command(&bwrap, exe.as_fd(), &ns).unwrap();
+        cmd.args([
+            "--exact",
+            "bwrap::tests::sandbox_has_only_its_mounts",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(CHILD_VAR, "1");
+        // SAFETY: fcntl is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                for &fd in &fds {
+                    rustix::io::fcntl_setfd(
+                        BorrowedFd::borrow_raw(fd),
+                        rustix::io::FdFlags::empty(),
+                    )?;
+                }
+                Ok(())
+            });
+        }
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "child {status}");
+        assert_eq!(std::fs::read(rw.path().join("new")).unwrap(), b"y");
+    }
+
+    fn check_inside() {
+        let mut top: Vec<String> = std::fs::read_dir("/")
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| !n.starts_with("lib") && n != "etc")
+            .collect();
+        top.sort();
+        assert_eq!(top, ["ro", "rw", "skl", "usr"]);
+        let erofs = Some(libc::EROFS);
+        let chmod =
+            std::fs::set_permissions("/ro/f", std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        assert_eq!(chmod.unwrap_err().raw_os_error(), erofs);
+        assert_eq!(
+            std::fs::write("/new", "y").unwrap_err().raw_os_error(),
+            erofs
+        );
+        std::fs::write("/rw/new", "y").unwrap();
+        // A new pid namespace, with bwrap's init as pid 1.
+        assert!(std::process::id() < 10, "pid {}", std::process::id());
+        // A new network namespace, with only a loopback interface: no route
+        // to other addresses (connecting a UDP socket sends nothing).
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let err = socket.connect("192.0.2.1:9").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENETUNREACH));
+        // No new user namespaces. unshare needs a single-threaded process.
+        // SAFETY: the child makes only async-signal-safe calls.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let r = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+            let errno = unsafe { *libc::__errno_location() };
+            unsafe { libc::_exit(if r == 0 { 0 } else { errno }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(libc::WEXITSTATUS(status), libc::ENOSPC);
+    }
+}

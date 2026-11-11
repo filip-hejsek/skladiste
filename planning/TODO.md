@@ -48,15 +48,13 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 
 - Supervisor: confine `skl` itself after opening its paths (Landlock with
   the store, the package files and the image's parent directory).
-- The install worker can change metadata (mode, owner, xattrs, times) of
-  store files, which Landlock doesn't restrict; only their content is
-  protected. Fix: bind the store read-only in a mount namespace.
 - Parallel imports: one worker per archive (a compromised worker could
   change another package's metadata), several at once, one supervisor
   thread per worker connection. Concurrent adds of the same object are
   harmless, but may count it as new twice.
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
-  namespaces, root is the image, no access to the store.
+  namespaces, root is the image, no access to the store (can build on
+  `src/bwrap.rs`).
 - Downloader (once skl downloads): network plus a download directory.
   Repo databases are untrusted archives and get parsed like packages.
   Sandboxing a signature verifier protects the host, not the verdict,

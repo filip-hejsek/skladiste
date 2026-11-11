@@ -2,6 +2,7 @@
 
 pub mod arch;
 pub mod btrfs;
+mod bwrap;
 pub mod install;
 pub mod manifest;
 mod sandbox;

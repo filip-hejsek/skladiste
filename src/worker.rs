@@ -2,11 +2,11 @@
 //! `skl` process), each confined to the access it needs.
 //!
 //! The supervisor starts a worker by executing the `skl` binary with the
-//! hidden [`SUBCOMMAND`], handing it only the fds it needs. A fresh exec is
-//! single-threaded and inherits no memory. The worker closes any other
-//! inherited fds and confines itself (Landlock and seccomp) before reading
-//! its input. Both ends are the same binary, so the protocol needs no
-//! stability.
+//! hidden [`SUBCOMMAND`] under bubblewrap (`src/bwrap.rs`), handing it
+//! only the fds and directories it needs. A fresh exec is single-threaded
+//! and inherits no memory. The worker closes any other inherited fds and
+//! confines itself (Landlock and seccomp) before reading its input. Both
+//! ends are the same binary, so the protocol needs no stability.
 //!
 //! Messages are frames: a tag byte, a little-endian `u32` length and the
 //! payload. A worker ends by writing one `DONE` frame (its JSON result) or
@@ -22,9 +22,13 @@
 //!   the supervisor fills in the hashes, so a compromised parser can't put
 //!   content under the wrong hash. No filesystem access, no ioctls.
 //! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
-//!   and the store directory and image root are passed as two more fds. The
-//!   worker installs the files with read access to the store and
-//!   write access to the image.
+//!   and the store directory and image root are bound at `/store`
+//!   (read-only) and `/image` in the worker's mount namespace. The worker
+//!   installs the files with read access to the store and write access to
+//!   the image.
+//!
+//! Directories are passed as paths inside the worker's mount namespace, or
+//! as inherited fd numbers when it runs without namespaces.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -38,6 +42,7 @@ use anyhow::{Context, Result, bail};
 use landlock::AccessFs;
 
 use crate::arch;
+use crate::bwrap::{self, Mount, Namespaces};
 use crate::install::{self, Report};
 use crate::manifest::{Content, Entry, ObjectId, Package};
 use crate::sandbox::{self, Layers, Policy};
@@ -69,6 +74,18 @@ const IMPORT_MAX_MEMORY: u64 = 1 << 30;
 /// (about 40 MiB were enough for an image of 17,000 entries).
 const INSTALL_MAX_MEMORY: u64 = 4 << 30;
 
+/// Capabilities the install worker keeps when skl runs as root: to set
+/// owners, then modes (including setuid and setgid bits), times and xattrs
+/// (including `security.capability`) of entries it no longer owns, and to
+/// create entries in directories whose permissions don't allow it.
+const INSTALL_CAPS: &[&str] = &[
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_SETFCAP",
+];
+
 /// Statistics about an import, counted by the supervisor.
 #[derive(Debug, Default)]
 pub struct ImportStats {
@@ -91,6 +108,12 @@ impl Workers {
             exe: exe.into(),
             layers: Layers::default(),
         }
+    }
+
+    /// Run workers without new namespaces (and without bubblewrap).
+    #[cfg(feature = "insecure")]
+    pub fn disable_namespaces(&mut self) {
+        self.layers.namespaces = false;
     }
 
     /// Run workers without Landlock, e.g. where an outer container blocks it.
@@ -116,7 +139,7 @@ impl Workers {
             None,
         )
         .context("creating socket")?;
-        let worker = self.spawn("import-arch", archive.into(), theirs, &[])?;
+        let worker = self.spawn("import-arch", archive.into(), theirs, &[], None)?;
         // Nothing is sent to the worker.
         rustix::net::shutdown(&ours, rustix::net::Shutdown::Write)
             .context("shutting down socket")?;
@@ -127,12 +150,26 @@ impl Workers {
     }
 
     /// Run [`install::populate`] in a worker that can read only the store
-    /// and write only beneath `root`.
+    /// and write only beneath `root`. The store is bound read-only, so the
+    /// worker can't change metadata of its files either (Landlock doesn't
+    /// restrict that).
     pub(crate) fn install(&self, store: &Store, plan: &[&Entry], root: &OwnedFd) -> Result<Report> {
         use rustix::pipe::{PipeFlags, pipe_with};
         let (plan_r, plan_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
         let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-        let worker = self.spawn("install", plan_r, result_w, &[store.dir(), root.as_fd()])?;
+        let dirs = [
+            Mount {
+                fd: store.dir(),
+                dest: "/store",
+                writable: false,
+            },
+            Mount {
+                fd: root.as_fd(),
+                dest: "/image",
+                writable: true,
+            },
+        ];
+        let worker = self.spawn("install", plan_r, result_w, &dirs, Some(INSTALL_CAPS))?;
         // The worker reads the whole plan before it writes a result, unless
         // it fails; then its error message explains the broken pipe.
         let sent = send_json(plan_w, plan);
@@ -143,22 +180,42 @@ impl Workers {
         worker.finish(result)
     }
 
-    /// Start worker `kind` with `stdin` and `stdout` as fds 0 and 1. `extra`
-    /// fds are inherited under their current numbers, which are passed as
-    /// arguments. Stderr is a pipe; see [`Worker::finish`].
+    /// Start worker `kind` with `stdin` and `stdout` as fds 0 and 1, and
+    /// `dirs` bound in its mount namespace, their paths passed as arguments.
+    /// Without namespaces, the fds of `dirs` are inherited under their
+    /// current numbers instead, and the numbers passed. `root_caps`: see
+    /// [`Namespaces::root_caps`]. Stderr is a pipe; see [`Worker::finish`].
     fn spawn(
         &self,
         kind: &'static str,
         stdin: OwnedFd,
         stdout: OwnedFd,
-        extra: &[BorrowedFd],
+        dirs: &[Mount],
+        root_caps: Option<&[&str]>,
     ) -> Result<Worker> {
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg(SUBCOMMAND).arg(kind);
-        let raw: Vec<RawFd> = extra.iter().map(|fd| fd.as_raw_fd()).collect();
-        for fd in &raw {
-            cmd.arg(fd.to_string());
-        }
+        let exe_fd: OwnedFd;
+        let (mut cmd, raw) = if self.layers.namespaces {
+            let bwrap = bwrap::find()?;
+            use rustix::fs::{Mode, OFlags};
+            exe_fd = rustix::fs::open(&self.exe, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+                .with_context(|| format!("opening {}", self.exe.display()))?;
+            let ns = Namespaces {
+                mounts: dirs,
+                root_caps,
+            };
+            let (mut cmd, raw) = bwrap::command(&bwrap, exe_fd.as_fd(), &ns)?;
+            cmd.arg(SUBCOMMAND).arg(kind);
+            cmd.args(dirs.iter().map(|d| d.dest));
+            (cmd, raw)
+        } else {
+            let mut cmd = Command::new(&self.exe);
+            cmd.arg(SUBCOMMAND).arg(kind);
+            let raw: Vec<RawFd> = dirs.iter().map(|d| d.fd.as_raw_fd()).collect();
+            for fd in &raw {
+                cmd.arg(fd.to_string());
+            }
+            (cmd, raw)
+        };
         if !self.layers.landlock {
             cmd.arg("--no-landlock");
         }
@@ -274,7 +331,12 @@ fn sanitize(s: &str) -> String {
 }
 
 fn describe(status: ExitStatus) -> String {
-    match status.signal() {
+    // bwrap exits with 128 + the signal that killed the worker. Workers
+    // and bwrap itself exit with small codes.
+    let signal = status
+        .signal()
+        .or_else(|| status.code().filter(|&c| c > 128).map(|c| c - 128));
+    match signal {
         Some(libc::SIGSYS) => {
             "was killed by SIGSYS (it made a system call its seccomp filter doesn't allow)"
                 .to_owned()
@@ -467,33 +529,44 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
     });
     let kind = args.next().context("missing worker kind")??;
     let mut layers = Layers::default();
-    let mut fds = Vec::new();
+    // Directories: absolute paths, or inherited fd numbers.
+    let mut dirs: Vec<Result<String, RawFd>> = Vec::new();
     for arg in args {
         match arg?.as_str() {
             "--no-landlock" => layers.landlock = insecure_option()?,
             "--no-seccomp" => layers.seccomp = insecure_option()?,
+            path if path.starts_with('/') => dirs.push(Ok(path.to_owned())),
             fd => {
                 let fd: RawFd = fd.parse().with_context(|| format!("bad fd {fd:?}"))?;
                 anyhow::ensure!(fd > 2, "bad fd {fd}");
-                fds.push(fd);
+                dirs.push(Err(fd));
             }
         }
     }
-    close_other_fds(&fds)?;
-    // SAFETY: these fds were inherited from the supervisor for this worker,
-    // and closing the others above makes them the only owners.
-    let fds: Vec<OwnedFd> = fds
+    let inherited: Vec<RawFd> = dirs.iter().filter_map(|d| d.clone().err()).collect();
+    close_other_fds(&inherited)?;
+    let dirs = dirs
         .into_iter()
-        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-        .collect();
+        .map(|dir| match dir {
+            Ok(path) => {
+                use rustix::fs::{Mode, OFlags};
+                let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                rustix::fs::open(&path, flags, Mode::empty())
+                    .with_context(|| format!("opening {path}"))
+            }
+            // SAFETY: these fds were inherited from the supervisor for this
+            // worker, and closing the others above makes them the only owners.
+            Err(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        })
+        .collect::<Result<Vec<OwnedFd>>>()?;
     match kind.as_str() {
-        "import-arch" if fds.is_empty() => import_worker(layers, out),
+        "import-arch" if dirs.is_empty() => import_worker(layers, out),
         "install" => {
-            let [store, root] = <[OwnedFd; 2]>::try_from(fds)
-                .map_err(|_| anyhow::anyhow!("install worker needs two fds"))?;
+            let [store, root] = <[OwnedFd; 2]>::try_from(dirs)
+                .map_err(|_| anyhow::anyhow!("install worker needs two directories"))?;
             install_worker(layers, store, root)
         }
-        kind => bail!("unknown worker {kind:?} or wrong number of fds"),
+        kind => bail!("unknown worker {kind:?} or wrong number of directories"),
     }
 }
 

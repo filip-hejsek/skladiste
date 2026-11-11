@@ -97,8 +97,9 @@ are in BUGS.md.
   exec is unsafe in a multithreaded process. Both ends are the same
   binary, so the protocol needs no stability. The environment is cleared
   and the working directory is `/`.
-- Fds for a worker are inherited at their own numbers (CLOEXEC cleared
-  in the child before exec), and the numbers passed as arguments. Rejected:
+- Fds for a worker (and for bwrap to bind) are inherited at their own
+  numbers (CLOEXEC cleared in the child before exec), and the numbers
+  passed as arguments. Rejected:
   `dup2` to fixed numbers in `pre_exec`, which can clobber the pipe std
   uses to report exec errors. The worker closes every other fd except
   stdio before confining itself, since Landlock and seccomp don't affect
@@ -115,6 +116,28 @@ are in BUGS.md.
   the terminal); a thread or `poll` to drain the pipe while the worker
   runs (a blocking worker could deadlock with a supervisor that waits on
   another fd; more code for output that's rarely there).
+- Workers start in new namespaces under bubblewrap (`src/bwrap.rs`), then
+  confine themselves with Landlock and seccomp. bwrap is found in the
+  supervisor's `PATH`. The root is an empty read-only tmpfs with the
+  host's `/usr` and `/lib*` (for the dynamic loader, `/etc/ld.so.cache` if
+  present), the `skl` binary bound from an `O_PATH` fd at `/skl`, and the
+  worker's directories bound from their fds at fixed paths, which the
+  worker opens before confining itself. New pid, net, ipc, uts and cgroup
+  namespaces; `--die-with-parent` and `--new-session`. bwrap exits with
+  128 + the signal that killed the worker, which is reported like the
+  signal itself. Namespaces add what Landlock lacks: a read-only store
+  (Landlock doesn't restrict metadata changes), no view of host processes
+  or network, and a hidden host filesystem during exec, before Landlock
+  applies.
+- User namespaces in workers: the install worker stays in the
+  supervisor's user namespace when skl runs as root, keeping only
+  `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID` and
+  `CAP_SETFCAP`, so owners apply in a user namespace with a range of ids
+  mapped. bwrap can map only one id in a new user namespace without
+  setuid. Otherwise (import worker, or skl not root) a worker gets a new
+  user namespace mapping only skl's uid and gid, with no capabilities and
+  `--disable-userns`. Xattrs that need `CAP_SYS_ADMIN` (`trusted.*`,
+  `security.*` other than `security.capability`) are counted as failures.
 - Workers confine themselves (`src/sandbox.rs`): `no_new_privs`, then
   Landlock (all filesystem access handled, plus TCP and the abstract
   socket and signal scopes; only the given directory fds are allowed),
@@ -184,9 +207,8 @@ are in BUGS.md.
   (Landlock: read files) and the image root fd (read dirs, write files,
   create dirs, files and symlinks, link across dirs), and only `FICLONE`
   as an ioctl, since Landlock doesn't restrict btrfs ioctls such as
-  subvolume creation. The worker runs in the supervisor's user
-  namespace, so owners are applied when skl runs with a uid range
-  mapped.
+  subvolume creation. The store is bound read-only and the image
+  read-write in its mount namespace.
 - Workers end with one result or error message; an error the worker
   sent is reported in preference to its exit status, and death by
   `SIGSYS` is reported as a blocked system call.
@@ -194,18 +216,22 @@ are in BUGS.md.
   file is parsed, so the manifest always matches the id.
 - Package code (install scripts, hooks) runs under an existing sandbox
   tool, bubblewrap for now (minijail or nsjail would also do). Rejected:
-  setting up namespaces ourselves; no clear benefit for more code.
-  Workers running skl's own code sandbox themselves (Landlock, seccomp).
+  setting up namespaces ourselves; no clear benefit for more code. Workers
+  running skl's own code also start under bubblewrap and add Landlock and
+  seccomp themselves.
 - If a sandboxing layer is unavailable, skl refuses to run. The escape
   hatch is the `insecure` cargo feature (off by default), which adds
-  `--insecure-no-landlock` and `--insecure-no-seccomp`; workers reject
-  these options in builds without it.
+  `--insecure-no-namespaces` (workers run without bwrap and get their
+  directories as fds), `--insecure-no-landlock` and
+  `--insecure-no-seccomp`; workers reject the last two in builds without
+  it.
 - Checked on Linux 7.2: `FICLONE` works across bind mounts of the same
-  filesystem, so a mount namespace can bind the store and image
-  separately. Landlock doesn't restrict btrfs ioctls (subvolume creation
+  filesystem, including from a read-only bind mount, so a mount namespace
+  can bind the store read-only and the image separately. Landlock doesn't restrict btrfs ioctls (subvolume creation
   succeeds where it blocks `mkdir`) or `FICLONE`.
 - Tests of the layers themselves re-run the unit test binary as a child
-  that confines itself, since confinement can't be undone.
+  that confines itself (or under bwrap), since confinement can't be
+  undone.
 
 ## Tests
 

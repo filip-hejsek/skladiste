@@ -18,6 +18,11 @@ struct Cli {
     #[arg(long, env = "SKL_STORE")]
     store: PathBuf,
 
+    /// Run workers without new namespaces and bubblewrap (INSECURE).
+    #[cfg(feature = "insecure")]
+    #[arg(long)]
+    insecure_no_namespaces: bool,
+
     /// Run workers without Landlock (INSECURE).
     #[cfg(feature = "insecure")]
     #[arg(long)]
@@ -71,6 +76,9 @@ fn run(cli: Cli) -> Result<()> {
     let mut workers = Workers::new("/proc/self/exe");
     #[cfg(feature = "insecure")]
     {
+        if cli.insecure_no_namespaces {
+            workers.disable_namespaces();
+        }
         if cli.insecure_no_landlock {
             workers.disable_landlock();
         }
