@@ -51,9 +51,16 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - The install worker can change metadata (mode, owner, xattrs, times) of
   store files, which Landlock doesn't restrict; only their content is
   protected. Fix: bind the store read-only in a mount namespace.
-- Avoid copying file contents through the import socket: the worker
-  writes files and passes their fds, and the supervisor reflinks them
-  into the store before hashing (the worker can't change a clone).
+- Avoid copying file contents through the import socket: the supervisor
+  creates `O_TMPFILE` files in a staging directory on the store's
+  filesystem and sends the worker write-only fds (reopened through
+  `/proc/self/fd`, so the worker gets its own file description), sent
+  ahead in batches. The worker reports each file as done with its size;
+  the supervisor reflinks the file from its own fd into the store and
+  hashes the clone (the worker can't change a clone), with the size
+  taken from the clone. Small files stay inline in the socket. Set
+  `RLIMIT_FSIZE` on the import worker once it can write files. See
+  "Import file contents" in DECISIONS.md.
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
   namespaces, root is the image, no access to the store.
 - Downloader (once skl downloads): network plus a download directory.

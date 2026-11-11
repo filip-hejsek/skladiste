@@ -144,6 +144,17 @@ are in BUGS.md.
   (`Package::validate`) and that every file's hash and size were
   returned by the store during that import, and counts the import
   statistics itself.
+- Import file contents (planned, see TODO.md): the supervisor creates
+  the files and hands the worker write fds, keeping its own fd to each,
+  so the worker still has no filesystem access and no fds come back
+  from the worker. Append-only fds aren't used: hashing the clone
+  already makes later writes harmless. Rejected: a writable directory
+  for the worker (more Landlock rights, the supervisor would have to
+  clean up names chosen by the worker and check fds it sends back);
+  pipes with `splice` (the kernel still copies from a pipe into a file,
+  and the supervisor would have to read the file back to hash it, so
+  no fewer copies than the socket; `vmsplice` saves one copy, but the
+  worker can't tell when it may reuse its buffer).
 - The supervisor (the `skl` process) is the only writer of the store and
   creates the image subvolume. It merges packages (conflict checks) and
   sends the plan to the install worker, which gets the store fd
