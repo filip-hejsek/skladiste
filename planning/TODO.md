@@ -12,6 +12,12 @@ Next priorities: dependency resolution, then install scripts and hooks.
   rather than the core.
 - Download packages from a mirror in `skl` itself
   (`scripts/fetch-arch-packages.sh` does this for testing now).
+  Import each archive as soon as it arrives. Download order matters
+  more than import order: this is a two-stage flow shop, where Johnson's
+  rule is optimal for one downloader and one importer. Downloading is
+  usually slower, which gives largest import first. Sizes are known
+  beforehand from the repo database (`%CSIZE%`, `%ISIZE%`). To measure
+  once it exists.
 - Run `.INSTALL` scriptlets and alpm hooks inside the image, in a
   sandbox (see Sandboxing).
 - Device nodes and FIFOs in packages are rejected; support them if a
