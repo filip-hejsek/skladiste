@@ -139,25 +139,26 @@ are in BUGS.md.
 - The import worker gets the archive as stdin and a socket as stdout, no
   filesystem access and no ioctls. It streams file contents to the
   supervisor, which writes and hashes them and replies with the hash
-  (one round trip per file; importing is about 10% slower than in
-  process). The supervisor checks the returned manifest
-  (`Package::validate`) and that every file's hash and size were
-  returned by the store during that import, and counts the import
-  statistics itself.
-- File contents stay in the import socket; avoiding the copy isn't
-  worth it. Importing 17 Arch packages (140 MiB in files of 64 KiB or
-  more) took 1.09 s through the socket, and copying through it costs
-  only about 35 ms of system time. Rejected (prototypes measured with
-  files of 64 KiB or more written by the worker to a staging
-  `O_TMPFILE` that the supervisor created): reflinking it into the store
-  and hashing the clone (1.69 s: `FICLONE` waits for the source to be
-  written to disk, and the clone isn't in the page cache, so hashing
-  reads from disk); hashing and linking the staging file itself after a
-  read lease (`F_SETLEASE`) shows that nothing has it open for writing
-  (1.19 s: the worker waits while the supervisor hashes, where the
-  socket lets both run at once; removing the per-file reply would need
-  the supervisor to fill hashes into the manifest, for a few percent at
-  best); a writable directory for the worker (more Landlock rights,
+  (one round trip per file; importing is about 16% slower than in
+  process, because of the round trip, see TODO.md). The supervisor
+  checks the returned manifest (`Package::validate`) and that every
+  file's hash and size were returned by the store during that import,
+  and counts the import statistics itself.
+- File contents stay in the import socket; avoiding the copy isn't worth
+  it. Importing 17 Arch packages (8,300 files, 185 MiB; 140 MiB in files
+  of 64 KiB or more) took 1.07 s through the socket and 0.92 s in
+  process. Sending everything through the socket a second time added
+  0.09 s, but leaving out the per-file reply took it to 0.81 s: the
+  round trip makes import slower, not the copy. Rejected (prototypes
+  measured with files of 64 KiB or more written by the worker to a
+  staging `O_TMPFILE` that the supervisor created): reflinking it into
+  the store and hashing the clone (1.69 s: `FICLONE` waits for the
+  source to be written to disk, and the clone isn't in the page cache,
+  so hashing reads from disk); hashing and linking the staging file
+  itself after a read lease (`F_SETLEASE`) shows that nothing has it
+  open for writing (1.19 s: the worker waits while the supervisor reads
+  and hashes the whole file, where the socket lets both run during a
+  file); a writable directory for the worker (more Landlock rights,
   names and fds from the worker to check); pipes with `splice` (the
   kernel copies from a pipe into a file, and hashing needs a read back).
 - The supervisor (the `skl` process) is the only writer of the store and

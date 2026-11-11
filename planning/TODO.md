@@ -51,6 +51,12 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - The install worker can change metadata (mode, owner, xattrs, times) of
   store files, which Landlock doesn't restrict; only their content is
   protected. Fix: bind the store read-only in a mount namespace.
+- Import without a round trip per file: the worker doesn't wait for
+  hashes; the supervisor fills them into the manifest in the order it
+  received the objects (the worker can't name hashes at all then).
+  Measured with dummy hashes: 0.81 s instead of 1.07 s for 17 Arch
+  packages, faster than in process (0.92 s), since parsing and storing
+  overlap. See the import worker entries in DECISIONS.md.
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
   namespaces, root is the image, no access to the store.
 - Downloader (once skl downloads): network plus a download directory.
