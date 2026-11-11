@@ -99,6 +99,15 @@ are in BUGS.md.
   file is parsed, so the manifest always matches the id.
 - The supervisor creates the image subvolume; the installer only fills
   it through the root fd.
+- Package code (install scripts, hooks) runs under an existing sandbox
+  tool, bubblewrap for now (minijail or nsjail would also do). Rejected:
+  setting up namespaces ourselves; no clear benefit for more code.
+  Workers running skl's own code sandbox themselves (Landlock, seccomp).
+- If a sandboxing layer is unavailable, skl refuses to run by default.
+  An escape hatch is unavoidable (some systems disable unprivileged user
+  namespaces, or an outer container blocks Landlock), but options that
+  reduce security are only available in builds with a cargo feature
+  that enables them.
 - Checked on Linux 7.2: `FICLONE` works across bind mounts of the same
   filesystem, so a mount namespace can bind the store and image
   separately. Landlock doesn't restrict btrfs ioctls (subvolume creation

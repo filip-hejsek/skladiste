@@ -62,13 +62,11 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - Installer worker: Landlock with the store read-only and the image
   writable; possibly in a user namespace with a uid range mapped, for
   chown (see the ownership question under Images).
-- Script runner: full container (user, mount, pid, net, ipc, uts
-  namespaces), root is the image, no access to the store.
+- Script runner: bubblewrap with user, mount, pid, net, ipc and uts
+  namespaces, root is the image, no access to the store.
 - Downloader (once skl downloads): network plus a download directory.
   Repo databases are untrusted archives and get parsed like packages.
   Sandboxing a signature verifier protects the host, not the verdict,
   so verification should use a memory-safe implementation.
-- Open question: own namespace setup or bubblewrap for the script runner.
-- Open question: what to do when a layer is unavailable (Landlock off,
-  unprivileged user namespaces disabled, or blocked by an outer
-  container's seccomp): fail, or warn and run with what is available.
+- The escape hatch for missing sandboxing layers: a cargo feature (off
+  by default) that adds runtime options to run without them.
