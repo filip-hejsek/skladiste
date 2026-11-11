@@ -138,20 +138,37 @@ are in BUGS.md.
   anyway), a kernel without Landlock is refused.
 - The import worker gets the archive as stdin and a socket as stdout, no
   filesystem access and no ioctls. It streams file contents to the
-  supervisor, which writes and hashes them and replies with the hash
-  (one round trip per file; importing is about 16% slower than in
-  process, because of the round trip, see TODO.md). The supervisor
-  checks the returned manifest (`Package::validate`) and that every
-  file's hash and size were returned by the store during that import,
-  and counts the import statistics itself.
+  supervisor without waiting for anything: data flows only from the
+  worker (the supervisor shuts down its sending side), so neither side
+  can block the other. Each object is `BEGIN` with its size, then
+  `CHUNK`s of exactly that many bytes; an `ERROR` can come between
+  chunks, e.g. when the archive is corrupt in the middle of a file.
+  The supervisor writes and hashes the objects as they arrive.
+- Frontends get no hashes: `ObjectSink::add_object` returns an
+  `ObjectId`, the object's position in the stream, and the manifest
+  (`Package<ObjectId>`) refers to files by id. The supervisor resolves
+  ids to hash and size (`Package::resolve`), validates the result
+  (`Package::validate`) and counts the import statistics itself. Ids are
+  explicit rather than implied by the order of file entries, so formats
+  whose metadata doesn't come in content order need no change.
+  Rejected: a reply with the hash for each file (the worker waits
+  for every file; 1.07 s instead of 0.77 s below); the worker naming
+  hashes the supervisor checks (the worker would hash everything again).
+- Both ends of a worker's output buffer it (64 KiB), so the many small
+  files of a package cost few system calls; chunks of 64 KiB bypass the
+  buffer. The final `DONE` or `ERROR` goes through the same buffer, so
+  it can't overtake earlier messages. Not done: a 64 KiB copy buffer in
+  `Store::add_object` instead of `io::copy`'s 8 KiB (0.75 s instead of
+  0.77 s, close to noise).
 - File contents stay in the import socket; avoiding the copy isn't worth
   it. Importing 17 Arch packages (8,300 files, 185 MiB; 140 MiB in files
-  of 64 KiB or more) took 1.07 s through the socket and 0.92 s in
-  process. Sending everything through the socket a second time added
-  0.09 s, but leaving out the per-file reply took it to 0.81 s: the
-  round trip makes import slower, not the copy. Rejected (prototypes
-  measured with files of 64 KiB or more written by the worker to a
-  staging `O_TMPFILE` that the supervisor created): reflinking it into
+  of 64 KiB or more) takes 0.77 s through the socket and took 0.92 s in
+  process, where parsing and storing don't overlap. With a reply per
+  file it took 1.07 s, and sending everything through the socket a
+  second time added only 0.09 s: the round trip was the cost, not the
+  copy. Rejected (prototypes measured with files of 64 KiB or more
+  written by the worker to a staging `O_TMPFILE` that the supervisor
+  created): reflinking it into
   the store and hashing the clone (1.69 s: `FICLONE` waits for the
   source to be written to disk, and the clone isn't in the page cache,
   so hashing reads from disk); hashing and linking the staging file

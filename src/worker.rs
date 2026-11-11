@@ -10,19 +10,22 @@
 //!
 //! Messages are frames: a tag byte, a little-endian `u32` length and the
 //! payload. A worker ends by writing one `DONE` frame (its JSON result) or
-//! one `ERROR` frame (a message) to fd 1.
+//! one `ERROR` frame (a message) to fd 1. Workers write fd 1 through a
+//! buffer, so many small messages cost one system call.
 //!
 //! - `import-arch`: fd 0 is the package archive, fd 1 a socket. The worker
 //!   parses the archive with [`arch::import`] and streams each file's content
-//!   (`BEGIN`, `CHUNK`…, `END`). The supervisor stores and hashes it and
-//!   replies with the hash, so a compromised parser can't put content under
-//!   the wrong hash. No filesystem access, no ioctls.
+//!   (`BEGIN` with the size, then `CHUNK`s with exactly that many bytes). Data
+//!   flows only from the worker: it never waits for the supervisor, which
+//!   stores and hashes the objects as they arrive. The manifest in `DONE`
+//!   refers to objects by their position in the stream ([`ObjectId`]), and
+//!   the supervisor fills in the hashes, so a compromised parser can't put
+//!   content under the wrong hash. No filesystem access, no ioctls.
 //! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
 //!   and the store directory and image root are passed as two more fds. The
 //!   worker installs the files with read access to the store and
 //!   write access to the image.
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -36,9 +39,9 @@ use landlock::AccessFs;
 
 use crate::arch;
 use crate::install::{self, Report};
-use crate::manifest::{Entry, EntryKind, Hash, Package};
+use crate::manifest::{Content, Entry, ObjectId, Package};
 use crate::sandbox::{self, Layers, Policy};
-use crate::store::{Added, ObjectSink, Store};
+use crate::store::{ObjectSink, Store};
 
 /// First argument that makes `skl` run as a worker. `main` must check for
 /// it before doing anything else.
@@ -46,17 +49,17 @@ pub const SUBCOMMAND: &str = "__worker";
 
 const BEGIN: u8 = 1;
 const CHUNK: u8 = 2;
-const END: u8 = 3;
-const DONE: u8 = 4;
-const ERROR: u8 = 5;
+const DONE: u8 = 3;
+const ERROR: u8 = 4;
 
 /// Chunk size the worker sends; the supervisor accepts up to [`MAX_CHUNK`].
 const CHUNK_SIZE: usize = 64 << 10;
 const MAX_CHUNK: usize = 1 << 20;
 const MAX_DONE: usize = 256 << 20;
 const MAX_ERROR: usize = 64 << 10;
-/// Reply to an object: hash, size (`u64` LE), and whether it was new.
-const REPLY_LEN: usize = 32 + 8 + 1;
+/// Buffer size for writing and reading messages. Chunks at least this
+/// large bypass the buffer.
+const BUF_SIZE: usize = CHUNK_SIZE;
 
 /// Address space limit of the import worker. Real packages need tens of
 /// MiB; zstd's default limit on the decoding window is 128 MiB, and very
@@ -114,7 +117,10 @@ impl Workers {
         )
         .context("creating socket")?;
         let worker = self.spawn("import-arch", archive.into(), theirs, &[])?;
-        let mut conn = File::from(ours);
+        // Nothing is sent to the worker.
+        rustix::net::shutdown(&ours, rustix::net::Shutdown::Write)
+            .context("shutting down socket")?;
+        let mut conn = BufReader::with_capacity(BUF_SIZE, File::from(ours));
         let result = receive_import(store, &mut conn);
         drop(conn);
         worker.finish(result)
@@ -293,13 +299,12 @@ impl std::fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
-fn write_frame(mut w: impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
+fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len()).map_err(io::Error::other)?;
-    let mut frame = Vec::with_capacity(5 + payload.len());
-    frame.push(tag);
-    frame.extend(len.to_le_bytes());
-    frame.extend(payload);
-    w.write_all(&frame)
+    let mut header = [tag, 0, 0, 0, 0];
+    header[1..].copy_from_slice(&len.to_le_bytes());
+    w.write_all(&header)?;
+    w.write_all(payload)
 }
 
 fn read_header(mut r: impl Read) -> io::Result<(u8, usize)> {
@@ -342,18 +347,20 @@ fn send_json(fd: OwnedFd, value: &(impl serde::Serialize + ?Sized)) -> Result<()
 }
 
 /// Supervisor side of `import-arch`.
-fn receive_import(store: &Store, conn: &mut File) -> Result<(Package, ImportStats)> {
+fn receive_import(store: &Store, conn: &mut BufReader<File>) -> Result<(Package, ImportStats)> {
     let mut stats = ImportStats::default();
-    // Objects added during this import, with their sizes.
-    let mut objects: HashMap<Hash, u64> = HashMap::new();
+    // Content of each object, in the order received.
+    let mut objects: Vec<Content> = Vec::new();
     loop {
         let (tag, len) = read_header(&mut *conn).context("reading from worker")?;
         match tag {
-            BEGIN if len == 0 => {
+            BEGIN if len == 8 => {
+                let mut size = [0u8; 8];
+                conn.read_exact(&mut size).context("reading from worker")?;
                 let mut reader = ObjectReader {
                     conn: &mut *conn,
+                    left: u64::from_le_bytes(size),
                     remaining: 0,
-                    done: false,
                     error: None,
                 };
                 let added = store.add_object(&mut reader);
@@ -361,24 +368,22 @@ fn receive_import(store: &Store, conn: &mut File) -> Result<(Package, ImportStat
                     return Err(e.into());
                 }
                 let added = added?;
-                anyhow::ensure!(reader.done, "worker sent no end of object");
                 stats.files += 1;
                 if added.new {
                     stats.new_objects += 1;
                     stats.new_bytes += added.size;
                 }
-                objects.insert(added.hash, added.size);
-                let mut reply = [0u8; REPLY_LEN];
-                reply[..32].copy_from_slice(&added.hash.0);
-                reply[32..40].copy_from_slice(&added.size.to_le_bytes());
-                reply[40] = added.new.into();
-                conn.write_all(&reply).context("replying to worker")?;
+                objects.push(Content {
+                    hash: added.hash,
+                    size: added.size,
+                });
             }
             DONE => {
                 let json = read_payload(&mut *conn, len, MAX_DONE)?;
-                let pkg: Package =
+                let pkg: Package<ObjectId> =
                     serde_json::from_slice(&json).context("parsing manifest from worker")?;
-                check_manifest(&pkg, &objects)?;
+                let pkg = pkg.resolve(&objects)?;
+                pkg.validate()?;
                 return Ok((pkg, stats));
             }
             ERROR => return Err(read_error(conn, len)),
@@ -387,28 +392,13 @@ fn receive_import(store: &Store, conn: &mut File) -> Result<(Package, ImportStat
     }
 }
 
-/// Check a manifest from a worker: its invariants, and that every file
-/// refers to an object stored during this import, with the right size.
-fn check_manifest(pkg: &Package, objects: &HashMap<Hash, u64>) -> Result<()> {
-    pkg.validate()?;
-    for entry in &pkg.entries {
-        if let EntryKind::File { hash, size } = &entry.kind {
-            anyhow::ensure!(
-                objects.get(hash) == Some(size),
-                "/{}: content {hash} of size {size} was not received from the worker",
-                entry.path
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Reads one object's content from `CHUNK` frames until `END`.
+/// Reads one object's content from `CHUNK` frames, up to its size.
 struct ObjectReader<'a> {
-    conn: &'a mut File,
+    conn: &'a mut BufReader<File>,
+    /// Bytes of the object not yet read.
+    left: u64,
     /// Bytes left in the current chunk.
     remaining: usize,
-    done: bool,
     /// An error the worker reported instead of finishing the object.
     error: Option<WorkerError>,
 }
@@ -416,18 +406,26 @@ struct ObjectReader<'a> {
 impl Read for ObjectReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while self.remaining == 0 {
-            if self.done {
+            if self.left == 0 {
                 return Ok(0);
             }
             let (tag, len) = read_header(&mut *self.conn)?;
             match tag {
-                CHUNK if len <= MAX_CHUNK => self.remaining = len,
-                END if len == 0 => self.done = true,
+                CHUNK if len <= MAX_CHUNK && len as u64 <= self.left => {
+                    self.remaining = len;
+                    self.left -= len as u64;
+                }
                 ERROR => {
                     let e = read_error(&mut *self.conn, len);
                     let msg = format!("{e:#}");
                     self.error = Some(WorkerError(msg.clone()));
                     return Err(io::Error::other(msg));
+                }
+                CHUNK => {
+                    return Err(io::Error::other(format!(
+                        "worker sent a chunk of {len} bytes where at most {} were left",
+                        self.left.min(MAX_CHUNK as u64)
+                    )));
                 }
                 _ => {
                     return Err(io::Error::other(format!(
@@ -447,12 +445,14 @@ impl Read for ObjectReader<'_> {
 /// [`SUBCOMMAND`].
 pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     // SAFETY: the supervisor always passes fd 1; nothing else uses it.
-    let out = unsafe { File::from_raw_fd(1) };
-    let (tag, payload, code) = match run(args, &out) {
+    let mut out = BufWriter::with_capacity(BUF_SIZE, unsafe { File::from_raw_fd(1) });
+    // The last message goes through the same buffer as any earlier ones, so
+    // it can't overtake them.
+    let (tag, payload, code) = match run(args, &mut out) {
         Ok(json) => (DONE, json, ExitCode::SUCCESS),
         Err(e) => (ERROR, format!("{e:#}").into_bytes(), ExitCode::FAILURE),
     };
-    if let Err(e) = write_frame(&out, tag, &payload) {
+    if let Err(e) = write_frame(&mut out, tag, &payload).and_then(|()| out.flush()) {
         // Not eprintln!, which panics if the stderr pipe is full.
         let _ = writeln!(io::stderr(), "sending result: {e}");
         return ExitCode::FAILURE;
@@ -460,7 +460,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     code
 }
 
-fn run(args: impl Iterator<Item = OsString>, out: &File) -> Result<Vec<u8>> {
+fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
     let mut args = args.map(|a| {
         a.into_string()
             .map_err(|a| anyhow::anyhow!("bad argument {a:?}"))
@@ -530,7 +530,7 @@ fn close_other_fds(keep: &[RawFd]) -> Result<()> {
     close(first, u32::MAX)
 }
 
-fn import_worker(layers: Layers, out: &File) -> Result<Vec<u8>> {
+fn import_worker(layers: Layers, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
     // SAFETY: the supervisor passes the archive as fd 0.
     let archive = unsafe { File::from_raw_fd(0) };
     let policy = Policy {
@@ -541,6 +541,7 @@ fn import_worker(layers: Layers, out: &File) -> Result<Vec<u8>> {
     let sink = RemoteSink {
         conn: out,
         buf: vec![0; CHUNK_SIZE],
+        next: 0,
     };
     let pkg = arch::import(archive, sink)?;
     Ok(serde_json::to_vec(&pkg)?)
@@ -548,13 +549,16 @@ fn import_worker(layers: Layers, out: &File) -> Result<Vec<u8>> {
 
 /// Worker side of `import-arch`: sends contents to the supervisor.
 struct RemoteSink<'a> {
-    conn: &'a File,
+    conn: &'a mut BufWriter<File>,
     buf: Vec<u8>,
+    /// Id of the next object.
+    next: u64,
 }
 
 impl ObjectSink for RemoteSink<'_> {
-    fn add_object(&mut self, content: &mut dyn Read) -> Result<Added> {
-        write_frame(self.conn, BEGIN, &[])?;
+    fn add_object(&mut self, size: u64, content: &mut dyn Read) -> Result<ObjectId> {
+        write_frame(self.conn, BEGIN, &size.to_le_bytes())?;
+        let mut left = size;
         loop {
             let n = match content.read(&mut self.buf) {
                 Ok(0) => break,
@@ -562,18 +566,15 @@ impl ObjectSink for RemoteSink<'_> {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
             };
+            left = left
+                .checked_sub(n as u64)
+                .context("content is longer than its size")?;
             write_frame(self.conn, CHUNK, &self.buf[..n])?;
         }
-        write_frame(self.conn, END, &[])?;
-        let mut reply = [0u8; REPLY_LEN];
-        (&mut &*self.conn)
-            .read_exact(&mut reply)
-            .context("reading reply from supervisor")?;
-        Ok(Added {
-            hash: Hash(reply[..32].try_into().unwrap()),
-            size: u64::from_le_bytes(reply[32..40].try_into().unwrap()),
-            new: reply[40] != 0,
-        })
+        anyhow::ensure!(left == 0, "content is shorter than its size");
+        let id = ObjectId { object: self.next };
+        self.next += 1;
+        Ok(id)
     }
 }
 

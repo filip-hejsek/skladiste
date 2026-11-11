@@ -12,11 +12,11 @@ use std::io::{BufRead, BufReader, Read};
 use anyhow::{Context, Result, bail};
 use tar::EntryType;
 
-use crate::manifest::{Entry, EntryKind, Package, XattrValue, normalize_path};
+use crate::manifest::{Entry, EntryKind, ObjectId, Package, XattrValue, normalize_path};
 use crate::store::ObjectSink;
 
 /// Read a package archive, adding file contents to `objects`.
-pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package> {
+pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package<ObjectId>> {
     let decoder = open_decoder(BufReader::new(archive))?;
     let mut archive = tar::Archive::new(decoder);
 
@@ -55,11 +55,8 @@ pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Packag
         let kind = match entry_type {
             EntryType::Directory => EntryKind::Dir,
             EntryType::Regular | EntryType::Continuous => {
-                let added = objects.add_object(&mut tar_entry)?;
-                EntryKind::File {
-                    hash: added.hash,
-                    size: added.size,
-                }
+                let size = tar_entry.size();
+                EntryKind::File(objects.add_object(size, &mut tar_entry)?)
             }
             EntryType::Symlink => EntryKind::Symlink {
                 target: link_name(&tar_entry, &path)?,

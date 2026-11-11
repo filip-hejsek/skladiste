@@ -15,7 +15,7 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::btrfs;
-use crate::manifest::{Entry, EntryKind, Package};
+use crate::manifest::{Content, Entry, EntryKind, Package};
 use crate::store::Store;
 use crate::worker::Workers;
 
@@ -73,7 +73,7 @@ pub(crate) fn populate(store: &Store, plan: Vec<&Entry>, root: OwnedFd) -> Resul
                 inst.create_dir(entry)?;
                 dirs.push(entry);
             }
-            EntryKind::File { .. } => inst.create_file(entry)?,
+            EntryKind::File(_) => inst.create_file(entry)?,
             EntryKind::Symlink { target } => inst.create_symlink(entry, target)?,
             EntryKind::Hardlink { .. } => unreachable!(),
         }
@@ -283,7 +283,7 @@ impl Installer<'_> {
     }
 
     fn create_file(&mut self, entry: &Entry) -> Result<()> {
-        let EntryKind::File { hash, .. } = &entry.kind else {
+        let EntryKind::File(Content { hash, .. }) = &entry.kind else {
             unreachable!()
         };
         let src = self.store.open_object(hash)?;

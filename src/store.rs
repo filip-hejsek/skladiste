@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::manifest::{Hash, Package};
+use crate::manifest::{Hash, ObjectId, Package};
 
 pub struct Store {
     dir: OwnedFd,
@@ -37,20 +37,18 @@ pub struct Added {
 /// Destination for file contents found while importing a package.
 ///
 /// Frontends write through this instead of using [`Store`] directly, so they
-/// can run in a sandboxed process that has no access to the store.
+/// can run in a sandboxed process that has no access to the store. The sink
+/// returns no hash, so a sink in another process needn't wait for the
+/// receiver: the receiver hashes the content and resolves the returned ids
+/// (see [`Package::resolve`](crate::manifest::Package::resolve)).
 pub trait ObjectSink {
-    fn add_object(&mut self, content: &mut dyn Read) -> Result<Added>;
-}
-
-impl ObjectSink for &Store {
-    fn add_object(&mut self, content: &mut dyn Read) -> Result<Added> {
-        Store::add_object(self, content)
-    }
+    /// Add an object of `size` bytes; `content` must yield exactly that.
+    fn add_object(&mut self, size: u64, content: &mut dyn Read) -> Result<ObjectId>;
 }
 
 impl<T: ObjectSink + ?Sized> ObjectSink for &mut T {
-    fn add_object(&mut self, content: &mut dyn Read) -> Result<Added> {
-        (**self).add_object(content)
+    fn add_object(&mut self, size: u64, content: &mut dyn Read) -> Result<ObjectId> {
+        (**self).add_object(size, content)
     }
 }
 

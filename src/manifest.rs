@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// BLAKE3 hash of a file's content; the address of an object in the store.
@@ -57,14 +58,72 @@ impl<'de> Deserialize<'de> for Hash {
 }
 
 /// A package as the core sees it: identity plus a list of filesystem entries.
+///
+/// `F` is what file entries refer to: [`Content`] in the store, or
+/// [`ObjectId`] in a manifest that a frontend produced, before the
+/// supervisor [resolves](Package::resolve) it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Package {
+pub struct Package<F = Content> {
     pub name: String,
     pub version: String,
-    pub entries: Vec<Entry>,
+    pub entries: Vec<Entry<F>>,
 }
 
-impl Package {
+/// A file's content in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Content {
+    pub hash: Hash,
+    pub size: u64,
+}
+
+/// A file's content as a frontend refers to it: the position of the object
+/// among those it sent to its [`ObjectSink`](crate::store::ObjectSink),
+/// counting from 0. Only the receiving side knows the hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectId {
+    pub object: u64,
+}
+
+impl Package<ObjectId> {
+    /// Replace object ids with the content they refer to; `objects` holds
+    /// the content of each object in the order they were received.
+    pub fn resolve(self, objects: &[Content]) -> anyhow::Result<Package> {
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|e| {
+                let kind = match e.kind {
+                    EntryKind::File(ObjectId { object }) => EntryKind::File(
+                        usize::try_from(object)
+                            .ok()
+                            .and_then(|i| objects.get(i))
+                            .copied()
+                            .with_context(|| format!("/{}: no object {object}", e.path))?,
+                    ),
+                    EntryKind::Dir => EntryKind::Dir,
+                    EntryKind::Symlink { target } => EntryKind::Symlink { target },
+                    EntryKind::Hardlink { target } => EntryKind::Hardlink { target },
+                };
+                Ok(Entry {
+                    path: e.path,
+                    kind,
+                    mode: e.mode,
+                    uid: e.uid,
+                    gid: e.gid,
+                    mtime: e.mtime,
+                    xattrs: e.xattrs,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Package {
+            name: self.name,
+            version: self.version,
+            entries,
+        })
+    }
+}
+
+impl<F> Package<F> {
     /// Check the invariants the rest of the core relies on.
     ///
     /// Frontends parse untrusted archives and may run in a sandboxed process,
@@ -95,10 +154,10 @@ impl Package {
 /// One filesystem entry. `path` is relative to the image root, without a
 /// leading or trailing slash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Entry {
+pub struct Entry<F = Content> {
     pub path: String,
     #[serde(flatten)]
-    pub kind: EntryKind,
+    pub kind: EntryKind<F>,
     /// Permission bits including setuid/setgid/sticky (`0o7777` mask).
     pub mode: u32,
     pub uid: u32,
@@ -111,12 +170,9 @@ pub struct Entry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-pub enum EntryKind {
+pub enum EntryKind<F = Content> {
     Dir,
-    File {
-        hash: Hash,
-        size: u64,
-    },
+    File(F),
     Symlink {
         target: String,
     },
@@ -196,7 +252,7 @@ mod tests {
 
     #[test]
     fn validate() {
-        let pkg = |path: &str| Package {
+        let pkg = |path: &str| Package::<Content> {
             name: "p".into(),
             version: "1".into(),
             entries: vec![Entry {
@@ -216,13 +272,38 @@ mod tests {
     }
 
     #[test]
+    fn resolve_object_ids() {
+        let pkg = |object| Package {
+            name: "p".into(),
+            version: "1".into(),
+            entries: vec![Entry {
+                path: "f".into(),
+                kind: EntryKind::File(ObjectId { object }),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: BTreeMap::new(),
+            }],
+        };
+        let content = Content {
+            hash: blake3::hash(b"x").into(),
+            size: 1,
+        };
+        let resolved = pkg(1).resolve(&[content, content]).unwrap();
+        assert_eq!(resolved.entries[0].kind, EntryKind::File(content));
+        assert!(pkg(2).resolve(&[content, content]).is_err());
+        assert!(pkg(u64::MAX).resolve(&[content]).is_err());
+    }
+
+    #[test]
     fn entry_json_roundtrip() {
         let e = Entry {
             path: "usr/bin/ping".into(),
-            kind: EntryKind::File {
+            kind: EntryKind::File(Content {
                 hash: blake3::hash(b"x").into(),
                 size: 1,
-            },
+            }),
             mode: 0o4755,
             uid: 0,
             gid: 0,
@@ -231,6 +312,7 @@ mod tests {
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""type":"file""#));
+        assert!(json.contains(r#""size":1"#));
         assert!(json.contains(r#""security.capability":"0102ff""#));
         assert_eq!(serde_json::from_str::<Entry>(&json).unwrap(), e);
     }
