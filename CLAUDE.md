@@ -1,5 +1,9 @@
 # skladiště
 
+Design principles (also for humans, so kept outside this file):
+
+@planning/PRINCIPLES.md
+
 Decisions already made, with rejected alternatives, are in
 planning/DECISIONS.md; plans and open questions are in planning/TODO.md,
 and known bugs in planning/BUGS.md. Check them before proposing design
