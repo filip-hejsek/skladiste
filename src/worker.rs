@@ -131,7 +131,7 @@ impl Workers {
 
     /// Start worker `kind` with `stdin` and `stdout` as fds 0 and 1. `extra`
     /// fds are inherited under their current numbers, which are passed as
-    /// arguments; nothing else is inherited except stderr.
+    /// arguments. Stderr is a pipe; see [`Worker::finish`].
     fn spawn(
         &self,
         kind: &'static str,
@@ -151,7 +151,19 @@ impl Workers {
         if !self.layers.seccomp {
             cmd.arg("--no-seccomp");
         }
-        cmd.env_clear().current_dir("/").stdin(stdin).stdout(stdout);
+        // Non-blocking on the worker's side: if the pipe fills up, further
+        // output is lost instead of blocking a worker while the supervisor
+        // waits for it on another fd. The worker can't change this, as
+        // seccomp allows `fcntl` only with `F_GETFD`.
+        use rustix::pipe::{PipeFlags, pipe_with};
+        let (stderr_r, stderr_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+        rustix::fs::fcntl_setfl(&stderr_w, rustix::fs::OFlags::NONBLOCK)
+            .context("making pipe non-blocking")?;
+        cmd.env_clear()
+            .current_dir("/")
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr_w);
         // SAFETY: fcntl is async-signal-safe, and only the child's fd table
         // is changed.
         unsafe {
@@ -171,6 +183,7 @@ impl Workers {
         Ok(Worker {
             kind,
             child: Some(child),
+            stderr: File::from(stderr_r),
         })
     }
 }
@@ -179,15 +192,28 @@ impl Workers {
 struct Worker {
     kind: &'static str,
     child: Option<Child>,
+    stderr: File,
 }
 
 impl Worker {
     /// Wait for the worker to exit and combine its exit status with the
     /// result received from it. An error the worker reported explains a
     /// failure best; otherwise an abnormal exit explains a broken connection.
+    ///
+    /// Then prints what the worker wrote to stderr (e.g. a panic message):
+    /// control characters escaped and each line prefixed with the worker's
+    /// name, so it can't pass for the supervisor's output or control the
+    /// terminal. Only what fit in the pipe is kept.
     fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         let status = self.child.take().unwrap().wait();
         let status = status.with_context(|| format!("waiting for {} worker", self.kind))?;
+        // The worker has exited, so this can't block: no one else has the
+        // pipe's write end.
+        let mut output = Vec::new();
+        match self.stderr.read_to_end(&mut output) {
+            Ok(_) => print_worker_output(self.kind, &output),
+            Err(e) => eprintln!("warning: reading {} worker's stderr: {e}", self.kind),
+        }
         match result {
             Err(e) if e.is::<WorkerError>() => Err(e),
             _ if !status.success() => {
@@ -209,6 +235,28 @@ impl Drop for Worker {
             let _ = child.wait();
         }
     }
+}
+
+/// Print a worker's output as one block, so output from workers finishing
+/// at the same time doesn't interleave.
+fn print_worker_output(kind: &str, output: &[u8]) {
+    let mut stderr = io::stderr().lock();
+    for line in sanitize(&String::from_utf8_lossy(output)).lines() {
+        let _ = writeln!(stderr, "{kind} worker: {line}");
+    }
+}
+
+/// Escape control characters other than newline and tab.
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() && c != '\n' && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn describe(status: ExitStatus) -> String {
@@ -394,7 +442,8 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         Err(e) => (ERROR, format!("{e:#}").into_bytes(), ExitCode::FAILURE),
     };
     if let Err(e) = write_frame(&out, tag, &payload) {
-        eprintln!("skl worker: sending result: {e}");
+        // Not eprintln!, which panics if the stderr pipe is full.
+        let _ = writeln!(io::stderr(), "sending result: {e}");
         return ExitCode::FAILURE;
     }
     code
@@ -551,4 +600,17 @@ fn install_worker(layers: Layers, store: OwnedFd, root: OwnedFd) -> Result<Vec<u
     let entries: Vec<Entry> = serde_json::from_reader(plan).context("reading plan")?;
     let report = install::populate(&store, entries.iter().collect(), root)?;
     Ok(serde_json::to_vec(&report)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_escapes_control_characters() {
+        assert_eq!(
+            sanitize("a\tb\n\x1b[2Jc\rd\u{9b}e é"),
+            "a\tb\n\\u{1b}[2Jc\\rd\\u{9b}e é"
+        );
+    }
 }

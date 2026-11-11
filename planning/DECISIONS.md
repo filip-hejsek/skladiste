@@ -102,7 +102,19 @@ are in BUGS.md.
   `dup2` to fixed numbers in `pre_exec`, which can clobber the pipe std
   uses to report exec errors. The worker closes every other fd except
   stdio before confining itself, since Landlock and seccomp don't affect
-  fds already open. Stderr is inherited for panic messages.
+  fds already open.
+- A worker's stderr (panic messages) is a pipe, non-blocking on the
+  worker's side, that the supervisor reads after the worker exits. It
+  prints the output with control characters escaped and each line
+  prefixed with the worker's name, so a worker can't control the
+  terminal or pass for the supervisor. Each worker's output is printed
+  as one block with stderr locked, so output from parallel workers won't
+  interleave. Output beyond the pipe's capacity
+  (64 KiB) is lost; workers only write there when something is wrong.
+  Rejected: inheriting stderr (a worker could write escape sequences to
+  the terminal); a thread or `poll` to drain the pipe while the worker
+  runs (a blocking worker could deadlock with a supervisor that waits on
+  another fd; more code for output that's rarely there).
 - Workers confine themselves (`src/sandbox.rs`): `no_new_privs`, then
   Landlock (all filesystem access handled, plus TCP and the abstract
   socket and signal scopes; only the given directory fds are allowed),
