@@ -85,34 +85,70 @@ are in BUGS.md.
   namespaces, Landlock and seccomp. Work that needs different access
   (parsing untrusted archives, writing the store, writing an image,
   running package code, network) goes in separate processes. See the
-  Sandboxing section of TODO.md for what isn't wired up yet.
+  Sandboxing section of TODO.md for what isn't done yet.
 - Library code works on file descriptors, not paths: `Store` holds a
   directory fd, frontends read from a `Read` and write file contents to
   an `ObjectSink`, and the installer uses only the store fd and the
-  image root fd. Only the CLI opens paths. A worker can then be handed
-  just the fds it needs and run under Landlock or in a mount namespace.
-- The supervisor (the `skl` process) is the only writer of the store.
-  It hashes object contents itself, so a compromised parser can't put
-  content under the wrong hash, and it checks every manifest a frontend
-  returns (`Package::validate`) before saving it.
+  image root fd. Only the CLI opens paths.
+- Workers (`src/worker.rs`) are started by re-executing the `skl` binary
+  (`/proc/self/exe`; tests pass `CARGO_BIN_EXE_skl`) with the hidden
+  `__worker` subcommand, which `main` checks before parsing arguments.
+  A fresh exec is single-threaded and inherits no memory; fork without
+  exec is unsafe in a multithreaded process. Both ends are the same
+  binary, so the protocol needs no stability. The environment is cleared
+  and the working directory is `/`.
+- Fds for a worker are inherited at their own numbers (CLOEXEC cleared
+  in the child before exec), and the numbers passed as arguments. Rejected:
+  `dup2` to fixed numbers in `pre_exec`, which can clobber the pipe std
+  uses to report exec errors. The worker closes every other fd except
+  stdio before confining itself, since Landlock and seccomp don't affect
+  fds already open. Stderr is inherited for panic messages.
+- Workers confine themselves (`src/sandbox.rs`): `no_new_privs`, then
+  Landlock (all filesystem access handled, plus TCP and the abstract
+  socket and signal scopes; only the given directory fds are allowed),
+  then a seccomp allowlist that kills the process on any other system
+  call. Allowlisting also rejects x32 system calls. `fcntl` is allowed
+  only with `F_GETFD`, which debug builds use when closing fds; `ioctl`
+  only with listed request numbers.
+- Landlock is best effort with ABI 9 requested: an older kernel that
+  enforces only part of it is accepted (TCP is blocked by seccomp
+  anyway), a kernel without Landlock is refused.
+- The import worker gets the archive as stdin and a socket as stdout, no
+  filesystem access and no ioctls. It streams file contents to the
+  supervisor, which writes and hashes them and replies with the hash
+  (one round trip per file; importing is about 10% slower than in
+  process). The supervisor checks the returned manifest
+  (`Package::validate`) and that every file's hash and size were
+  returned by the store during that import, and counts the import
+  statistics itself.
+- The supervisor (the `skl` process) is the only writer of the store and
+  creates the image subvolume. It merges packages (conflict checks) and
+  sends the plan to the install worker, which gets the store fd
+  (Landlock: read files) and the image root fd (read dirs, write files,
+  create dirs, files and symlinks, link across dirs), and only `FICLONE`
+  as an ioctl, since Landlock doesn't restrict btrfs ioctls such as
+  subvolume creation. The worker runs in the supervisor's user
+  namespace, so owners are applied when skl runs with a uid range
+  mapped.
+- Workers end with one result or error message; an error the worker
+  sent is reported in preference to its exit status, and death by
+  `SIGSYS` is reported as a blocked system call.
 - A package archive is opened once, hashed for its id, and the same open
   file is parsed, so the manifest always matches the id.
-- The supervisor creates the image subvolume; the installer only fills
-  it through the root fd.
 - Package code (install scripts, hooks) runs under an existing sandbox
   tool, bubblewrap for now (minijail or nsjail would also do). Rejected:
   setting up namespaces ourselves; no clear benefit for more code.
   Workers running skl's own code sandbox themselves (Landlock, seccomp).
-- If a sandboxing layer is unavailable, skl refuses to run by default.
-  An escape hatch is unavoidable (some systems disable unprivileged user
-  namespaces, or an outer container blocks Landlock), but options that
-  reduce security are only available in builds with a cargo feature
-  that enables them.
+- If a sandboxing layer is unavailable, skl refuses to run. The escape
+  hatch is the `insecure` cargo feature (off by default), which adds
+  `--insecure-no-landlock` and `--insecure-no-seccomp`; workers reject
+  these options in builds without it.
 - Checked on Linux 7.2: `FICLONE` works across bind mounts of the same
   filesystem, so a mount namespace can bind the store and image
   separately. Landlock doesn't restrict btrfs ioctls (subvolume creation
-  succeeds where it blocks `mkdir`) or `FICLONE`; workers that shouldn't
-  use them need seccomp filtering ioctl numbers.
+  succeeds where it blocks `mkdir`) or `FICLONE`.
+- Tests of the layers themselves re-run the unit test binary as a child
+  that confines itself, since confinement can't be undone.
 
 ## Tests
 

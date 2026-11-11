@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use skladiste::{arch, install, manifest::Package, store::Store};
+use skladiste::{install, manifest::Package, store::Store, worker::Workers};
 use tar::{EntryType, Header};
 
 const BTRFS_SUPER_MAGIC: i64 = 0x9123683e;
@@ -82,8 +82,15 @@ fn make_package(dir: &Path, name: &str, items: &[Item]) -> PathBuf {
     path
 }
 
+fn workers() -> Workers {
+    Workers::new(env!("CARGO_BIN_EXE_skl"))
+}
+
 fn import(store: &Store, path: &Path) -> Package {
-    arch::import(File::open(path).unwrap(), store).unwrap().0
+    workers()
+        .import_arch(store, File::open(path).unwrap())
+        .unwrap()
+        .0
 }
 
 #[test]
@@ -120,12 +127,14 @@ fn build_image() {
     );
 
     let base = import(&store, &base);
-    let (tools, stats) = arch::import(File::open(&tools).unwrap(), &store).unwrap();
+    let (tools, stats) = workers()
+        .import_arch(&store, File::open(&tools).unwrap())
+        .unwrap();
     assert_eq!(stats.files, 4);
     assert_eq!(stats.new_objects, 3, "identical files share one object");
 
     let img = tmp.path().join("img");
-    let report = install::build(&store, &[base, tools], &img).unwrap();
+    let report = install::build(&workers(), &store, &[base, tools], &img).unwrap();
     assert_eq!(report.files, 4);
     assert_eq!(report.hardlinks, 1);
     assert_eq!(report.xattr_failures, 0);
@@ -158,6 +167,21 @@ fn conflicting_files_are_rejected() {
     let a = make_package(tmp.path(), "a", &[Item::File("f", 0o644, b"a")]);
     let b = make_package(tmp.path(), "b", &[Item::File("f", 0o644, b"b")]);
     let pkgs = [import(&store, &a), import(&store, &b)];
-    let err = install::build(&store, &pkgs, &tmp.path().join("img")).unwrap_err();
+    let err = install::build(&workers(), &store, &pkgs, &tmp.path().join("img")).unwrap_err();
     assert!(err.to_string().contains("conflict: /f"), "{err}");
+}
+
+#[test]
+fn worker_errors_are_reported() {
+    let Some(tmp) = btrfs_tempdir() else { return };
+    let store = Store::open(&tmp.path().join("store")).unwrap();
+    let path = tmp.path().join("bad.pkg.tar.zst");
+    fs::write(&path, "not an archive").unwrap();
+    let err = workers()
+        .import_arch(&store, File::open(&path).unwrap())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported compression"),
+        "{err:#}"
+    );
 }

@@ -84,10 +84,15 @@ impl Store {
             mkdir_exist_ok(&dir, sub)
                 .with_context(|| format!("creating {}", root.join(sub).display()))?;
         }
-        Ok(Store {
+        Ok(Store::from_dir(dir))
+    }
+
+    /// Use an already open store directory, e.g. one passed to a worker.
+    pub fn from_dir(dir: OwnedFd) -> Store {
+        Store {
             dir,
             tmp_counter: AtomicU64::new(0),
-        })
+        }
     }
 
     /// The store's directory, e.g. for passing to a worker process.

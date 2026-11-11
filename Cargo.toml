@@ -14,7 +14,10 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 blake3 = "1.8.7"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-rustix = { version = "1.1.6", features = ["fs", "process"] }
+landlock = "0.4.7"
+libc = "0.2.191"
+rustix = { version = "1.1.6", features = ["fs", "net", "pipe", "process", "thread"] }
+seccompiler = "0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tar = "0.4.46"
@@ -33,3 +36,7 @@ unreachable_pub = "warn"
 # Reduces the size of target/.
 [profile.dev]
 debug = "line-tables-only"
+
+[features]
+# Adds options that turn off sandboxing layers, for systems that lack them.
+insecure = []

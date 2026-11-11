@@ -16,6 +16,9 @@ formats can be added as frontends.
 - No dependency resolution, install scripts or hooks yet
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
+- Archives are parsed and images filled by worker processes confined with
+  Landlock and seccomp; `skl` refuses to run where these aren't available
+  (builds with the `insecure` feature can turn them off)
 
 ## Usage
 

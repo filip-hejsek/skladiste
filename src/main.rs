@@ -1,13 +1,15 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+use skladiste::install;
 use skladiste::manifest::Package;
 use skladiste::store::{Store, hash_reader};
-use skladiste::{arch, install};
+use skladiste::worker::{self, Workers};
 
 #[derive(Parser)]
 #[command(name = "skl", about = "Content-addressed package manager on btrfs")]
@@ -15,6 +17,16 @@ struct Cli {
     /// Store directory (must be on the same btrfs filesystem as images).
     #[arg(long, env = "SKL_STORE")]
     store: PathBuf,
+
+    /// Run workers without Landlock (INSECURE).
+    #[cfg(feature = "insecure")]
+    #[arg(long)]
+    insecure_no_landlock: bool,
+
+    /// Run workers without seccomp filters (INSECURE).
+    #[cfg(feature = "insecure")]
+    #[arg(long)]
+    insecure_no_seccomp: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -40,13 +52,37 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|a| a == worker::SUBCOMMAND) {
+        return worker::main(args);
+    }
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    #[allow(unused_mut)]
+    let mut workers = Workers::new("/proc/self/exe");
+    #[cfg(feature = "insecure")]
+    {
+        if cli.insecure_no_landlock {
+            workers.disable_landlock();
+        }
+        if cli.insecure_no_seccomp {
+            workers.disable_seccomp();
+        }
+    }
     let store = Store::open(&cli.store)?;
     match cli.command {
         Command::Import { packages } => {
             for path in &packages {
-                get_package(&store, path)?;
+                get_package(&workers, &store, path)?;
             }
         }
         Command::Build { output, packages } => {
@@ -55,9 +91,9 @@ fn main() -> Result<()> {
             }
             let packages = packages
                 .iter()
-                .map(|p| get_package(&store, p))
+                .map(|p| get_package(&workers, &store, p))
                 .collect::<Result<Vec<_>>>()?;
-            let r = install::build(&store, &packages, &output)?;
+            let r = install::build(&workers, &store, &packages, &output)?;
             eprintln!(
                 "built {}: {} files, {} dirs, {} symlinks, {} hard links",
                 output.display(),
@@ -83,7 +119,7 @@ fn main() -> Result<()> {
 /// Load a package's manifest from the store, importing the archive if needed.
 /// Packages are identified by the hash of the archive file. The file is
 /// opened once, so the parsed content is the content that was hashed.
-fn get_package(store: &Store, path: &Path) -> Result<Package> {
+fn get_package(workers: &Workers, store: &Store, path: &Path) -> Result<Package> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let id = hash_reader(&mut file)
         .with_context(|| format!("reading {}", path.display()))?
@@ -92,9 +128,8 @@ fn get_package(store: &Store, path: &Path) -> Result<Package> {
         return Ok(pkg);
     }
     file.seek(SeekFrom::Start(0))?;
-    let (pkg, stats) =
-        arch::import(file, store).with_context(|| format!("importing {}", path.display()))?;
-    pkg.validate()
+    let (pkg, stats) = workers
+        .import_arch(store, file)
         .with_context(|| format!("importing {}", path.display()))?;
     store.save_package(&id, &pkg)?;
     eprintln!(

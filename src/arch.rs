@@ -3,8 +3,8 @@
 //! Install scriptlets (`.INSTALL`), `.MTREE` and `.BUILDINFO` are ignored for now.
 //!
 //! The archive is untrusted input, so [`import`] touches nothing but the
-//! stream it reads and the [`ObjectSink`] it writes to; this lets it run in a
-//! sandboxed worker process.
+//! stream it reads and the [`ObjectSink`] it writes to; `skl` runs it in a
+//! sandboxed worker process (see [`crate::worker`]).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
@@ -15,20 +15,11 @@ use tar::EntryType;
 use crate::manifest::{Entry, EntryKind, Package, XattrValue, normalize_path};
 use crate::store::ObjectSink;
 
-/// Statistics about an import.
-#[derive(Default)]
-pub struct ImportStats {
-    pub files: u64,
-    pub new_objects: u64,
-    pub new_bytes: u64,
-}
-
 /// Read a package archive, adding file contents to `objects`.
-pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<(Package, ImportStats)> {
+pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package> {
     let decoder = open_decoder(BufReader::new(archive))?;
     let mut archive = tar::Archive::new(decoder);
 
-    let mut stats = ImportStats::default();
     let mut entries = Vec::new();
     let mut pkginfo = None;
 
@@ -65,11 +56,6 @@ pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<(Packa
             EntryType::Directory => EntryKind::Dir,
             EntryType::Regular | EntryType::Continuous => {
                 let added = objects.add_object(&mut tar_entry)?;
-                stats.files += 1;
-                if added.new {
-                    stats.new_objects += 1;
-                    stats.new_bytes += added.size;
-                }
                 EntryKind::File {
                     hash: added.hash,
                     size: added.size,
@@ -98,14 +84,11 @@ pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<(Packa
     let Some((name, version)) = pkginfo else {
         bail!("missing .PKGINFO");
     };
-    Ok((
-        Package {
-            name,
-            version,
-            entries,
-        },
-        stats,
-    ))
+    Ok(Package {
+        name,
+        version,
+        entries,
+    })
 }
 
 fn open_decoder<'a>(mut reader: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {

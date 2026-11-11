@@ -4,4 +4,6 @@ pub mod arch;
 pub mod btrfs;
 pub mod install;
 pub mod manifest;
+mod sandbox;
 pub mod store;
+pub mod worker;

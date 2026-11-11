@@ -12,12 +12,14 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, ResolveFlags, Timespec, Timestamps, Uid, XattrFlags};
 use rustix::io::Errno;
+use serde::{Deserialize, Serialize};
 
 use crate::btrfs;
 use crate::manifest::{Entry, EntryKind, Package};
 use crate::store::Store;
+use crate::worker::Workers;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub dirs: u64,
     pub files: u64,
@@ -29,9 +31,16 @@ pub struct Report {
     pub xattr_failures: u64,
 }
 
-/// Create a new subvolume at `target` and install `packages` into it.
-pub fn build(store: &Store, packages: &[Package], target: &Path) -> Result<Report> {
-    let plan = merge(packages)?;
+/// Create a new subvolume at `target` and install `packages` into it. The
+/// files are installed by a worker that can access only the store and the
+/// new subvolume.
+pub fn build(
+    workers: &Workers,
+    store: &Store,
+    packages: &[Package],
+    target: &Path,
+) -> Result<Report> {
+    let plan: Vec<&Entry> = merge(packages)?.into_values().collect();
     btrfs::create_subvolume(target)?;
     let root = rustix::fs::open(
         target,
@@ -39,12 +48,13 @@ pub fn build(store: &Store, packages: &[Package], target: &Path) -> Result<Repor
         Mode::empty(),
     )
     .with_context(|| format!("opening {}", target.display()))?;
-    populate(store, plan, root)
+    workers.install(store, &plan, &root)
 }
 
-/// Install `plan` into the empty directory `root`. Uses only the store's and
-/// the image's directory fds, so it can run in a process confined to them.
-fn populate(store: &Store, plan: BTreeMap<&str, &Entry>, root: OwnedFd) -> Result<Report> {
+/// Install `plan` (sorted by path) into the empty directory `root`. Uses only
+/// the store's and the image's directory fds, so it runs in a worker
+/// confined to them.
+pub(crate) fn populate(store: &Store, plan: Vec<&Entry>, root: OwnedFd) -> Result<Report> {
     let mut inst = Installer {
         store,
         root,
@@ -54,7 +64,7 @@ fn populate(store: &Store, plan: BTreeMap<&str, &Entry>, root: OwnedFd) -> Resul
 
     // Hard links go last because their targets may sort after them.
     let (hardlinks, others): (Vec<&Entry>, Vec<&Entry>) = plan
-        .into_values()
+        .into_iter()
         .partition(|e| matches!(e.kind, EntryKind::Hardlink { .. }));
     let mut dirs = Vec::new();
     inst.create_all(others, |inst, entry| {

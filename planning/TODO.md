@@ -46,27 +46,19 @@ Next priorities: dependency resolution, then install scripts and hooks.
 
 Decisions already made are under Sandboxing in DECISIONS.md.
 
-- Worker processes: re-exec `/proc/self/exe` with a hidden subcommand,
-  passing only the needed fds. A fresh exec is single-threaded (needed
-  for `unshare(CLONE_NEWUSER)`) and inherits no memory; fork without
-  exec is unsafe in a multithreaded process. Both ends are the same
-  binary, so the protocol needs no stability.
-- Unpacker worker (frontends): gets the archive fd and a socket, no
-  filesystem or network access, tight seccomp allowlist. Sends entries
-  and file contents over the socket; the supervisor writes and hashes
-  them through `ObjectSink`. Later, to avoid the copy: the worker writes
-  files and passes their fds, and the supervisor reflinks them into the
-  store before hashing (the worker can't change a clone).
-- When frontends run out of process, check that every file hash in the
-  returned manifest was returned by the store during that import.
-- Installer worker: Landlock with the store read-only and the image
-  writable; possibly in a user namespace with a uid range mapped, for
-  chown (see the ownership question under Images).
+- Supervisor: confine `skl` itself after opening its paths (Landlock with
+  the store, the package files and the image's parent directory).
+- The install worker can change metadata (mode, owner, xattrs, times) of
+  store files, which Landlock doesn't restrict; only their content is
+  protected. Fix: bind the store read-only in a mount namespace.
+- Resource limits for workers (e.g. `RLIMIT_AS`), so a decompression or
+  header bomb can't exhaust memory.
+- Avoid copying file contents through the import socket: the worker
+  writes files and passes their fds, and the supervisor reflinks them
+  into the store before hashing (the worker can't change a clone).
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
   namespaces, root is the image, no access to the store.
 - Downloader (once skl downloads): network plus a download directory.
   Repo databases are untrusted archives and get parsed like packages.
   Sandboxing a signature verifier protects the host, not the verdict,
   so verification should use a memory-safe implementation.
-- The escape hatch for missing sandboxing layers: a cargo feature (off
-  by default) that adds runtime options to run without them.
