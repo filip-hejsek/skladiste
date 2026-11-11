@@ -14,6 +14,12 @@ are in TODO.md.
 
 ## Arch frontend
 
+- The archive is read three times from the same open file (signature
+  check, hash, import). Someone who can write the file meanwhile (e.g. a
+  future sandboxed downloader holding an fd to it) can get unverified
+  content imported. A fix: verify, hash and import a private copy (a
+  reflink clone or a sealed memfd), or hash and verify in one pass while
+  copying.
 - Paths and symlink targets that aren't valid UTF-8 are rejected.
 - Sub-second mtimes from PAX headers are dropped.
 

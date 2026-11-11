@@ -37,6 +37,7 @@ packages (downloaded from an Arch mirror). Use a directory on btrfs;
 ```sh
 dir=tmp  # any directory on btrfs
 scripts/fetch-arch-packages.sh $dir/pkgs filesystem glibc bash ncurses readline coreutils
+export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # archlinux-keyring
 SKL_STORE=$dir/store cargo run --release -- build -o $dir/img $dir/pkgs/*.pkg.tar.zst
 unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img

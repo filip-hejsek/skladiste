@@ -11,7 +11,9 @@ formats can be added as frontends.
 
 ## Status
 
-- Imports Arch `.pkg.tar.zst` packages into the store
+- Imports Arch `.pkg.tar.zst` packages into the store, after checking
+  each package's signature (`.sig` next to it) against the Arch keyring:
+  the signing key must be certified by at least 3 of the master keys
 - Builds a new image subvolume from a list of package files
 - No dependency resolution, install scripts or hooks yet
 - Owners are applied only where permitted; unprivileged builds report how
@@ -27,6 +29,7 @@ The store and images must be on the same btrfs filesystem.
 
 ```sh
 export SKL_STORE=/path/on/btrfs/store
+export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
 scripts/fetch-arch-packages.sh pkgs filesystem glibc bash ncurses readline
 skl build -o image pkgs/*.pkg.tar.zst
 unshare -r chroot image /usr/bin/bash

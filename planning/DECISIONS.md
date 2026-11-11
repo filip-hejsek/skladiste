@@ -45,6 +45,51 @@ are in BUGS.md.
 - Owner, mode and mtime come from the tar headers; xattrs come from
   `SCHILY.xattr.*` PAX records, as written by bsdtar.
 
+## Package signatures
+
+- Every package's detached signature (`<package>.sig`) is checked
+  against the Arch keyring before the archive is hashed or parsed, also
+  when it was imported before (the keyring may have changed since).
+  There's no option to skip it. The keyring is given as a path prefix
+  (`--keyring`, `SKL_KEYRING`): `PREFIX.gpg`, `PREFIX-trusted`,
+  `PREFIX-revoked`, as in `/usr/share/pacman/keyrings/`. skl is meant
+  to manage the keyring itself later.
+- OpenPGP library: Sequoia (`sequoia-openpgp`) with its pure-Rust
+  crypto backend (`crypto-rust`, which needs `allow-experimental-crypto`
+  and `allow-variable-time-crypto`; timing doesn't matter, only public
+  data is handled), not the default Nettle (C), so that verification is
+  memory-safe. It grew `Cargo.lock` from 63 to 273 crates, the release
+  binary from 2.7 to 6.5 MB and a clean release build from about 23 s
+  to 65 s. Rejected: GnuPG/gpgme as pacman uses (C, and the web of trust
+  below); rPGP (also pure Rust, but lower level, leaving more of
+  certificate validity to us).
+- Verification runs in the supervisor, not a worker. The verdict can't
+  be checked by the supervisor, so a compromised verifier is already as
+  bad as a forged signature; a worker would add protection of the host
+  for a per-package process and protocol. The untrusted input is only
+  the small `.sig` file and the archive bytes being hashed.
+- Trust is an explicit rule, not GnuPG's web of trust: a packager key is
+  a certificate with a user ID certified by at least 3 master keys
+  (`archlinux-trusted`, which must list them at marginal trust `4`;
+  other levels are rejected rather than interpreted). This is what
+  pacman's setup amounts to (marginal owner trust, `marginals-needed`
+  3). Master keys don't count as packager keys themselves. Keys in
+  `archlinux-revoked` are dropped entirely. A certification counts if it
+  is the issuer's active one and not revoked by a later or hard
+  revocation from the same issuer. A file with several signatures is
+  accepted if one is good (at most 8, as the data is hashed for each).
+- Validity is evaluated at the current time, as GnuPG does, not as of
+  the signature's creation time: the Arch keyring keeps only each key's
+  latest self-signatures, so with Sequoia's stream verifier (which
+  checks the key as of the signature time) `filesystem` failed as
+  "subkey not bound". skl therefore parses and checks signatures itself
+  with Sequoia's primitives and standard policy.
+- Certifications are checked when a key first signs something and
+  cached, not for the whole keyring when it's loaded: with the real
+  keyring (144 certificates) that took 210 ms of a 240 ms load; lazily,
+  loading takes about 30 ms. Importing 7 packages (43 MB) into an empty
+  store took 290 ms instead of 233 ms without verification.
+
 ## Installation
 
 - Files are reflinked (`FICLONE`) from the store, not hardlinked as in
@@ -227,8 +272,9 @@ are in BUGS.md.
   (0.50 s at `-j1`, 0.75 s at `-j8`), presumably contention in btrfs.
   Starting in command-line order instead took 0.56 s with `-j2` and
   0.49 s with `-j8`.
-- A package archive is opened once, hashed for its id, and the same open
-  file is parsed, so the manifest always matches the id.
+- A package archive is opened once, verified, hashed for its id, and the
+  same open file is parsed, so the manifest matches the id unless the
+  file is written to meanwhile (see BUGS.md).
 - Package code (install scripts, hooks) runs under an existing sandbox
   tool, bubblewrap for now (minijail or nsjail would also do). Rejected:
   setting up namespaces ourselves; no clear benefit for more code. Workers

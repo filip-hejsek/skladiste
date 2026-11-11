@@ -10,6 +10,11 @@ Next priorities: dependency resolution, then install scripts and hooks.
 - Dependency resolution from repo databases (`core.db`, `extra.db`),
   with Arch version comparison (`vercmp`) supplied by the frontend
   rather than the core.
+- Manage the keyring in skl (from the `archlinux-keyring` package,
+  updated like other packages and verified by the current keyring)
+  instead of a path on the command line.
+- Signatures of downloaded packages: the repo database has them too
+  (`%PGPSIG%`); repo databases themselves are usually unsigned in Arch.
 - Download packages from a mirror in `skl` itself
   (`scripts/fetch-arch-packages.sh` does this for testing now).
   Import each archive as soon as it arrives. Download order matters
@@ -59,5 +64,3 @@ Decisions already made are under Sandboxing in DECISIONS.md.
   `src/bwrap.rs`).
 - Downloader (once skl downloads): network plus a download directory.
   Repo databases are untrusted archives and get parsed like packages.
-  Sandboxing a signature verifier protects the host, not the verdict,
-  so verification should use a memory-safe implementation.

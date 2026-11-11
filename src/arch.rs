@@ -15,6 +15,8 @@ use tar::EntryType;
 use crate::manifest::{Entry, EntryKind, ObjectId, Package, XattrValue, normalize_path};
 use crate::store::ObjectSink;
 
+pub mod signature;
+
 /// Read a package archive, adding file contents to `objects`.
 pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package<ObjectId>> {
     let decoder = open_decoder(BufReader::new(archive))?;

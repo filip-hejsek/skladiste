@@ -1,6 +1,6 @@
 #!/bin/bash
 # Download the current versions of the named Arch Linux packages (no
-# dependency resolution) into DEST.
+# dependency resolution) and their signatures (.sig) into DEST.
 #
 # Usage: fetch-arch-packages.sh DEST PKGNAME...
 # Environment: ARCH_MIRROR (default https://geo.mirror.pkgbuild.com)
@@ -58,6 +58,10 @@ for name in "$@"; do
 		echo "fetching ${path##*/}" >&2
 		curl -fsSL "$mirror/$path" -o "$file.part"
 		mv "$file.part" "$file"
+	fi
+	if [[ ! -f $file.sig ]]; then
+		curl -fsSL "$mirror/$path.sig" -o "$file.sig.part"
+		mv "$file.sig.part" "$file.sig"
 	fi
 	echo "$file"
 done
