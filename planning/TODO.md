@@ -25,11 +25,31 @@ Next priorities: dependency resolution, then install scripts and hooks.
     beforehand from the repo database (`%CSIZE%`, `%ISIZE%`).
   - Limit each download to its `%CSIZE%` and check `%SHA256SUM%`; there
     is no size limit on package downloads now.
-  - Downgrades: a valid signature doesn't show that the file is the
-    version the URL names. TLS prevents this on the way, but a mirror
-    can still serve an older signed package. Check the name and version
-    in `.PKGINFO` against the repo database (or at least the file name).
   - Fall back to the next mirror when a download fails.
+- Mirror trust: packages are signed, but Arch's repo databases aren't,
+  so a malicious mirror (or anyone impersonating one; TLS stops only
+  that) can't be fully defended against. It can:
+  - serve an older signed package, or an older database;
+  - serve a version newer than the client's but not the latest, e.g.
+    one with a vulnerability the latest fixes;
+  - serve an inconsistent set of versions, so a package is installed
+    with incompatible dependencies;
+  - serve wrong metadata: claim false dependencies to get a package
+    installed, omit packages that provide a needed dependency, or
+    withhold a dependency so a package isn't installed;
+  - serve some packages and not others.
+
+  Partial checks worth doing:
+  - Name and version in `.PKGINFO` must match the database entry the
+    package was chosen from (or at least the file name).
+  - Refuse versions older than one skl has already seen for a package.
+  - Dependency metadata is also in the signed `.PKGINFO` (`depend`,
+    `provides`, including soname provides like `libfoo.so=1-64`):
+    resolve again from those after download and fail on a mismatch with
+    the database. This catches false dependencies and many
+    incompatible version sets, not omitted or withheld packages.
+  - Warn when the mirror's `lastupdate` is old; optionally compare
+    databases from a second mirror.
 - Downloads: follow redirects (the worker would report the target and
   the supervisor connect again), use the system's CA certificates
   instead of the compiled-in Mozilla roots, support HTTP proxies.
