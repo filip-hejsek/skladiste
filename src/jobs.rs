@@ -113,6 +113,9 @@ mod tests {
         let err = par_map(&items, jobs(2), |&i| {
             started.fetch_add(1, Ordering::Relaxed);
             anyhow::ensure!(i != 3, "item {i} failed");
+            // Slow enough that the other thread can't start many items
+            // between taking item 3 and recording its failure.
+            std::thread::sleep(Duration::from_millis(20));
             Ok(i)
         })
         .unwrap_err();
