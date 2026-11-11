@@ -32,7 +32,6 @@ pub struct Report {
 /// Create a new subvolume at `target` and install `packages` into it.
 pub fn build(store: &Store, packages: &[Package], target: &Path) -> Result<Report> {
     let plan = merge(packages)?;
-
     btrfs::create_subvolume(target)?;
     let root = rustix::fs::open(
         target,
@@ -40,7 +39,12 @@ pub fn build(store: &Store, packages: &[Package], target: &Path) -> Result<Repor
         Mode::empty(),
     )
     .with_context(|| format!("opening {}", target.display()))?;
+    populate(store, plan, root)
+}
 
+/// Install `plan` into the empty directory `root`. Uses only the store's and
+/// the image's directory fds, so it can run in a process confined to them.
+fn populate(store: &Store, plan: BTreeMap<&str, &Entry>, root: OwnedFd) -> Result<Report> {
     let mut inst = Installer {
         store,
         root,
@@ -272,9 +276,7 @@ impl Installer<'_> {
         let EntryKind::File { hash, .. } = &entry.kind else {
             unreachable!()
         };
-        let object = self.store.object_path(hash);
-        let src = rustix::fs::open(&object, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .with_context(|| format!("opening store object {}", object.display()))?;
+        let src = self.store.open_object(hash)?;
         let (parent, name) = self.parent(&entry.path)?;
         let dst = rustix::fs::openat(
             parent,

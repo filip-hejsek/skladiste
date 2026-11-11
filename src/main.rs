@@ -1,10 +1,12 @@
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use skladiste::manifest::Package;
-use skladiste::store::{Store, hash_file};
+use skladiste::store::{Store, hash_reader};
 use skladiste::{arch, install};
 
 #[derive(Parser)]
@@ -79,13 +81,21 @@ fn main() -> Result<()> {
 }
 
 /// Load a package's manifest from the store, importing the archive if needed.
-/// Packages are identified by the hash of the archive file.
+/// Packages are identified by the hash of the archive file. The file is
+/// opened once, so the parsed content is the content that was hashed.
 fn get_package(store: &Store, path: &Path) -> Result<Package> {
-    let id = hash_file(path)?.to_string();
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let id = hash_reader(&mut file)
+        .with_context(|| format!("reading {}", path.display()))?
+        .to_string();
     if let Some(pkg) = store.load_package(&id)? {
         return Ok(pkg);
     }
-    let (pkg, stats) = arch::import(store, path)?;
+    file.seek(SeekFrom::Start(0))?;
+    let (pkg, stats) =
+        arch::import(file, store).with_context(|| format!("importing {}", path.display()))?;
+    pkg.validate()
+        .with_context(|| format!("importing {}", path.display()))?;
     store.save_package(&id, &pkg)?;
     eprintln!(
         "imported {} {}: {} files, {} new objects ({:.1} MiB)",

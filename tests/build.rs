@@ -83,7 +83,7 @@ fn make_package(dir: &Path, name: &str, items: &[Item]) -> PathBuf {
 }
 
 fn import(store: &Store, path: &Path) -> Package {
-    arch::import(store, path).unwrap().0
+    arch::import(File::open(path).unwrap(), store).unwrap().0
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn build_image() {
     );
 
     let base = import(&store, &base);
-    let (tools, stats) = arch::import(&store, &tools).unwrap();
+    let (tools, stats) = arch::import(File::open(&tools).unwrap(), &store).unwrap();
     assert_eq!(stats.files, 4);
     assert_eq!(stats.new_objects, 3, "identical files share one object");
 

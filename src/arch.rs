@@ -1,17 +1,19 @@
 //! Arch Linux package frontend: reads `.pkg.tar.zst` archives into the store.
 //!
 //! Install scriptlets (`.INSTALL`), `.MTREE` and `.BUILDINFO` are ignored for now.
+//!
+//! The archive is untrusted input, so [`import`] touches nothing but the
+//! stream it reads and the [`ObjectSink`] it writes to; this lets it run in a
+//! sandboxed worker process.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufReader, Read};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
 
 use anyhow::{Context, Result, bail};
 use tar::EntryType;
 
 use crate::manifest::{Entry, EntryKind, Package, XattrValue, normalize_path};
-use crate::store::Store;
+use crate::store::ObjectSink;
 
 /// Statistics about an import.
 #[derive(Default)]
@@ -21,9 +23,9 @@ pub struct ImportStats {
     pub new_bytes: u64,
 }
 
-pub fn import(store: &Store, path: &Path) -> Result<(Package, ImportStats)> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let decoder = open_decoder(path, BufReader::new(file))?;
+/// Read a package archive, adding file contents to `objects`.
+pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<(Package, ImportStats)> {
+    let decoder = open_decoder(BufReader::new(archive))?;
     let mut archive = tar::Archive::new(decoder);
 
     let mut stats = ImportStats::default();
@@ -62,7 +64,7 @@ pub fn import(store: &Store, path: &Path) -> Result<(Package, ImportStats)> {
         let kind = match entry_type {
             EntryType::Directory => EntryKind::Dir,
             EntryType::Regular | EntryType::Continuous => {
-                let added = store.add_object(&mut tar_entry)?;
+                let added = objects.add_object(&mut tar_entry)?;
                 stats.files += 1;
                 if added.new {
                     stats.new_objects += 1;
@@ -94,7 +96,7 @@ pub fn import(store: &Store, path: &Path) -> Result<(Package, ImportStats)> {
     }
 
     let Some((name, version)) = pkginfo else {
-        bail!("{}: missing .PKGINFO", path.display());
+        bail!("missing .PKGINFO");
     };
     Ok((
         Package {
@@ -106,16 +108,12 @@ pub fn import(store: &Store, path: &Path) -> Result<(Package, ImportStats)> {
     ))
 }
 
-fn open_decoder<'a>(path: &Path, mut reader: BufReader<File>) -> Result<Box<dyn Read + 'a>> {
-    use std::io::BufRead;
+fn open_decoder<'a>(mut reader: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {
     let magic = reader.fill_buf()?;
     if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         Ok(Box::new(zstd::Decoder::with_buffer(reader)?))
     } else {
-        bail!(
-            "{}: unsupported compression (only zstd is supported)",
-            path.display()
-        )
+        bail!("unsupported compression (only zstd is supported)")
     }
 }
 

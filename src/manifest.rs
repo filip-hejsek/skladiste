@@ -64,6 +64,34 @@ pub struct Package {
     pub entries: Vec<Entry>,
 }
 
+impl Package {
+    /// Check the invariants the rest of the core relies on.
+    ///
+    /// Frontends parse untrusted archives and may run in a sandboxed process,
+    /// so their output is checked again by the code that stores it.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for entry in &self.entries {
+            let path = &entry.path;
+            anyhow::ensure!(
+                !path.is_empty() && normalize_path(path)? == *path,
+                "invalid path: {path:?}"
+            );
+            anyhow::ensure!(
+                entry.mode & !0o7777 == 0,
+                "/{path}: invalid mode {:o}",
+                entry.mode
+            );
+            if let EntryKind::Hardlink { target } = &entry.kind {
+                anyhow::ensure!(
+                    !target.is_empty() && normalize_path(target)? == *target,
+                    "/{path}: invalid hard link target {target:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One filesystem entry. `path` is relative to the image root, without a
 /// leading or trailing slash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +192,27 @@ mod tests {
         assert_eq!(normalize_path("/etc//passwd").unwrap(), "etc/passwd");
         assert_eq!(normalize_path("./").unwrap(), "");
         assert!(normalize_path("usr/../etc").is_err());
+    }
+
+    #[test]
+    fn validate() {
+        let pkg = |path: &str| Package {
+            name: "p".into(),
+            version: "1".into(),
+            entries: vec![Entry {
+                path: path.into(),
+                kind: EntryKind::Dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: BTreeMap::new(),
+            }],
+        };
+        assert!(pkg("usr/bin").validate().is_ok());
+        for bad in ["", "/usr", "usr/", "usr//bin", "usr/./bin", "usr/../etc"] {
+            assert!(pkg(bad).validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

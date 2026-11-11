@@ -48,6 +48,8 @@ are in BUGS.md.
 - Files are reflinked (`FICLONE`) from the store, not hardlinked as in
   ostree. Each installed file is a separate inode with its own owner,
   mode and xattrs, and can be modified without affecting the store.
+  This also means code running in an image (install scripts, the
+  container itself) can't modify the store.
 - The store and images must be on the same btrfs filesystem; reflinks
   across subvolumes work.
 - Files small enough to be stored inline by btrfs (up to about 2 KiB by
@@ -76,6 +78,32 @@ are in BUGS.md.
 - Unprivileged users can delete an image with `rm -rf` (an empty
   subvolume can be removed with `rmdir`); `btrfs subvolume delete`
   needs privileges.
+
+## Sandboxing
+
+- Goal: every part of skl runs with only the access it needs, using
+  namespaces, Landlock and seccomp. Work that needs different access
+  (parsing untrusted archives, writing the store, writing an image,
+  running package code, network) goes in separate processes. See the
+  Sandboxing section of TODO.md for what isn't wired up yet.
+- Library code works on file descriptors, not paths: `Store` holds a
+  directory fd, frontends read from a `Read` and write file contents to
+  an `ObjectSink`, and the installer uses only the store fd and the
+  image root fd. Only the CLI opens paths. A worker can then be handed
+  just the fds it needs and run under Landlock or in a mount namespace.
+- The supervisor (the `skl` process) is the only writer of the store.
+  It hashes object contents itself, so a compromised parser can't put
+  content under the wrong hash, and it checks every manifest a frontend
+  returns (`Package::validate`) before saving it.
+- A package archive is opened once, hashed for its id, and the same open
+  file is parsed, so the manifest always matches the id.
+- The supervisor creates the image subvolume; the installer only fills
+  it through the root fd.
+- Checked on Linux 7.2: `FICLONE` works across bind mounts of the same
+  filesystem, so a mount namespace can bind the store and image
+  separately. Landlock doesn't restrict btrfs ioctls (subvolume creation
+  succeeds where it blocks `mkdir`) or `FICLONE`; workers that shouldn't
+  use them need seccomp filtering ioctl numbers.
 
 ## Tests
 
