@@ -48,10 +48,6 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 
 - Supervisor: confine `skl` itself after opening its paths (Landlock with
   the store, the package files and the image's parent directory).
-- Parallel imports: one worker per archive (a compromised worker could
-  change another package's metadata), several at once, one supervisor
-  thread per worker connection. Concurrent adds of the same object are
-  harmless, but may count it as new twice.
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
   namespaces, root is the image, no access to the store (can build on
   `src/bwrap.rs`).

@@ -27,9 +27,11 @@ are in BUGS.md.
 - Rejected for now: the fs-verity digest as the content address. fs-verity
   is left for later, so there's no need to tie the store to it now.
 - Layout: `objects/ab/cdef…` (read-only, mode 0444), `packages/<id>.json`
-  for imported manifests, `tmp/` for objects being written. Objects are
-  written to `tmp/` while hashing, then renamed into place unless an
-  identical object already exists.
+  for imported manifests, `tmp/` for objects and manifests being written.
+  Objects are written to `tmp/` while hashing, then renamed into place
+  with `RENAME_NOREPLACE` unless an identical object already exists, so
+  of concurrent adds of the same object (threads or processes) exactly
+  one counts it as new. Manifests are renamed over any earlier one.
 - An imported package is identified by the BLAKE3 hash of its archive
   file, so re-importing the same file is skipped.
 - Manifests are JSON; hashes and xattr values are hex strings.
@@ -212,6 +214,19 @@ are in BUGS.md.
 - Workers end with one result or error message; an error the worker
   sent is reported in preference to its exit status, and death by
   `SIGSYS` is reported as a blocked system call.
+- Packages are imported in parallel, `-j` at once (default: the number
+  of CPUs), each by its own worker (a compromised worker could otherwise
+  change another package's manifest) and one supervisor thread per
+  worker (`jobs::par_map`). The largest archives start first, since the
+  largest package bounds the total time. After a failure no new imports
+  start; running ones finish and are saved. The same archive given twice
+  is imported twice; not worth coordinating between threads. Importing
+  the 17 packages below (now 109 MiB of archives): 0.81 s with `-j1`,
+  0.51 s with `-j2`, 0.50 s with `-j4`, 0.50 s with `-j8` on 8 CPUs,
+  where perl alone takes 0.27 s. Sys time grows with more threads
+  (0.50 s at `-j1`, 0.75 s at `-j8`), presumably contention in btrfs.
+  Starting in command-line order instead took 0.56 s with `-j2` and
+  0.49 s with `-j8`.
 - A package archive is opened once, hashed for its id, and the same open
   file is parsed, so the manifest always matches the id.
 - Package code (install scripts, hooks) runs under an existing sandbox

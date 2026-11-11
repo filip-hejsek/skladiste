@@ -185,3 +185,36 @@ fn worker_errors_are_reported() {
         "{err:#}"
     );
 }
+
+#[test]
+fn concurrent_imports_share_objects() {
+    let Some(tmp) = btrfs_tempdir() else { return };
+    let store = Store::open(&tmp.path().join("store")).unwrap();
+    let files: Vec<Vec<u8>> = (0..200u32).map(|i| i.to_le_bytes().repeat(100)).collect();
+    let items: Vec<(String, &[u8])> = files
+        .iter()
+        .enumerate()
+        .map(|(i, data)| (format!("f{i}"), data.as_slice()))
+        .collect();
+    let items: Vec<Item> = items
+        .iter()
+        .map(|(p, data)| Item::File(p, 0o644, data))
+        .collect();
+    let path = make_package(tmp.path(), "same", &items);
+
+    let workers = workers();
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| s.spawn(|| workers.import_arch(&store, File::open(&path).unwrap())))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut new_objects = 0;
+    for r in results {
+        let (pkg, stats) = r.unwrap();
+        assert_eq!(pkg.entries.len(), 200);
+        assert_eq!(stats.files, 200);
+        new_objects += stats.new_objects;
+    }
+    assert_eq!(new_objects, 200, "each object is new for one import only");
+}

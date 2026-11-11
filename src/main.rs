@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -7,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use skladiste::install;
+use skladiste::jobs::{default_jobs, par_map};
 use skladiste::manifest::Package;
 use skladiste::store::{Store, hash_reader};
 use skladiste::worker::{self, Workers};
@@ -17,6 +19,10 @@ struct Cli {
     /// Store directory (must be on the same btrfs filesystem as images).
     #[arg(long, env = "SKL_STORE")]
     store: PathBuf,
+
+    /// Number of packages to import at once [default: number of CPUs].
+    #[arg(short, long, global = true)]
+    jobs: Option<NonZeroUsize>,
 
     /// Run workers without new namespaces and bubblewrap (INSECURE).
     #[cfg(feature = "insecure")]
@@ -87,20 +93,17 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
     let store = Store::open(&cli.store)?;
+    let jobs = cli.jobs.unwrap_or_else(default_jobs);
+    let get_packages = |paths: &[PathBuf]| get_packages(&workers, &store, paths, jobs);
     match cli.command {
         Command::Import { packages } => {
-            for path in &packages {
-                get_package(&workers, &store, path)?;
-            }
+            get_packages(&packages)?;
         }
         Command::Build { output, packages } => {
             if output.symlink_metadata().is_ok() {
                 bail!("{} already exists", output.display());
             }
-            let packages = packages
-                .iter()
-                .map(|p| get_package(&workers, &store, p))
-                .collect::<Result<Vec<_>>>()?;
+            let packages = get_packages(&packages)?;
             let r = install::build(&workers, &store, &packages, &output)?;
             eprintln!(
                 "built {}: {} files, {} dirs, {} symlinks, {} hard links",
@@ -124,9 +127,35 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// [`get_package`] for each path, `jobs` at once, each import by its own
+/// worker (so a compromised worker can't change another package's
+/// manifest). The largest archives start first, as they take longest.
+fn get_packages(
+    workers: &Workers,
+    store: &Store,
+    paths: &[PathBuf],
+    jobs: NonZeroUsize,
+) -> Result<Vec<Package>> {
+    let mut order: Vec<(usize, &PathBuf, u64)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, p, p.metadata().map_or(0, |m| m.len())))
+        .collect();
+    order.sort_by_key(|&(_, _, size)| std::cmp::Reverse(size));
+    let pkgs = par_map(&order, jobs, |&(i, p, _)| {
+        Ok((i, get_package(workers, store, p)?))
+    })?;
+    let mut slots: Vec<Option<Package>> = vec![None; paths.len()];
+    for (i, pkg) in pkgs {
+        slots[i] = Some(pkg);
+    }
+    Ok(slots.into_iter().flatten().collect())
+}
+
 /// Load a package's manifest from the store, importing the archive if needed.
 /// Packages are identified by the hash of the archive file. The file is
 /// opened once, so the parsed content is the content that was hashed.
+/// Concurrent calls for the same archive each import it.
 fn get_package(workers: &Workers, store: &Store, path: &Path) -> Result<Package> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let id = hash_reader(&mut file)

@@ -3,7 +3,7 @@
 //! Layout:
 //! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `packages/<id>.json` — imported package manifests
-//! - `tmp/` — staging area for objects being written
+//! - `tmp/` — staging area for objects and manifests being written
 //!
 //! After [`Store::open`], every access is relative to the store's directory
 //! fd, so the store also works from a sandboxed process that was handed only
@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 
 use crate::manifest::{Hash, ObjectId, Package};
@@ -115,18 +115,26 @@ impl Store {
     }
 
     /// Stream `content` into the store, returning its hash.
+    /// Safe to call from several threads and processes at once: if the
+    /// same object is added concurrently, one of them adds it and the
+    /// others report it as already present.
     pub fn add_object(&self, content: &mut dyn Read) -> Result<Added> {
-        let tmp = format!(
-            "tmp/{}-{}",
-            std::process::id(),
-            self.tmp_counter.fetch_add(1, Ordering::Relaxed)
-        );
+        let tmp = self.tmp_name();
         let result = self.add_object_via(&tmp, content);
         if result.as_ref().map_or(true, |a| !a.new) {
             // Either failed or a duplicate; the temp file is not needed.
             let _ = rustix::fs::unlinkat(&self.dir, &tmp, AtFlags::empty());
         }
         result
+    }
+
+    /// A name in `tmp/` unique among all processes using the store.
+    fn tmp_name(&self) -> String {
+        format!(
+            "tmp/{}-{}",
+            std::process::id(),
+            self.tmp_counter.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     fn add_object_via(&self, tmp: &str, content: &mut dyn Read) -> Result<Added> {
@@ -157,13 +165,20 @@ impl Store {
         drop(file);
         let (subdir, _) = dest.rsplit_once('/').unwrap();
         mkdir_exist_ok(&self.dir, subdir).with_context(|| format!("creating {subdir}"))?;
-        rustix::fs::renameat(&self.dir, tmp, &self.dir, &dest)
-            .with_context(|| format!("moving object to {dest}"))?;
-        Ok(Added {
-            hash,
-            size,
-            new: true,
-        })
+        // Another thread or process may have added the same object since
+        // the check above.
+        let new = match rustix::fs::renameat_with(
+            &self.dir,
+            tmp,
+            &self.dir,
+            &dest,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => true,
+            Err(Errno::EXIST) => false,
+            Err(e) => return Err(e).with_context(|| format!("moving object to {dest}")),
+        };
+        Ok(Added { hash, size, new })
     }
 
     pub fn load_package(&self, id: &str) -> Result<Option<Package>> {
@@ -181,18 +196,26 @@ impl Store {
         Ok(Some(pkg))
     }
 
+    /// Save a manifest under `id`, replacing any saved before. Concurrent
+    /// saves of the same package don't interfere; one of them wins.
     pub fn save_package(&self, id: &str, pkg: &Package) -> Result<()> {
         let name = package_name(id);
-        let tmp = format!("{name}.tmp");
+        let json = serde_json::to_vec(pkg)?;
+        let tmp = self.tmp_name();
         let fd = self
-            .openat(&tmp, OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, 0o644)
+            .openat(&tmp, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, 0o644)
             .with_context(|| format!("creating {tmp}"))?;
-        File::from(fd)
-            .write_all(&serde_json::to_vec(pkg)?)
-            .with_context(|| format!("writing {tmp}"))?;
-        rustix::fs::renameat(&self.dir, &tmp, &self.dir, &name)
-            .with_context(|| format!("moving {tmp} to {name}"))?;
-        Ok(())
+        let result = File::from(fd)
+            .write_all(&json)
+            .with_context(|| format!("writing {tmp}"))
+            .and_then(|()| {
+                rustix::fs::renameat(&self.dir, &tmp, &self.dir, &name)
+                    .with_context(|| format!("moving {tmp} to {name}"))
+            });
+        if result.is_err() {
+            let _ = rustix::fs::unlinkat(&self.dir, &tmp, AtFlags::empty());
+        }
+        result
     }
 }
 
