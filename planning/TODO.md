@@ -16,7 +16,8 @@ Next priorities: dependency resolution, then install scripts and hooks.
 - Signatures of downloaded packages: the repo database has them too
   (`%PGPSIG%`); repo databases themselves are usually unsigned in Arch.
 - Download packages from a mirror in `skl` itself
-  (`scripts/fetch-arch-packages.sh` does this for testing now).
+  (`scripts/fetch-arch-packages.sh` does this for testing now, with
+  dependencies resolved by name and provides, ignoring versions).
   Import each archive as soon as it arrives. Download order matters
   more than import order: this is a two-stage flow shop, where Johnson's
   rule is optimal for one downloader and one importer. Downloading is

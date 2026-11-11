@@ -1,6 +1,7 @@
 #!/bin/bash
-# Download the current versions of the named Arch Linux packages (no
-# dependency resolution) and their signatures (.sig) into DEST.
+# Download the current versions of the named Arch Linux packages and
+# their dependencies (transitively, ignoring versions), with signatures
+# (.sig), into DEST. Prints the paths of the package files.
 #
 # Usage: fetch-arch-packages.sh DEST PKGNAME...
 # Environment: ARCH_MIRROR (default https://geo.mirror.pkgbuild.com)
@@ -28,31 +29,65 @@ for repo in "${repos[@]}"; do
 	fi
 done
 
-# Print "name repo filename" for every package in the cached databases.
+# Print a line for every package in the cached databases ("P name
+# repo/filename"), each of its dependencies ("D name dependency", without
+# version constraints) and each name it provides ("V provided name").
 index() {
 	for repo in "${repos[@]}"; do
-		for desc in "$dest/db/$repo"/*/desc; do
-			awk -v repo="$repo" '
-				prev == "%NAME%" { name = $0 }
-				prev == "%FILENAME%" { file = $0 }
-				{ prev = $0 }
-				END { print name, repo, file }
-			' "$desc"
-		done
+		awk -v repo="$repo" '
+			function flush() {
+				if (name != "") print "P", name, repo "/os/x86_64/" file
+				for (i = 1; i <= nd; i++) print "D", name, deps[i]
+				for (i = 1; i <= np; i++) print "V", provs[i], name
+				name = ""; nd = 0; np = 0
+			}
+			FNR == 1 { flush() }
+			/^%.*%$/ { section = $0; next }
+			$0 == "" { section = ""; next }
+			{ v = $0; sub(/[<>=].*/, "", v) }
+			section == "%NAME%" { name = $0 }
+			section == "%FILENAME%" { file = $0 }
+			section == "%DEPENDS%" { deps[++nd] = v }
+			section == "%PROVIDES%" { provs[++np] = v }
+			END { flush() }
+		' "$dest/db/$repo"/*/desc
 	done
 }
 
-declare -A available
-while read -r name repo file; do
-	available[$name]="$repo/os/x86_64/$file"
+declare -A available depends provider
+while read -r kind a b; do
+	case $kind in
+	P) [[ -n ${available[$a]:-} ]] || available[$a]=$b ;;
+	D) depends[$a]+=" $b" ;;
+	V) [[ -n ${provider[$a]:-} ]] || provider[$a]=$b ;;
+	esac
 done < <(index)
 
-for name in "$@"; do
-	path=${available[$name]:-}
-	if [[ -z $path ]]; then
-		echo "package not found: $name" >&2
-		exit 1
+# Resolve the named packages and their dependencies, transitively. A
+# dependency is a package name or, failing that, something a package
+# provides (the first one found).
+declare -A wanted
+queue=("$@")
+order=()
+while ((${#queue[@]})); do
+	name=${queue[0]}
+	queue=("${queue[@]:1}")
+	if [[ -z ${available[$name]:-} ]]; then
+		if [[ -z ${provider[$name]:-} ]]; then
+			echo "package not found: $name" >&2
+			exit 1
+		fi
+		name=${provider[$name]}
 	fi
+	[[ -z ${wanted[$name]:-} ]] || continue
+	wanted[$name]=1
+	order+=("$name")
+	read -ra deps <<<"${depends[$name]:-}"
+	queue+=("${deps[@]}")
+done
+
+for name in "${order[@]}"; do
+	path=${available[$name]}
 	file="$dest/${path##*/}"
 	if [[ ! -f $file ]]; then
 		echo "fetching ${path##*/}" >&2

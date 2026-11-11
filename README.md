@@ -30,8 +30,9 @@ The store and images must be on the same btrfs filesystem.
 ```sh
 export SKL_STORE=/path/on/btrfs/store
 export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
-scripts/fetch-arch-packages.sh pkgs filesystem glibc bash ncurses readline
-skl build -o image pkgs/*.pkg.tar.zst
+# Downloads the packages and their dependencies; prints their paths.
+pkgs=$(scripts/fetch-arch-packages.sh pkgs filesystem bash coreutils)
+skl build -o image $pkgs
 unshare -r chroot image /usr/bin/bash
 ```
 
