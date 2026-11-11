@@ -1,14 +1,20 @@
 #!/bin/bash
 # Download the current versions of the named Arch Linux packages and
 # their dependencies (transitively, ignoring versions), with signatures
-# (.sig), into DEST. Prints the paths of the package files.
+# (.sig), into DEST. Prints the paths of the package files. With --urls,
+# prints their URLs instead and downloads only the repo databases.
 #
-# Usage: fetch-arch-packages.sh DEST PKGNAME...
+# Usage: fetch-arch-packages.sh [--urls] DEST PKGNAME...
 # Environment: ARCH_MIRROR (default https://geo.mirror.pkgbuild.com)
 set -euo pipefail
 
+urls=
+if [[ ${1:-} == --urls ]]; then
+	urls=1
+	shift
+fi
 if (($# < 2)); then
-	echo "usage: $0 DEST PKGNAME..." >&2
+	echo "usage: $0 [--urls] DEST PKGNAME..." >&2
 	exit 1
 fi
 
@@ -88,6 +94,10 @@ done
 
 for name in "${order[@]}"; do
 	path=${available[$name]}
+	if [[ -n $urls ]]; then
+		echo "$mirror/$path"
+		continue
+	fi
 	file="$dest/${path##*/}"
 	if [[ ! -f $file ]]; then
 		echo "fetching ${path##*/}" >&2

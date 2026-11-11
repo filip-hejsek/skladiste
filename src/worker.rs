@@ -21,6 +21,11 @@
 //!   refers to objects by their position in the stream ([`ObjectId`]), and
 //!   the supervisor fills in the hashes, so a compromised parser can't put
 //!   content under the wrong hash. No filesystem access, no ioctls.
+//! - `download`: fd 0 is a TCP connection the supervisor opened to the
+//!   URL's host (passed as an argument), fd 1 a socket. The worker sends
+//!   the request (over TLS for `https`) and streams the response body in
+//!   `CHUNK`s, ending with an empty `DONE`. It can't reach any other host,
+//!   and the supervisor writes the file. No filesystem access, no ioctls.
 //! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
 //!   and the store directory and image root are bound at `/store`
 //!   (read-only) and `/image` in the worker's mount namespace. The worker
@@ -28,7 +33,8 @@
 //!   the image.
 //!
 //! Directories are passed as paths inside the worker's mount namespace, or
-//! as inherited fd numbers when it runs without namespaces.
+//! as inherited fd numbers when it runs without namespaces. Other arguments
+//! of a worker come last, after `--`.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -37,12 +43,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use landlock::AccessFs;
 
 use crate::arch;
 use crate::bwrap::{self, Mount, Namespaces};
+use crate::http::{self, Url};
 use crate::install::{self, Report};
 use crate::manifest::{Content, Entry, ObjectId, Package};
 use crate::sandbox::{self, Layers, Policy};
@@ -73,6 +81,11 @@ const IMPORT_MAX_MEMORY: u64 = 1 << 30;
 /// Address space limit of the install worker, which holds the whole plan
 /// (about 40 MiB were enough for an image of 17,000 entries).
 const INSTALL_MAX_MEMORY: u64 = 4 << 30;
+/// Address space limit of the download worker (TLS and a few buffers).
+const DOWNLOAD_MAX_MEMORY: u64 = 256 << 20;
+
+/// Timeout for connecting, and for each read and write once connected.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Capabilities the install worker keeps when skl runs as root: to set
 /// owners, then modes (including setuid and setgid bits), times and xattrs
@@ -139,12 +152,31 @@ impl Workers {
             None,
         )
         .context("creating socket")?;
-        let worker = self.spawn("import-arch", archive.into(), theirs, &[], None)?;
-        // Nothing is sent to the worker.
-        rustix::net::shutdown(&ours, rustix::net::Shutdown::Write)
-            .context("shutting down socket")?;
-        let mut conn = BufReader::with_capacity(BUF_SIZE, File::from(ours));
+        let worker = self.spawn("import-arch", archive.into(), theirs, &[], None, &[])?;
+        let mut conn = receiver(ours)?;
         let result = receive_import(store, &mut conn);
+        drop(conn);
+        worker.finish(result)
+    }
+
+    /// Download `url` in a worker and write the body to `dest`, failing
+    /// if it is longer than `max_size`. Returns its size. The connection is
+    /// opened here and handed to the worker, which has no network access
+    /// of its own. Redirects are not followed.
+    pub fn download(&self, url: &Url, dest: &mut dyn Write, max_size: u64) -> Result<u64> {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        let conn = http::connect(url, DOWNLOAD_TIMEOUT)?;
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .context("creating socket")?;
+        let url = url.to_string();
+        let worker = self.spawn("download", conn.into(), theirs, &[], None, &[&url])?;
+        let mut conn = receiver(ours)?;
+        let result = receive_download(&mut conn, dest, max_size);
         drop(conn);
         worker.finish(result)
     }
@@ -169,7 +201,7 @@ impl Workers {
                 writable: true,
             },
         ];
-        let worker = self.spawn("install", plan_r, result_w, &dirs, Some(INSTALL_CAPS))?;
+        let worker = self.spawn("install", plan_r, result_w, &dirs, Some(INSTALL_CAPS), &[])?;
         // The worker reads the whole plan before it writes a result, unless
         // it fails; then its error message explains the broken pipe.
         let sent = send_json(plan_w, plan);
@@ -184,7 +216,8 @@ impl Workers {
     /// `dirs` bound in its mount namespace, their paths passed as arguments.
     /// Without namespaces, the fds of `dirs` are inherited under their
     /// current numbers instead, and the numbers passed. `root_caps`: see
-    /// [`Namespaces::root_caps`]. Stderr is a pipe; see [`Worker::finish`].
+    /// [`Namespaces::root_caps`]. `args` are passed last, after `--`.
+    /// Stderr is a pipe; see [`Worker::finish`].
     fn spawn(
         &self,
         kind: &'static str,
@@ -192,6 +225,7 @@ impl Workers {
         stdout: OwnedFd,
         dirs: &[Mount],
         root_caps: Option<&[&str]>,
+        args: &[&str],
     ) -> Result<Worker> {
         let exe_fd: OwnedFd;
         let (mut cmd, raw) = if self.layers.namespaces {
@@ -222,6 +256,7 @@ impl Workers {
         if !self.layers.seccomp {
             cmd.arg("--no-seccomp");
         }
+        cmd.arg("--").args(args);
         // Non-blocking on the worker's side: if the pipe fills up, further
         // output is lost instead of blocking a worker while the supervisor
         // waits for it on another fd. The worker can't change this, as
@@ -312,16 +347,16 @@ impl Drop for Worker {
 /// at the same time doesn't interleave.
 fn print_worker_output(kind: &str, output: &[u8]) {
     let mut stderr = io::stderr().lock();
-    for line in sanitize(&String::from_utf8_lossy(output)).lines() {
+    for line in sanitize(&String::from_utf8_lossy(output), true).lines() {
         let _ = writeln!(stderr, "{kind} worker: {line}");
     }
 }
 
-/// Escape control characters other than newline and tab.
-fn sanitize(s: &str) -> String {
+/// Escape control characters, other than newline and tab if `lines`.
+fn sanitize(s: &str, lines: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() && c != '\n' && c != '\t' {
+        if c.is_control() && !(lines && (c == '\n' || c == '\t')) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -385,9 +420,11 @@ fn read_payload(mut r: impl Read, len: usize, max: usize) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// Read an error message, escaping control characters: it may contain
+/// text from untrusted input, such as a server's reason phrase.
 fn read_error(r: impl Read, len: usize) -> anyhow::Error {
     match read_payload(r, len, MAX_ERROR) {
-        Ok(msg) => WorkerError(String::from_utf8_lossy(&msg).into_owned()).into(),
+        Ok(msg) => WorkerError(sanitize(&String::from_utf8_lossy(&msg), false)).into(),
         Err(e) => e.context("reading error message from worker"),
     }
 }
@@ -406,6 +443,40 @@ fn send_json(fd: OwnedFd, value: &(impl serde::Serialize + ?Sized)) -> Result<()
     let mut w = BufWriter::new(File::from(fd));
     serde_json::to_writer(&mut w, value)?;
     w.flush().context("sending to worker")
+}
+
+/// The supervisor's end of a socket that only the worker writes to.
+fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
+    // Nothing is sent to the worker.
+    rustix::net::shutdown(&ours, rustix::net::Shutdown::Write).context("shutting down socket")?;
+    Ok(BufReader::with_capacity(BUF_SIZE, File::from(ours)))
+}
+
+/// Supervisor side of `download`.
+fn receive_download(
+    conn: &mut BufReader<File>,
+    dest: &mut dyn Write,
+    max_size: u64,
+) -> Result<u64> {
+    let mut total: u64 = 0;
+    let mut buf = Vec::new();
+    loop {
+        let (tag, len) = read_header(&mut *conn).context("reading from worker")?;
+        match tag {
+            CHUNK if len <= MAX_CHUNK => {
+                total += len as u64;
+                if total > max_size {
+                    bail!("file is larger than {max_size} bytes");
+                }
+                buf.resize(len, 0);
+                conn.read_exact(&mut buf).context("reading from worker")?;
+                dest.write_all(&buf).context("writing download")?;
+            }
+            DONE if len == 0 => return Ok(total),
+            ERROR => return Err(read_error(conn, len)),
+            _ => bail!("unexpected message {tag} ({len} bytes) from worker"),
+        }
+    }
 }
 
 /// Supervisor side of `import-arch`.
@@ -531,8 +602,13 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
     let mut layers = Layers::default();
     // Directories: absolute paths, or inherited fd numbers.
     let mut dirs: Vec<Result<String, RawFd>> = Vec::new();
-    for arg in args {
+    let mut extra = Vec::new();
+    while let Some(arg) = args.next() {
         match arg?.as_str() {
+            "--" => {
+                extra = args.collect::<Result<_>>()?;
+                break;
+            }
             "--no-landlock" => layers.landlock = insecure_option()?,
             "--no-seccomp" => layers.seccomp = insecure_option()?,
             path if path.starts_with('/') => dirs.push(Ok(path.to_owned())),
@@ -559,14 +635,15 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
             Err(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
         })
         .collect::<Result<Vec<OwnedFd>>>()?;
-    match kind.as_str() {
-        "import-arch" if dirs.is_empty() => import_worker(layers, out),
-        "install" => {
+    match (kind.as_str(), &extra[..]) {
+        ("import-arch", []) if dirs.is_empty() => import_worker(layers, out),
+        ("download", [url]) if dirs.is_empty() => download_worker(layers, url, out),
+        ("install", []) => {
             let [store, root] = <[OwnedFd; 2]>::try_from(dirs)
                 .map_err(|_| anyhow::anyhow!("install worker needs two directories"))?;
             install_worker(layers, store, root)
         }
-        kind => bail!("unknown worker {kind:?} or wrong number of directories"),
+        (kind, _) => bail!("unknown worker {kind:?} or wrong arguments or directories"),
     }
 }
 
@@ -651,6 +728,19 @@ impl ObjectSink for RemoteSink<'_> {
     }
 }
 
+fn download_worker(layers: Layers, url: &str, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
+    let url = Url::parse(url)?;
+    // SAFETY: the supervisor passes the connection as fd 0.
+    let conn = unsafe { File::from_raw_fd(0) };
+    let policy = Policy {
+        max_memory: Some(DOWNLOAD_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(layers, &policy)?;
+    http::get(conn, &url, &mut |data| write_frame(out, CHUNK, data))?;
+    Ok(Vec::new())
+}
+
 /// System calls the installer makes besides [`sandbox`]'s basic set.
 const INSTALL_SYSCALLS: &[i64] = &[
     libc::SYS_openat,
@@ -699,8 +789,9 @@ mod tests {
     #[test]
     fn sanitize_escapes_control_characters() {
         assert_eq!(
-            sanitize("a\tb\n\x1b[2Jc\rd\u{9b}e é"),
+            sanitize("a\tb\n\x1b[2Jc\rd\u{9b}e é", true),
             "a\tb\n\\u{1b}[2Jc\\rd\\u{9b}e é"
         );
+        assert_eq!(sanitize("a\tb\nc", false), "a\\tb\\nc");
     }
 }

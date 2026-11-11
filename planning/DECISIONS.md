@@ -45,6 +45,56 @@ are in BUGS.md.
 - Owner, mode and mtime come from the tar headers; xattrs come from
   `SCHILY.xattr.*` PAX records, as written by bsdtar.
 
+## Downloads
+
+- Packages can be given as `http` or `https` URLs instead of files; the
+  signature is the same URL with `.sig` appended. No dependency
+  resolution yet (see TODO.md).
+- The supervisor resolves the host (`getaddrinfo`, not sandboxed, like
+  any program's name lookup) and opens the TCP connection; the download
+  worker gets the connected socket and speaks TLS and HTTP over it. The
+  worker therefore has the import worker's sandbox: no network
+  namespace of the host, no files, no DNS, and it can reach no other
+  host, including services on localhost. It streams only the response
+  body; the supervisor writes the file, so no other process holds an fd
+  to it. Rejected: a worker in the host's network namespace doing its
+  own DNS (needs `/etc/resolv.conf` and more system calls, and can
+  connect anywhere; Landlock can restrict only TCP ports); an HTTP
+  client library such as ureq (it opens its own connections; its
+  transport API is unstable).
+- One connection and one worker per file, `Connection: close`, no
+  keep-alive or pipelining: the worker's protocol stays one-way. Two
+  workers per package (signature, then archive), started within the
+  import jobs (`-j`), so downloads overlap with imports.
+- HTTP/1.1 is written by hand on `httparse` for the response head:
+  `Content-Length`, chunked or until close; `Accept-Encoding: identity`,
+  other encodings are rejected. Only `200` is accepted; redirects are
+  reported with their target and not followed (the supervisor would
+  have to connect again). Reads and writes time out after 30 s
+  (`SO_RCVTIMEO`/`SO_SNDTIMEO` set by the supervisor, also in effect in
+  the worker). The worker's memory limit is 256 MiB.
+- TLS: rustls with the `ring` provider (C and assembly from BoringSSL)
+  and the Mozilla roots compiled in (`webpki-roots`), so the worker
+  needs no files. A memory-safe crypto backend matters less here than
+  for signatures: TLS runs sandboxed and package integrity comes from
+  signatures; TLS keeps a network attacker from serving an older signed
+  package under a newer URL. Added 17 crates to `Cargo.lock` (most are
+  Windows-only).
+- Downloads are kept in the store's `downloads/` by file name (the URL's
+  last path segment; Arch file names include the version), written to
+  `tmp/` and renamed into place only after the signature verified,
+  archive before signature, so a signature file means a complete
+  archive. Present files are used without downloading, and verified
+  again. A file that fails verification there is an error, not
+  downloaded again.
+- Worker error messages are shown with control characters escaped, as
+  they can contain text from servers or archives.
+- Measured with 43 packages (43 MiB) from `geo.mirror.pkgbuild.com`
+  over a link of about 2.4 MB/s, into an empty store: 32.7 s with
+  `-j1`, 19.8 s `-j4`, 18.0 s `-j8` and `-j16` (bandwidth-bound);
+  sequential `curl` took 28.6 s for the same files. glibc alone (10.9
+  MB) took 4.75 s including verifying and importing, curl 4.36 s.
+
 ## Package signatures
 
 - Every package's detached signature (`<package>.sig`) is checked

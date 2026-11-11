@@ -44,6 +44,10 @@ unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img
 ```
 
+For changes to downloading, pass `--urls` to the script: it then prints
+the packages' URLs, and `skl build` downloads them into the store's
+`downloads/`.
+
 Without root, chown to other users fails; `skl build` reports how many
 entries kept the wrong owner. This is expected. If you have subordinate
 uids and gids (`/etc/subuid`, `/etc/subgid`), run `skl build` under

@@ -3,7 +3,9 @@
 //! Layout:
 //! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `packages/<id>.json` — imported package manifests
-//! - `tmp/` — staging area for objects and manifests being written
+//! - `downloads/<name>` — downloaded package archives (and their
+//!   signatures), by file name
+//! - `tmp/` — staging area for files being written
 //!
 //! After [`Store::open`], every access is relative to the store's directory
 //! fd, so the store also works from a sandboxed process that was handed only
@@ -78,7 +80,7 @@ impl Store {
             Mode::empty(),
         )
         .with_context(|| format!("opening {}", root.display()))?;
-        for sub in ["objects", "packages", "tmp"] {
+        for sub in ["objects", "packages", "downloads", "tmp"] {
             mkdir_exist_ok(&dir, sub)
                 .with_context(|| format!("creating {}", root.join(sub).display()))?;
         }
@@ -126,6 +128,29 @@ impl Store {
             let _ = rustix::fs::unlinkat(&self.dir, &tmp, AtFlags::empty());
         }
         result
+    }
+
+    /// Create a file in `tmp/`, removed unless it is saved.
+    pub fn tmp_file(&self) -> Result<TmpFile<'_>> {
+        let name = self.tmp_name();
+        let fd = self
+            .openat(&name, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, 0o644)
+            .with_context(|| format!("creating {name}"))?;
+        Ok(TmpFile {
+            store: self,
+            name,
+            file: Some(File::from(fd)),
+        })
+    }
+
+    /// Open `downloads/<name>`, if it exists.
+    pub fn open_download(&self, name: &str) -> Result<Option<File>> {
+        let path = download_path(name)?;
+        match self.openat(&path, OFlags::RDONLY, 0) {
+            Ok(fd) => Ok(Some(File::from(fd))),
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("opening {path}")),
+        }
     }
 
     /// A name in `tmp/` unique among all processes using the store.
@@ -216,6 +241,49 @@ impl Store {
             let _ = rustix::fs::unlinkat(&self.dir, &tmp, AtFlags::empty());
         }
         result
+    }
+}
+
+/// `downloads/<name>`, if `name` is a plain file name.
+fn download_path(name: &str) -> Result<String> {
+    anyhow::ensure!(
+        !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\0']),
+        "bad file name {name:?} for a download"
+    );
+    Ok(format!("downloads/{name}"))
+}
+
+/// A file being written in the store's `tmp/` directory; removed when
+/// dropped unless saved.
+pub struct TmpFile<'a> {
+    store: &'a Store,
+    name: String,
+    /// Taken when saved.
+    file: Option<File>,
+}
+
+impl TmpFile<'_> {
+    pub fn file(&mut self) -> &mut File {
+        self.file.as_mut().unwrap()
+    }
+
+    /// Move the file to `downloads/<name>`, replacing any file there.
+    /// Returns the open file.
+    pub fn save_download(mut self, name: &str) -> Result<File> {
+        let dest = download_path(name)?;
+        let dir = &self.store.dir;
+        rustix::fs::renameat(dir, &self.name, dir, &dest)
+            .with_context(|| format!("moving {} to {dest}", self.name))?;
+        self.name.clear();
+        Ok(self.file.take().unwrap())
+    }
+}
+
+impl Drop for TmpFile<'_> {
+    fn drop(&mut self) {
+        if !self.name.is_empty() {
+            let _ = rustix::fs::unlinkat(&self.store.dir, &self.name, AtFlags::empty());
+        }
     }
 }
 

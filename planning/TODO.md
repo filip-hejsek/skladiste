@@ -15,15 +15,24 @@ Next priorities: dependency resolution, then install scripts and hooks.
   instead of a path on the command line.
 - Signatures of downloaded packages: the repo database has them too
   (`%PGPSIG%`); repo databases themselves are usually unsigned in Arch.
-- Download packages from a mirror in `skl` itself
-  (`scripts/fetch-arch-packages.sh` does this for testing now, with
-  dependencies resolved by name and provides, ignoring versions).
-  Import each archive as soon as it arrives. Download order matters
-  more than import order: this is a two-stage flow shop, where Johnson's
-  rule is optimal for one downloader and one importer. Downloading is
-  usually slower, which gives largest import first. Sizes are known
-  beforehand from the repo database (`%CSIZE%`, `%ISIZE%`). To measure
-  once it exists.
+- Download from a mirror list with packages named rather than given as
+  URLs (`scripts/fetch-arch-packages.sh --urls` prints the URLs for
+  testing now, with dependencies resolved by name and provides,
+  ignoring versions). Then:
+  - Download order: this is a two-stage flow shop, where Johnson's rule
+    is optimal for one downloader and one importer. Downloading is
+    usually slower, which gives largest import first. Sizes are known
+    beforehand from the repo database (`%CSIZE%`, `%ISIZE%`).
+  - Limit each download to its `%CSIZE%` and check `%SHA256SUM%`; there
+    is no size limit on package downloads now.
+  - Downgrades: a valid signature doesn't show that the file is the
+    version the URL names. TLS prevents this on the way, but a mirror
+    can still serve an older signed package. Check the name and version
+    in `.PKGINFO` against the repo database (or at least the file name).
+  - Fall back to the next mirror when a download fails.
+- Downloads: follow redirects (the worker would report the target and
+  the supervisor connect again), use the system's CA certificates
+  instead of the compiled-in Mozilla roots, support HTTP proxies.
 - Run `.INSTALL` scriptlets and alpm hooks inside the image, in a
   sandbox (see Sandboxing).
 - Device nodes and FIFOs in packages are rejected; support them if a
@@ -66,5 +75,5 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - Low priority: signature verification in a worker (one per import
   run, not per package). It runs in the supervisor now, so a parser
   exploit gets `skl`'s privileges, which may exceed the image's.
-- Downloader (once skl downloads): network plus a download directory.
-  Repo databases are untrusted archives and get parsed like packages.
+- Repo databases are untrusted archives and get parsed in a worker like
+  packages.

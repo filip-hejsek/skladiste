@@ -10,14 +10,15 @@ are in TODO.md.
   fsync (or syncfs once per import) before publishing objects and
   manifests.
 - Files in `tmp/` are left behind if the process is killed during an
-  import; nothing cleans them up.
+  import or download; nothing cleans them up.
 
 ## Arch frontend
 
 - The archive is read three times from the same open file (signature
-  check, hash, import). Someone who can write the file meanwhile (e.g. a
-  future sandboxed downloader holding an fd to it) can get unverified
-  content imported. A fix: verify, hash and import a private copy (a
+  check, hash, import). Someone who can write the file meanwhile can get
+  unverified content imported. This affects package files given as
+  paths; downloads are written only by the supervisor (in the store).
+  Hashing while downloading would also save a read. A fix: verify, hash and import a private copy (a
   reflink clone or a sealed memfd), or hash and verify in one pass while
   copying.
 - Paths and symlink targets that aren't valid UTF-8 are rejected.
