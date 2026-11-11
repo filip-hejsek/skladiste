@@ -122,6 +122,17 @@ are in BUGS.md.
   call. Allowlisting also rejects x32 system calls. `fcntl` is allowed
   only with `F_GETFD`, which debug builds use when closing fds; `ioctl`
   only with listed request numbers.
+- Workers have a fixed address space limit (`RLIMIT_AS`, soft and hard,
+  set before confining): 1 GiB for import (real packages need tens of
+  MiB; zstd's decoding window is at most 128 MiB by default), 4 GiB for
+  install, whose memory grows with the plan. Death by `SIGABRT` is
+  reported as a possible out-of-memory. Not limited: CPU time (a stuck
+  worker only hangs skl, which can be interrupted, and any limit risks
+  failing large legitimate jobs), processes (seccomp blocks `clone`),
+  open files and file sizes (the import worker can't open files; the
+  install worker writes only what the plan says). Rejected for now:
+  cgroups, which would also limit the total of parallel workers but need
+  a delegated cgroup (e.g. from systemd).
 - Landlock is best effort with ABI 9 requested: an older kernel that
   enforces only part of it is accepted (TCP is blocked by seccomp
   anyway), a kernel without Landlock is refused.

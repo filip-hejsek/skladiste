@@ -52,6 +52,9 @@ pub(crate) struct Policy<'a> {
     pub(crate) syscalls: &'a [i64],
     /// Allowed `ioctl` request numbers; no ioctls if empty.
     pub(crate) ioctls: &'a [u64],
+    /// Limit on the address space in bytes (`RLIMIT_AS`), so a bug or
+    /// malicious input can't exhaust the host's memory.
+    pub(crate) max_memory: Option<u64>,
 }
 
 /// System calls every worker may make: I/O on its fds, memory management,
@@ -85,10 +88,20 @@ const BASE_SYSCALLS: &[i64] = &[
 /// Restrict the calling process according to `policy`. Must be called while
 /// the process is single-threaded, since seccomp applies to this thread only.
 ///
-/// Fails if a requested layer is unavailable. Landlock is applied best
+/// Resource limits are set as both soft and hard limits, so the process
+/// can't raise them (seccomp also blocks `setrlimit`). They don't depend on
+/// `layers`. Fails if a requested layer is unavailable. Landlock is applied best
 /// effort: an older kernel that lacks some restrictions (e.g. TCP, which
 /// seccomp also blocks) is accepted, a kernel without Landlock is not.
 pub(crate) fn confine(layers: Layers, policy: &Policy) -> Result<()> {
+    if let Some(max) = policy.max_memory {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+        let limit = Rlimit {
+            current: Some(max),
+            maximum: Some(max),
+        };
+        setrlimit(Resource::As, limit).context("limiting memory")?;
+    }
     // Required for unprivileged Landlock and seccomp; also keeps exec from
     // gaining privileges if seccomp is off.
     rustix::thread::set_no_new_privs(true).context("setting no_new_privs")?;
@@ -200,6 +213,26 @@ mod tests {
             assert_eq!(outside.kind(), denied);
             let create = std::fs::write(dir.path().join("new"), "x").unwrap_err();
             assert_eq!(create.kind(), denied);
+        });
+        if let Some(status) = status {
+            assert!(status.success(), "child {status}");
+        }
+    }
+
+    #[test]
+    fn memory_is_limited() {
+        let status = in_child("memory_is_limited", || {
+            let layers = Layers {
+                landlock: false,
+                seccomp: false,
+            };
+            let policy = Policy {
+                max_memory: Some(256 << 20),
+                ..Policy::default()
+            };
+            confine(layers, &policy).unwrap();
+            assert!(Vec::<u8>::new().try_reserve(16 << 20).is_ok());
+            assert!(Vec::<u8>::new().try_reserve(512 << 20).is_err());
         });
         if let Some(status) = status {
             assert!(status.success(), "child {status}");

@@ -51,8 +51,6 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - The install worker can change metadata (mode, owner, xattrs, times) of
   store files, which Landlock doesn't restrict; only their content is
   protected. Fix: bind the store read-only in a mount namespace.
-- Resource limits for workers (e.g. `RLIMIT_AS`), so a decompression or
-  header bomb can't exhaust memory.
 - Avoid copying file contents through the import socket: the worker
   writes files and passes their fds, and the supervisor reflinks them
   into the store before hashing (the worker can't change a clone).

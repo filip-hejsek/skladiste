@@ -58,6 +58,14 @@ const MAX_ERROR: usize = 64 << 10;
 /// Reply to an object: hash, size (`u64` LE), and whether it was new.
 const REPLY_LEN: usize = 32 + 8 + 1;
 
+/// Address space limit of the import worker. Real packages need tens of
+/// MiB; zstd's default limit on the decoding window is 128 MiB, and very
+/// large packages have manifests of tens of MiB.
+const IMPORT_MAX_MEMORY: u64 = 1 << 30;
+/// Address space limit of the install worker, which holds the whole plan
+/// (about 40 MiB were enough for an image of 17,000 entries).
+const INSTALL_MAX_MEMORY: u64 = 4 << 30;
+
 /// Statistics about an import, counted by the supervisor.
 #[derive(Debug, Default)]
 pub struct ImportStats {
@@ -264,6 +272,9 @@ fn describe(status: ExitStatus) -> String {
         Some(libc::SIGSYS) => {
             "was killed by SIGSYS (it made a system call its seccomp filter doesn't allow)"
                 .to_owned()
+        }
+        Some(libc::SIGABRT) => {
+            "aborted (e.g. out of memory: workers have a fixed memory limit)".to_owned()
         }
         Some(sig) => format!("was killed by signal {sig}"),
         None => format!("failed ({status})"),
@@ -522,7 +533,11 @@ fn close_other_fds(keep: &[RawFd]) -> Result<()> {
 fn import_worker(layers: Layers, out: &File) -> Result<Vec<u8>> {
     // SAFETY: the supervisor passes the archive as fd 0.
     let archive = unsafe { File::from_raw_fd(0) };
-    sandbox::confine(layers, &Policy::default())?;
+    let policy = Policy {
+        max_memory: Some(IMPORT_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(layers, &policy)?;
     let sink = RemoteSink {
         conn: out,
         buf: vec![0; CHUNK_SIZE],
@@ -593,6 +608,7 @@ fn install_worker(layers: Layers, store: OwnedFd, root: OwnedFd) -> Result<Vec<u
         // Landlock doesn't restrict ioctls on regular files, and btrfs has
         // ioctls such as subvolume creation that work on any fd.
         ioctls: &[libc::FICLONE],
+        max_memory: Some(INSTALL_MAX_MEMORY),
     };
     sandbox::confine(layers, &policy)?;
     // SAFETY: the supervisor passes the plan as fd 0.
