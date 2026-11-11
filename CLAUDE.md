@@ -39,7 +39,11 @@ rm -rf $dir/img
 ```
 
 Without root, chown to other users fails; `skl build` reports how many
-entries kept the wrong owner. This is expected.
+entries kept the wrong owner. This is expected. If you have subordinate
+uids and gids (`/etc/subuid`, `/etc/subgid`), run `skl build` under
+`unshare --map-auto --map-root-user` so owners are applied; the image then
+contains files owned by those ids, so remove it the same way
+(`unshare --map-auto --map-root-user rm -rf $dir/img`).
 
 ## Checks
 
