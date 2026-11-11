@@ -63,5 +63,8 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
   namespaces, root is the image, no access to the store (can build on
   `src/bwrap.rs`).
+- Low priority: signature verification in a worker (one per import
+  run, not per package). It runs in the supervisor now, so a parser
+  exploit gets `skl`'s privileges, which may exceed the image's.
 - Downloader (once skl downloads): network plus a download directory.
   Repo databases are untrusted archives and get parsed like packages.

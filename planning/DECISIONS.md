@@ -67,7 +67,9 @@ are in BUGS.md.
   be checked by the supervisor, so a compromised verifier is already as
   bad as a forged signature; a worker would add protection of the host
   for a per-package process and protocol. The untrusted input is only
-  the small `.sig` file and the archive bytes being hashed.
+  the small `.sig` file and the archive bytes being hashed. That host
+  protection still matters when `skl` has more privileges than the image
+  will run with, but isn't a priority (see Sandboxing in TODO.md).
 - Trust is an explicit rule, not GnuPG's web of trust: a packager key is
   a certificate with a user ID certified by at least 3 master keys
   (`archlinux-trusted`, which must list them at marginal trust `4`;
