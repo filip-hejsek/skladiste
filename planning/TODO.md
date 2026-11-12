@@ -7,24 +7,72 @@ Next priorities: dependency resolution, then install scripts and hooks.
 
 ## Arch frontend
 
-- Dependency resolution from repo databases (`core.db`, `extra.db`),
-  with Arch version comparison (`vercmp`) supplied by the frontend
-  rather than the core.
+- Repo databases (sync dbs) and building by package name. Design
+  agreed; to be done in this order, one commit each:
+  1. Repos and `skl sync`. A repo is a local name, the trust unit, with
+     its configuration in the store (`skl repo add NAME URL`, kept in
+     `repos/<name>/config.json`): a URL template in pacman's format
+     (`…/$repo/os/$arch`, arch fixed to `x86_64`) and the remote
+     database name (`core` for `core.db`), later its keyring.
+     Frontend-specific configuration may move out of the store later.
+     `skl sync` downloads each repo's database (gzip tar, unsigned) with
+     `Workers::download` and a size limit, and keeps every version: the
+     database as a store object, plus a record
+     `repos/<repo>/syncs/<time>.json` with its hash and size, the URL,
+     the fetch time (supervisor's clock) and the server's
+     `Last-Modified` (sent by the worker, so untrusted and only for
+     information). Records of repos synced together are written only
+     after all of them downloaded and parsed. A build uses each repo's
+     latest snapshot; it fails if a repo was never synced. Conditional
+     requests (304) if cheap, else later.
+  2. Reading databases in a `read-arch-db` worker (`src/arch/repo.rs`;
+     fd 0 the database, one `DONE` with JSON; import worker's sandbox,
+     a size cap per `desc`). Fields: `FILENAME`, `NAME`, `BASE`,
+     `VERSION`, `CSIZE`, `ISIZE`, `SHA256SUM`, `PGPSIG` (base64-decoded),
+     `ARCH`, `DEPENDS`, `PROVIDES`, `CONFLICTS`, `REPLACES`, the latter
+     as strings. The supervisor validates: name and version character
+     sets, the entry's directory matches `NAME-VERSION`, no duplicate
+     names, `FILENAME` a plain file name, the hash 64 hex digits, the
+     signature at most `MAX_SIGNATURE_SIZE`. Parse on every use and
+     measure (`gzip -dc extra.db`, 15,245 entries, takes 75 ms); cache by
+     database hash only if needed.
+  3. Package ids include the repo: `<repo>/<archive hash>`, manifests in
+     `packages/<repo>/<hash>.json` (objects are shared, so a package in
+     two repos costs only its manifest twice). Packages given as paths
+     or URLs belong to the pseudo-repo `@local`. Downloads move to
+     `downloads/<repo>/<file name>`, as the same file name can have
+     different content in different repos.
+  4. Build by name. A build lists the repos it may use in priority order
+     (`--repo`); a name can be qualified (`repo/name`). Restrictions are
+     per repo only: a single package can install any file, so limiting
+     which names a repo may provide would protect nothing. Arguments
+     containing `/` or ending in `.pkg.tar.zst` are paths, URLs stay
+     URLs, anything else is a name. The snapshot's entry gives the URL,
+     the signature (`%PGPSIG%`, still saved as `.sig`), the size limit
+     (`%CSIZE%`) and `%SHA256SUM%` (checked while downloading), and
+     `.PKGINFO`'s name and version must match it. Download order by
+     `%CSIZE%`.
+  5. Dependency resolution against the snapshots, with Arch version
+     comparison (`vercmp`) supplied by the frontend rather than the
+     core: versioned dependencies and soname provides are checked across
+     everything going into the image, so incompatible versions (also
+     from snapshots of different times) are reported. This trusts the
+     unsigned databases more, for usability; checking again against
+     `.PKGINFO` (see Mirror trust) limits that. Image metadata records
+     the snapshot used per repo, for upgrades and the check against
+     older versions.
+
+  Testing until 5: `scripts/fetch-arch-packages.sh --urls` prints the
+  URLs, with dependencies resolved by name and provides, ignoring
+  versions.
 - Manage the keyring in skl (from the `archlinux-keyring` package,
   updated like other packages and verified by the current keyring)
   instead of a path on the command line.
-- Signatures of downloaded packages: the repo database has them too
-  (`%PGPSIG%`); repo databases themselves are usually unsigned in Arch.
-- Download from a mirror list with packages named rather than given as
-  URLs (`scripts/fetch-arch-packages.sh --urls` prints the URLs for
-  testing now, with dependencies resolved by name and provides,
-  ignoring versions). Then:
+- Downloads from a mirror list:
   - Download order: this is a two-stage flow shop, where Johnson's rule
     is optimal for one downloader and one importer. Downloading is
     usually slower, which gives largest import first. Sizes are known
     beforehand from the repo database (`%CSIZE%`, `%ISIZE%`).
-  - Limit each download to its `%CSIZE%` and check `%SHA256SUM%`; there
-    is no size limit on package downloads now.
   - Fall back to the next mirror when a download fails.
 - Mirror trust: packages are signed, but Arch's repo databases aren't,
   so a malicious mirror (or anyone impersonating one; TLS stops only
@@ -74,7 +122,8 @@ Next priorities: dependency resolution, then install scripts and hooks.
 
 ## Store
 
-- Garbage collection of objects no package references.
+- Garbage collection of objects no package or sync record references,
+  and of old repo database snapshots.
 - Detect modified files cheaply by comparing extents (FIEMAP) with the
   store object; on a mismatch, rehash instead of reporting a
   modification, since defrag also breaks sharing.
@@ -95,5 +144,3 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - Low priority: signature verification in a worker (one per import
   run, not per package). It runs in the supervisor now, so a parser
   exploit gets `skl`'s privileges, which may exceed the image's.
-- Repo databases are untrusted archives and get parsed in a worker like
-  packages.

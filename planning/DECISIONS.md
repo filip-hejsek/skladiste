@@ -89,8 +89,8 @@ are in BUGS.md.
 - Downloads are kept in the store's `downloads/` by file name (the URL's
   last path segment; Arch file names include the version), written to
   an unnamed file in `tmp/` and linked into place only after the
-  signature verified (removing any file there first),
-  archive before signature, so a signature file means a complete
+  signature verified (removing any file there first), so a file there
+  is complete; the signature is saved after the
   archive. Present files are used without downloading, and verified
   again. A file that fails verification there is an error, not
   downloaded again.
