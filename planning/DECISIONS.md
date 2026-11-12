@@ -28,10 +28,16 @@ are in BUGS.md.
   is left for later, so there's no need to tie the store to it now.
 - Layout: `objects/ab/cdef…` (read-only, mode 0444), `packages/<id>.json`
   for imported manifests, `tmp/` for objects and manifests being written.
-  Objects are written to `tmp/` while hashing, then renamed into place
-  with `RENAME_NOREPLACE` unless an identical object already exists, so
-  of concurrent adds of the same object (threads or processes) exactly
-  one counts it as new. Manifests are renamed over any earlier one.
+  Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
+  then linked into place unless an identical object already exists;
+  linking fails if the name exists, so of concurrent adds of the same
+  object (threads or processes) exactly one counts it as new. An unnamed
+  file leaves nothing behind if skl is killed, and nobody can open it by
+  name while it's written. Linking goes through `/proc/self/fd/N`
+  (`AT_SYMLINK_FOLLOW`), since `AT_EMPTY_PATH` needs
+  `CAP_DAC_READ_SEARCH`; so writing to the store needs `/proc` (only the
+  supervisor writes). Manifests are written to a named file in `tmp/` and
+  renamed over any earlier one, which linking can't do.
 - An imported package is identified by the BLAKE3 hash of its archive
   file, so re-importing the same file is skipped.
 - Manifests are JSON; hashes and xattr values are hex strings.
@@ -82,7 +88,8 @@ are in BUGS.md.
   Windows-only).
 - Downloads are kept in the store's `downloads/` by file name (the URL's
   last path segment; Arch file names include the version), written to
-  `tmp/` and renamed into place only after the signature verified,
+  an unnamed file in `tmp/` and linked into place only after the
+  signature verified (removing any file there first),
   archive before signature, so a signature file means a complete
   archive. Present files are used without downloading, and verified
   again. A file that fails verification there is an error, not

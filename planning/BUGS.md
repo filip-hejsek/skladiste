@@ -5,12 +5,12 @@ are in TODO.md.
 
 ## Store
 
-- Objects aren't fsynced before being renamed into place, so a crash can
+- Objects aren't fsynced before being linked into place, so a crash can
   leave an object whose content doesn't match its name. A fix needs
   fsync (or syncfs once per import) before publishing objects and
   manifests.
-- Files in `tmp/` are left behind if the process is killed during an
-  import or download; nothing cleans them up.
+- A manifest being saved is left in `tmp/` if the process is killed
+  before it's renamed into place; nothing cleans it up.
 
 ## Arch frontend
 
