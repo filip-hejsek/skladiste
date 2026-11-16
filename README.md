@@ -36,6 +36,10 @@ skl build -o image $pkgs
 unshare -r chroot image /usr/bin/bash
 ```
 
+HTTPS servers are checked against the Mozilla root certificates built
+into skl; `--ca-certs FILE` (`SKL_CA_CERTS`) uses the certificates in a
+PEM file instead, e.g. behind a TLS-intercepting proxy.
+
 An image is a btrfs subvolume. Unprivileged users can remove it with `rm -rf`.
 
 ## Store layout

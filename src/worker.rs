@@ -22,7 +22,10 @@
 //!   the supervisor fills in the hashes, so a compromised parser can't put
 //!   content under the wrong hash. No filesystem access, no ioctls.
 //! - `download`: fd 0 is a TCP connection the supervisor opened to the
-//!   URL's host (passed as an argument), fd 1 a socket. The worker sends
+//!   URL's host (passed as an argument), fd 1 a socket. With a second
+//!   argument `custom-roots`, the supervisor first sends the root
+//!   certificates on fd 1 (a `CERT` frame each, in DER, then an empty
+//!   `DONE`); otherwise the worker uses the built-in ones. The worker sends
 //!   the request (over TLS for `https`) and streams the response body in
 //!   `CHUNK`s, ending with an empty `DONE`. It can't reach any other host,
 //!   and the supervisor writes the file. No filesystem access, no ioctls.
@@ -50,7 +53,7 @@ use landlock::AccessFs;
 
 use crate::arch;
 use crate::bwrap::{self, Mount, Namespaces};
-use crate::http::{self, Url};
+use crate::http::{self, RootCerts, Url};
 use crate::install::{self, Report};
 use crate::manifest::{Content, Entry, ObjectId, Package};
 use crate::sandbox::{self, Layers, Policy};
@@ -64,12 +67,15 @@ const BEGIN: u8 = 1;
 const CHUNK: u8 = 2;
 const DONE: u8 = 3;
 const ERROR: u8 = 4;
+const CERT: u8 = 5;
 
 /// Chunk size the worker sends; the supervisor accepts up to [`MAX_CHUNK`].
 const CHUNK_SIZE: usize = 64 << 10;
 const MAX_CHUNK: usize = 1 << 20;
 const MAX_DONE: usize = 256 << 20;
 const MAX_ERROR: usize = 64 << 10;
+/// Largest root certificate the download worker accepts.
+const MAX_CERT: usize = 64 << 10;
 /// Buffer size for writing and reading messages. Chunks at least this
 /// large bypass the buffer.
 const BUF_SIZE: usize = CHUNK_SIZE;
@@ -111,6 +117,7 @@ pub struct ImportStats {
 pub struct Workers {
     exe: PathBuf,
     layers: Layers,
+    roots: RootCerts,
 }
 
 impl Workers {
@@ -120,7 +127,14 @@ impl Workers {
         Workers {
             exe: exe.into(),
             layers: Layers::default(),
+            roots: RootCerts::default(),
         }
+    }
+
+    /// Check TLS server certificates of downloads against `roots` (the
+    /// built-in ones by default).
+    pub fn set_root_certs(&mut self, roots: RootCerts) {
+        self.roots = roots;
     }
 
     /// Run workers without new namespaces (and without bubblewrap).
@@ -173,10 +187,22 @@ impl Workers {
             None,
         )
         .context("creating socket")?;
+        let custom = self.roots.custom().filter(|_| url.tls);
         let url = url.to_string();
-        let worker = self.spawn("download", conn.into(), theirs, &[], None, &[&url])?;
-        let mut conn = receiver(ours)?;
-        let result = receive_download(&mut conn, dest, max_size);
+        let mut args = vec![&*url];
+        if custom.is_some() {
+            args.push("custom-roots");
+        }
+        let worker = self.spawn("download", conn.into(), theirs, &[], None, &args)?;
+        let ours = File::from(ours);
+        // The worker reads all certificates before it writes anything but
+        // an error, which then explains a failure to send them.
+        let sent = custom.map_or(Ok(()), |certs| send_certs(&ours, certs));
+        let mut conn = receiver(ours.into())?;
+        let result = receive_download(&mut conn, dest, max_size).and_then(|size| {
+            sent?;
+            Ok(size)
+        });
         drop(conn);
         worker.finish(result)
     }
@@ -445,9 +471,38 @@ fn send_json(fd: OwnedFd, value: &(impl serde::Serialize + ?Sized)) -> Result<()
     w.flush().context("sending to worker")
 }
 
-/// The supervisor's end of a socket that only the worker writes to.
+/// Send root certificates to a download worker.
+fn send_certs(conn: &File, certs: &[rustls::pki_types::CertificateDer]) -> Result<()> {
+    let mut w = BufWriter::new(conn);
+    for cert in certs {
+        anyhow::ensure!(
+            cert.len() <= MAX_CERT,
+            "root certificate of {} bytes is too large (limit {MAX_CERT})",
+            cert.len()
+        );
+        write_frame(&mut w, CERT, cert)?;
+    }
+    write_frame(&mut w, DONE, &[])?;
+    w.flush().context("sending root certificates to worker")
+}
+
+/// Worker side of [`send_certs`].
+fn receive_certs(conn: &File) -> Result<RootCerts> {
+    let mut r = BufReader::new(conn);
+    let mut certs = Vec::new();
+    loop {
+        match read_header(&mut r).context("reading root certificates")? {
+            (CERT, len) => certs.push(read_payload(&mut r, len, MAX_CERT)?.into()),
+            (DONE, 0) => return RootCerts::from_der(certs),
+            (tag, len) => bail!("unexpected message {tag} ({len} bytes) from supervisor"),
+        }
+    }
+}
+
+/// The supervisor's end of a socket that only the worker writes to (any
+/// input for the worker was sent before).
 fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
-    // Nothing is sent to the worker.
+    // Nothing more is sent to the worker.
     rustix::net::shutdown(&ours, rustix::net::Shutdown::Write).context("shutting down socket")?;
     Ok(BufReader::with_capacity(BUF_SIZE, File::from(ours)))
 }
@@ -637,7 +692,10 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
         .collect::<Result<Vec<OwnedFd>>>()?;
     match (kind.as_str(), &extra[..]) {
         ("import-arch", []) if dirs.is_empty() => import_worker(layers, out),
-        ("download", [url]) if dirs.is_empty() => download_worker(layers, url, out),
+        ("download", [url]) if dirs.is_empty() => download_worker(layers, url, false, out),
+        ("download", [url, roots]) if dirs.is_empty() && roots == "custom-roots" => {
+            download_worker(layers, url, true, out)
+        }
         ("install", []) => {
             let [store, root] = <[OwnedFd; 2]>::try_from(dirs)
                 .map_err(|_| anyhow::anyhow!("install worker needs two directories"))?;
@@ -728,7 +786,13 @@ impl ObjectSink for RemoteSink<'_> {
     }
 }
 
-fn download_worker(layers: Layers, url: &str, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
+/// `custom_roots`: read the root certificates from fd 1 first.
+fn download_worker(
+    layers: Layers,
+    url: &str,
+    custom_roots: bool,
+    out: &mut BufWriter<File>,
+) -> Result<Vec<u8>> {
     let url = Url::parse(url)?;
     // SAFETY: the supervisor passes the connection as fd 0.
     let conn = unsafe { File::from_raw_fd(0) };
@@ -737,7 +801,14 @@ fn download_worker(layers: Layers, url: &str, out: &mut BufWriter<File>) -> Resu
         ..Policy::default()
     };
     sandbox::confine(layers, &policy)?;
-    http::get(conn, &url, &mut |data| write_frame(out, CHUNK, data))?;
+    let roots = if custom_roots {
+        receive_certs(out.get_ref())?
+    } else {
+        RootCerts::default()
+    };
+    http::get(conn, &url, &roots, &mut |data| {
+        write_frame(out, CHUNK, data)
+    })?;
     Ok(Vec::new())
 }
 

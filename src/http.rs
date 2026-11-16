@@ -3,7 +3,8 @@
 //! The supervisor parses the URL ([`Url`]) and opens the TCP connection
 //! ([`connect`]); the download worker speaks TLS and HTTP over it (`get`),
 //! so it needs no network access, DNS or files of its own and can reach no
-//! other host. Redirects are not followed.
+//! other host. Redirects are not followed. Server certificates are checked
+//! against [`RootCerts`].
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use rustls::pki_types::CertificateDer;
 
 /// Longest response head (status line and headers) accepted.
 const MAX_HEAD: u64 = 64 << 10;
@@ -177,21 +179,75 @@ pub fn connect(url: &Url, timeout: Duration) -> Result<TcpStream> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("{} has no addresses", url.host)))
 }
 
+/// The root certificates that TLS server certificates must chain to: by
+/// default the Mozilla roots compiled into skl (`webpki-roots`), or
+/// certificates given by the user instead.
+#[derive(Clone, Debug, Default)]
+pub struct RootCerts {
+    /// `None` for the built-in roots. Each certificate was checked to be
+    /// usable as a trust anchor.
+    custom: Option<Vec<CertificateDer<'static>>>,
+}
+
+impl RootCerts {
+    /// Root certificates from a PEM file, such as a CA bundle
+    /// (`/etc/ssl/certs/ca-certificates.crt`), used instead of the built-in
+    /// ones. Sections other than `CERTIFICATE` are ignored. There must be
+    /// at least one certificate, and each must be usable as a trust anchor.
+    pub fn from_pem(pem: &[u8]) -> Result<RootCerts> {
+        use rustls::pki_types::pem::PemObject;
+        let certs = CertificateDer::pem_slice_iter(pem)
+            .enumerate()
+            .map(|(i, cert)| cert.with_context(|| format!("reading certificate {}", i + 1)))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(!certs.is_empty(), "no certificates found");
+        Self::from_der(certs)
+    }
+
+    /// Root certificates in DER, used instead of the built-in ones.
+    pub(crate) fn from_der(certs: Vec<CertificateDer<'static>>) -> Result<RootCerts> {
+        let roots = RootCerts {
+            custom: Some(certs),
+        };
+        roots.store()?;
+        Ok(roots)
+    }
+
+    /// The certificates given instead of the built-in ones, if any.
+    pub(crate) fn custom(&self) -> Option<&[CertificateDer<'static>]> {
+        self.custom.as_deref()
+    }
+
+    fn store(&self) -> Result<rustls::RootCertStore> {
+        let Some(certs) = &self.custom else {
+            return Ok(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            });
+        };
+        let mut store = rustls::RootCertStore::empty();
+        for (i, cert) in certs.iter().enumerate() {
+            store
+                .add(cert.clone())
+                .with_context(|| format!("certificate {} is not a usable root", i + 1))?;
+        }
+        Ok(store)
+    }
+}
+
 /// Request `url` over `stream`, an open connection to its host, using TLS
-/// for `https` (with the Mozilla root certificates compiled in), and pass
+/// for `https` with server certificates checked against `roots`, and pass
 /// the body of a `200 OK` response to `body` in pieces. Any other status
 /// is an error, including redirects.
 pub(crate) fn get(
     stream: impl Read + Write,
     url: &Url,
+    roots: &RootCerts,
     body: &mut dyn FnMut(&[u8]) -> io::Result<()>,
 ) -> Result<()> {
     if !url.tls {
         return request(stream, url, body);
     }
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
+    let roots = roots.store()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?

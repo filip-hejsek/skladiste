@@ -91,6 +91,17 @@ are in BUGS.md.
   signatures; TLS keeps a network attacker from serving an older signed
   package under a newer URL. Added 17 crates to `Cargo.lock` (most are
   Windows-only).
+- Root certificates given by the user (`--ca-certs FILE`,
+  `SKL_CA_CERTS`): a PEM file whose certificates replace the built-in
+  roots, not add to them, as with a CA bundle such as
+  `/etc/ssl/certs/ca-certificates.crt` (or a TLS-intercepting proxy's).
+  The supervisor reads and checks them at startup (each must be a usable
+  trust anchor; non-certificate PEM sections are ignored) and sends them
+  in DER to each `https` download worker on its socket before the worker
+  sends anything, so the worker still needs no files. Rejected: an
+  argument (a bundle of 122 roots is 180 KB of PEM, over Linux's
+  128 KiB limit per argument); an extra fd (needs new plumbing through
+  bubblewrap for one input sent once).
 - Downloads are kept in the store's `downloads/` by file name (the URL's
   last path segment; Arch file names include the version), written to
   an unnamed file in `tmp/` and linked into place only after the

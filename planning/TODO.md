@@ -130,8 +130,8 @@ Next priorities: dependency resolution, then install scripts and hooks.
   - Warn when the mirror's `lastupdate` is old; optionally compare
     databases from a second mirror.
 - Downloads: follow redirects (the worker would report the target and
-  the supervisor connect again), use the system's CA certificates
-  instead of the compiled-in Mozilla roots, support HTTP proxies.
+  the supervisor connect again), use the system's CA certificates by
+  default (now only with `--ca-certs`), support HTTP proxies.
 - Run `.INSTALL` scriptlets and alpm hooks inside the image, in a
   sandbox (see Sandboxing).
 - Device nodes and FIFOs in packages are rejected; support them if a

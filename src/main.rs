@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use skladiste::arch::signature::{self, Keyring};
-use skladiste::http::Url;
+use skladiste::http::{RootCerts, Url};
 use skladiste::install;
 use skladiste::jobs::{default_jobs, par_map};
 use skladiste::manifest::Package;
@@ -27,6 +27,12 @@ struct Cli {
     /// suffix: PREFIX.gpg, PREFIX-trusted and PREFIX-revoked are read.
     #[arg(long, env = "SKL_KEYRING", value_name = "PREFIX")]
     keyring: PathBuf,
+
+    /// PEM file of root certificates to check HTTPS servers against,
+    /// instead of the Mozilla roots built into skl (e.g. a CA bundle such
+    /// as /etc/ssl/certs/ca-certificates.crt).
+    #[arg(long, env = "SKL_CA_CERTS", value_name = "FILE")]
+    ca_certs: Option<PathBuf>,
 
     /// Number of packages to download and import at once [default: number
     /// of CPUs].
@@ -92,7 +98,6 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    #[allow(unused_mut)]
     let mut workers = Workers::new("/proc/self/exe");
     #[cfg(feature = "insecure")]
     {
@@ -105,6 +110,12 @@ fn run(cli: Cli) -> Result<()> {
         if cli.insecure_no_seccomp {
             workers.disable_seccomp();
         }
+    }
+    if let Some(path) = &cli.ca_certs {
+        let pem = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let roots = RootCerts::from_pem(&pem)
+            .with_context(|| format!("loading root certificates from {}", path.display()))?;
+        workers.set_root_certs(roots);
     }
     let store = Store::open(&cli.store)?;
     let keyring = load_keyring(&cli.keyring)?;
