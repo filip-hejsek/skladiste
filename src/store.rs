@@ -3,7 +3,7 @@
 //! Layout:
 //! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
-//!   and the archive's hash (packages given as paths or URLs belong to
+//!   and the archive's hash (packages imported from files or URLs belong to
 //!   the pseudo-repo [`repo::LOCAL`])
 //! - `downloads/<repo>/<name>` — downloaded package archives (and their
 //!   signatures), by repo and file name
@@ -266,6 +266,22 @@ impl Store {
         self.read_json(&package_name(repo, hash)?)
     }
 
+    /// The archive hashes of the packages imported from `repo`, sorted.
+    pub fn packages(&self, repo: &str) -> Result<Vec<Hash>> {
+        repo::check_name_or_local(repo)?;
+        let dir = format!("packages/{repo}");
+        if let Err(Errno::NOENT) = rustix::fs::statat(&self.dir, &dir, AtFlags::empty()) {
+            return Ok(Vec::new());
+        }
+        let mut hashes: Vec<Hash> = self
+            .list_dir(&dir)?
+            .iter()
+            .filter_map(|n| n.strip_suffix(".json")?.parse().ok())
+            .collect();
+        hashes.sort();
+        Ok(hashes)
+    }
+
     /// Save the manifest of the package from `repo` whose archive has
     /// `hash`, replacing any saved before. Concurrent saves of the same
     /// package don't interfere; one of them wins.
@@ -467,6 +483,9 @@ mod tests {
         let pkg = |version: &str| Package {
             name: "a".into(),
             version: version.into(),
+            depends: vec![],
+            provides: vec![],
+            conflicts: vec![],
             entries: vec![],
         };
         store.save_package(repo::LOCAL, &hash, &pkg("1-1")).unwrap();
@@ -475,6 +494,8 @@ mod tests {
         assert_eq!(load(repo::LOCAL).as_deref(), Some("1-1"));
         assert_eq!(load("core").as_deref(), Some("2-1"));
         assert_eq!(load("extra"), None);
+        assert_eq!(store.packages("core").unwrap(), [hash]);
+        assert_eq!(store.packages("extra").unwrap(), []);
         assert!(store.save_package("../x", &hash, &pkg("1")).is_err());
         assert!(
             dir.path()

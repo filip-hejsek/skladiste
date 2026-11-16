@@ -14,11 +14,11 @@ formats can be added as frontends.
 - Imports Arch `.pkg.tar.zst` packages into the store, after checking
   each package's signature (`.sig` next to it) against the Arch keyring:
   the signing key must be certified by at least 3 of the master keys
-- Builds a new image subvolume from a list of packages: names looked up
-  in repos, files or URLs
+- Builds a new image subvolume from a list of package names, looked up
+  in repos and among package files imported before (`skl import`)
 - Keeps Arch repo databases (`skl repo add`, `skl sync`), every version
-- Resolves dependencies of packages given by name, pacman-style
-  (versioned dependencies, provides, conflicts)
+- Resolves dependencies pacman-style (versioned dependencies, provides,
+  conflicts)
 - No install scripts or hooks yet
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
@@ -39,12 +39,24 @@ mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
 skl repo add core "$mirror"
 skl repo add extra "$mirror"
 skl sync
-skl build --repo core --repo extra -o image filesystem bash coreutils
+skl build --fetch --repo core --repo extra -o image filesystem bash coreutils
 unshare -r chroot image /usr/bin/bash
 ```
 
-Package files and URLs can be given instead of names (with their
-signatures as `.sig` next to them); their dependencies are not resolved.
+`build` takes package names (`NAME`, or `REPO/NAME` for a package from
+one repo) and uses the repos given with `--repo`, in priority order. It
+uses the network only when asked: `--sync` downloads the repos'
+databases first (as `skl sync`), and `--fetch` downloads packages that
+aren't in the store yet.
+
+Package files and URLs (with their signatures as `.sig` next to them)
+are imported in a step of their own, and are then available to builds as
+the repo `@local`:
+
+```sh
+skl import ./mypkg-1.0-1-x86_64.pkg.tar.zst
+skl build --fetch --repo @local --repo core --repo extra -o image mypkg
+```
 
 HTTPS servers are checked against the Mozilla root certificates built
 into skl; `--ca-certs FILE` (`SKL_CA_CERTS`) uses the certificates in a
@@ -56,7 +68,8 @@ An image is a btrfs subvolume. Unprivileged users can remove it with `rm -rf`.
 
 - `objects/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
 - `packages/<repo>/<hash>.json` — imported package manifests, keyed by the
-  archive's hash; packages given as paths or URLs are in the repo `@local`
+  archive's hash; packages imported from files or URLs are in the repo
+  `@local`
 - `downloads/<repo>/` — downloaded packages and their signatures
 - `repos/<repo>/` — a repo's configuration and a record of each version of
   its database that was synced (the database itself is an object)

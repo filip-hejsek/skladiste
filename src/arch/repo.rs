@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::arch::signature::MAX_SIGNATURE_SIZE;
 use crate::http::Url;
+use crate::manifest::Package;
 use crate::repo::{self, SyncRecord};
 use crate::resolve::{Candidate, Dep, Op, Provide};
 use crate::store::Store;
@@ -114,20 +115,50 @@ impl Snapshot {
 impl DbEntry {
     /// This package for dependency resolution.
     pub fn candidate(&self) -> Result<Candidate> {
-        let deps = |list: &[String]| list.iter().map(|d| parse_dep(d)).collect::<Result<_>>();
-        Ok::<_, anyhow::Error>(Candidate {
-            name: self.name.clone(),
-            version: self.version.clone(),
-            depends: deps(&self.depends)?,
-            provides: self
-                .provides
-                .iter()
-                .map(|p| parse_provide(p))
-                .collect::<Result<_>>()?,
-            conflicts: deps(&self.conflicts)?,
-        })
-        .with_context(|| format!("package {}", self.name))
+        candidate(
+            &self.name,
+            &self.version,
+            &self.depends,
+            &self.provides,
+            &self.conflicts,
+        )
     }
+}
+
+/// An imported package for dependency resolution, by its own metadata
+/// (`.PKGINFO`). That came from the import worker, so the name and
+/// version are checked here as well as the dependencies.
+pub fn package_candidate<F>(pkg: &Package<F>) -> Result<Candidate> {
+    check_name(&pkg.name)?;
+    check_version(&pkg.version).with_context(|| format!("package {}", pkg.name))?;
+    candidate(
+        &pkg.name,
+        &pkg.version,
+        &pkg.depends,
+        &pkg.provides,
+        &pkg.conflicts,
+    )
+}
+
+fn candidate(
+    name: &str,
+    version: &str,
+    depends: &[String],
+    provides: &[String],
+    conflicts: &[String],
+) -> Result<Candidate> {
+    let deps = |list: &[String]| list.iter().map(|d| parse_dep(d)).collect::<Result<_>>();
+    Ok::<_, anyhow::Error>(Candidate {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        depends: deps(depends)?,
+        provides: provides
+            .iter()
+            .map(|p| parse_provide(p))
+            .collect::<Result<_>>()?,
+        conflicts: deps(conflicts)?,
+    })
+    .with_context(|| format!("package {name}"))
 }
 
 /// Parse a dependency or conflict: `NAME`, or `NAME` followed by `<`,
@@ -591,6 +622,26 @@ mod tests {
         );
         assert_eq!(parse_provide("sh").unwrap().version, None);
         assert!(parse_provide("sh>=1").is_err());
+    }
+
+    #[test]
+    fn imported_packages() {
+        let pkg = |name: &str, version: &str, depend: &str| Package::<()> {
+            name: name.into(),
+            version: version.into(),
+            depends: vec![depend.into()],
+            provides: vec!["sh".into(), "libfoo.so=1-64".into()],
+            conflicts: vec!["old<2".into()],
+            entries: vec![],
+        };
+        let c = package_candidate(&pkg("bash", "5.3-1", "glibc>=2.40")).unwrap();
+        assert_eq!((&*c.name, &*c.version), ("bash", "5.3-1"));
+        assert_eq!(c.depends[0].to_string(), "glibc>=2.40");
+        assert_eq!(c.provides[1].version.as_deref(), Some("1-64"));
+        assert_eq!(c.conflicts[0].to_string(), "old<2");
+        assert!(package_candidate(&pkg("ba sh", "5.3-1", "glibc")).is_err());
+        assert!(package_candidate(&pkg("bash", "5.3", "glibc")).is_err());
+        assert!(package_candidate(&pkg("bash", "5.3-1", "gl\u{1b}ibc")).is_err());
     }
 
     #[test]

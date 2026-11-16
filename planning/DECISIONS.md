@@ -48,7 +48,7 @@ are in BUGS.md.
 - An imported package is identified by its repo and the BLAKE3 hash of
   its archive file (`<repo>/<hash>`), so re-importing the same file is
   skipped. Objects are shared, so a package in two repos costs only its
-  manifest twice. Packages given as paths or URLs belong to the
+  manifest twice. Packages imported from paths or URLs belong to the
   pseudo-repo `@local`.
 - Manifests are JSON; hashes and xattr values are hex strings.
 
@@ -56,8 +56,11 @@ are in BUGS.md.
 
 - Only zstd-compressed packages are supported, as current Arch packages
   use zstd.
-- Package name and version come from `.PKGINFO`; other metadata files
-  (`.MTREE`, `.BUILDINFO`, `.INSTALL`, `.CHANGELOG`) are ignored for now.
+- Package name, version, dependencies, provides and conflicts come from
+  `.PKGINFO` and are kept in the manifest (dependencies as strings in
+  Arch's syntax; the supervisor checks them when importing, as for
+  database entries); other metadata files (`.MTREE`, `.BUILDINFO`,
+  `.INSTALL`, `.CHANGELOG`) are ignored for now.
 - Owner, mode and mtime come from the tar headers; xattrs come from
   `SCHILY.xattr.*` PAX records, as written by bsdtar.
 
@@ -110,20 +113,34 @@ are in BUGS.md.
   was replaced. Cache by database hash only if this matters.
 - No conditional requests yet: syncing core and extra (8.8 MiB) took
   0.9 s, 1.35 s with reading them.
-- The keyring is needed only to import packages (`import`, `build`).
-- Packages can be given by name. A build (or import) lists the repos it
-  may use in priority order (`--repo`) and uses each one's latest
+- The keyring is needed to import packages: by `import`, and by `build`
+  when it uses packages from synced repos (their archives are verified
+  again each time).
+- `build` takes only package names. It lists the repos it may use in
+  priority order (`--repo`, at least one) and uses each one's latest
   snapshot, failing if a repo was never synced; the first repo with the
   name wins, and `REPO/NAME` takes it from that repo, which must be
   among `--repo`. Restrictions are per repo only: a single package can
   install any file, so limiting which names a repo may provide would
   protect nothing. A package named twice is taken once.
-- Arguments: URLs stay URLs; `REPO/NAME` with one of the `--repo` repos
-  is a qualified name; other arguments containing `/` or ending in
-  `.pkg.tar.zst` are paths (`./REPO/NAME` for a file that would read as
-  a name); anything else is a name. `REPO/NAME` with a configured repo
-  not among `--repo` is an error rather than a path, as it's more likely
-  a mistake.
+- `build` uses the network only when asked: `--sync` syncs the `--repo`
+  repos first (as `skl sync` with those repos), `--fetch` downloads
+  packages that aren't in the store's downloads; without it, a missing
+  package is an error.
+- Package files and URLs are imported in a step of their own (`skl
+  import FILE|URL...`) into the pseudo-repo `@local`, which a build uses
+  like any other repo (`--repo @local`, `@local/NAME`). So `build`'s
+  arguments are never paths, and local packages take part in dependency
+  resolution, by the metadata in their manifests. Rejected: files and
+  URLs as `build` arguments (a name could be read as a path and the
+  reverse, which needed rules like `./REPO/NAME`; their dependencies
+  were known only after importing, so they weren't resolved).
+- `@local` offers every package imported into it. Of several versions
+  of a name, the newest comes first, so it is taken unless a versioned
+  dependency excludes it. Signatures of local packages are checked when
+  importing, not again by builds: the archive of a file isn't kept.
+  All `@local` manifests are read for each build that uses it (not
+  measured); index them if this gets slow.
 - The snapshot's entry gives the URL (`<server>/<FILENAME>`), the
   signature (`%PGPSIG%`, still saved as `.sig` next to the download;
   an entry without one is an error), the size limit and exact size
@@ -137,10 +154,10 @@ are in BUGS.md.
 
 ## Dependency resolution
 
-- Packages given by name are resolved with their dependencies against
-  the latest snapshots of the `--repo` repos (`src/resolve.rs`). The
+- Packages are resolved with their dependencies against the `--repo`
+  repos: latest snapshots and `@local` (`src/resolve.rs`). The
   resolver is format-independent: the frontend turns database entries
-  into candidates (name, version, depends, provides, conflicts; Arch's
+  and imported manifests into candidates (name, version, depends, provides, conflicts; Arch's
   `NAME`, `NAME<=V` etc. parsed in `src/arch/repo.rs`) and supplies the
   version comparison (`src/arch/version.rs`, pacman's `vercmp`: epoch,
   then version with rpm's segment rules, then the release only if both
@@ -175,9 +192,8 @@ are in BUGS.md.
 
 ## Downloads
 
-- Packages can be given as `http` or `https` URLs instead of files; the
-  signature is the same URL with `.sig` appended. No dependency
-  resolution yet (see TODO.md).
+- `skl import` takes `http` or `https` URLs as well as files; the
+  signature is the same URL with `.sig` appended.
 - The supervisor resolves the host (`getaddrinfo`, not sandboxed, like
   any program's name lookup) and opens the TCP connection; the download
   worker gets the connected socket and speaks TLS and HTTP over it. The
@@ -241,8 +257,10 @@ are in BUGS.md.
 ## Package signatures
 
 - Every package's detached signature (`<package>.sig`) is checked
-  against the Arch keyring before the archive is hashed or parsed, also
-  when it was imported before (the keyring may have changed since).
+  against the Arch keyring before the archive is hashed or parsed. For
+  packages from synced repos this is repeated by every build, from the
+  kept download (the keyring may have changed since); `@local` packages
+  are checked only when imported.
   There's no option to skip it. The keyring is given as a path prefix
   (`--keyring`, `SKL_KEYRING`): `PREFIX.gpg`, `PREFIX-trusted`,
   `PREFIX-revoked`, as in `/usr/share/pacman/keyrings/`. skl is meant

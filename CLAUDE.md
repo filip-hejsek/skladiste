@@ -43,17 +43,17 @@ export SKL_STORE=$dir/store SKL_KEYRING=/usr/share/pacman/keyrings/archlinux
 skl() { cargo run -q --release -- "$@"; }
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
 skl repo add core "$mirror" && skl repo add extra "$mirror"  # once
-skl sync
 # 42 packages with dependencies, downloaded into the store's downloads/.
-skl build --repo core --repo extra -o $dir/img filesystem bash coreutils
+skl build --sync --fetch --repo core --repo extra -o $dir/img filesystem bash coreutils
 unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img
 ```
 
-For package files given as paths, `scripts/fetch-arch-packages.sh
-$dir/pkgs filesystem bash coreutils` downloads the packages and their
-dependencies (ignoring versions) and prints their paths; with `--urls`
-it prints their URLs instead.
+For importing package files (`skl import FILE...`, then `skl build
+--repo @local`), `scripts/fetch-arch-packages.sh $dir/pkgs filesystem
+bash coreutils` downloads the packages and their dependencies (ignoring
+versions) and prints their paths; with `--urls` it prints their URLs
+instead.
 
 Without root, chown to other users fails; `skl build` reports how many
 entries kept the wrong owner. This is expected. If you have subordinate

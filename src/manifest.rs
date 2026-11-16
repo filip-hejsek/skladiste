@@ -66,6 +66,12 @@ impl<'de> Deserialize<'de> for Hash {
 pub struct Package<F = Content> {
     pub name: String,
     pub version: String,
+    /// Dependencies, provides and conflicts from the package's own
+    /// metadata, in the frontend's syntax (e.g. `glibc>=2.40`). The
+    /// frontend that reads them checks them.
+    pub depends: Vec<String>,
+    pub provides: Vec<String>,
+    pub conflicts: Vec<String>,
     pub entries: Vec<Entry<F>>,
 }
 
@@ -118,6 +124,9 @@ impl Package<ObjectId> {
         Ok(Package {
             name: self.name,
             version: self.version,
+            depends: self.depends,
+            provides: self.provides,
+            conflicts: self.conflicts,
             entries,
         })
     }
@@ -259,6 +268,9 @@ mod tests {
         let pkg = |path: &str| Package::<Content> {
             name: "p".into(),
             version: "1".into(),
+            depends: vec!["d".into()],
+            provides: vec![],
+            conflicts: vec![],
             entries: vec![Entry {
                 path: path.into(),
                 kind: EntryKind::Dir,
@@ -280,6 +292,9 @@ mod tests {
         let pkg = |object| Package {
             name: "p".into(),
             version: "1".into(),
+            depends: vec!["d".into()],
+            provides: vec![],
+            conflicts: vec![],
             entries: vec![Entry {
                 path: "f".into(),
                 kind: EntryKind::File(ObjectId { object }),

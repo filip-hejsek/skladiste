@@ -7,10 +7,12 @@ Next priorities: install scripts and hooks.
 
 ## Arch frontend
 
-- Dependencies of packages given as paths or URLs aren't resolved,
-  and they don't satisfy dependencies of packages given by name (their
-  metadata is known only after import). Resolve after importing them,
-  from `.PKGINFO`.
+- `@local` can't be managed: no command lists or removes imported
+  packages, and a build can't choose an older version of a name except
+  through a versioned dependency.
+- `skl import` doesn't check a package's architecture (`arch` in
+  `.PKGINFO`).
+- A command to download a build's packages without building.
 - The resolver doesn't search: like pacman, it takes the first package
   that fits each dependency and reports a conflict rather than trying
   another choice.

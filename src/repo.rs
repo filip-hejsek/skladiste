@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::Hash;
 
-/// Pseudo-repo of packages given as paths or URLs.
+/// Pseudo-repo of packages imported from files or URLs.
 pub const LOCAL: &str = "@local";
 
 /// Longest repo name accepted.

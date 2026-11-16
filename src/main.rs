@@ -66,37 +66,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import Arch packages into the store.
+    /// Import Arch package files into the store, as the repo `@local`.
     ///
-    /// Packages are names, files or http(s) URLs. A name is looked up in
-    /// the repos given with `--repo`, or in one of them as `REPO/NAME`, and
-    /// its dependencies are added (not those of files and URLs); the
-    /// package's signature, size and SHA-256 come from the repo's
-    /// database. Other arguments containing `/` or ending in
-    /// `.pkg.tar.zst` are files (write `./REPO/NAME` for a file that would
-    /// read as a name). The signature of a file or URL is read from the
-    /// same path or URL with `.sig` appended. Downloads are kept in the
-    /// store's `downloads/<repo>/` directory (`@local` for URLs) and not
-    /// downloaded again for the same file name. Redirects are not
-    /// followed.
+    /// Packages are files or http(s) URLs. The signature is read from the
+    /// same path or URL with `.sig` appended. Builds can use the imported
+    /// packages with `--repo @local`. Downloads are kept in the store's
+    /// `downloads/@local/` directory and not downloaded again for the
+    /// same file name. Redirects are not followed.
     Import {
-        #[command(flatten)]
-        repos: Repos,
-        #[arg(required = true)]
+        /// Package files or URLs.
+        #[arg(required = true, value_name = "FILE|URL")]
         packages: Vec<OsString>,
     },
-    /// Create a new image subvolume containing the given packages.
+    /// Create a new image subvolume containing the given packages and
+    /// their dependencies.
     ///
     /// Install scripts are not run.
     Build {
         /// Path of the new subvolume (must not exist).
         #[arg(short, long)]
         output: PathBuf,
-        #[command(flatten)]
-        repos: Repos,
-        /// Arch packages as for `import`, imported first if needed.
-        #[arg(required = true)]
-        packages: Vec<OsString>,
+        /// Download the databases of the repos first, as `skl sync` does.
+        #[arg(long)]
+        sync: bool,
+        /// Download packages that aren't in the store yet. Without this,
+        /// a build uses the network only for `--sync`.
+        #[arg(long)]
+        fetch: bool,
+        /// Repo to take packages from (repeatable, in priority order): a
+        /// repo added with `skl repo add`, of which the latest sync is
+        /// used, or `@local` for the packages imported with `skl import`.
+        #[arg(long = "repo", value_name = "REPO", required = true)]
+        repos: Vec<String>,
+        /// Package names: `NAME`, or `REPO/NAME` to take it from that repo.
+        #[arg(required = true, value_name = "PACKAGE")]
+        packages: Vec<String>,
     },
     /// Manage repos.
     Repo {
@@ -112,14 +116,6 @@ enum Command {
         /// Repos to sync [default: all].
         repos: Vec<String>,
     },
-}
-
-#[derive(clap::Args)]
-struct Repos {
-    /// Repo to take packages given by name and their dependencies from
-    /// (repeatable, in priority order). Each repo's latest sync is used.
-    #[arg(long = "repo", value_name = "REPO")]
-    repos: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -185,32 +181,52 @@ fn run(cli: Cli) -> Result<()> {
         load_keyring(prefix)
     };
     match cli.command {
-        Command::Import { repos, packages } => {
+        Command::Import { packages } => {
             let keyring = keyring()?;
             let ctx = Ctx {
                 workers: &workers,
                 store: &store,
                 keyring: &keyring,
             };
-            let sources = sources(&ctx, &packages, &repos.repos, jobs)?;
-            get_packages(&ctx, &sources, jobs)?;
+            import_local(&ctx, &packages, jobs)?;
         }
         Command::Build {
             output,
+            sync: sync_first,
+            fetch,
             repos,
             packages,
         } => {
             if output.symlink_metadata().is_ok() {
                 bail!("{} already exists", output.display());
             }
-            let keyring = keyring()?;
-            let ctx = Ctx {
-                workers: &workers,
-                store: &store,
-                keyring: &keyring,
+            let targets = packages
+                .iter()
+                .map(|arg| parse_target(arg, &repos))
+                .collect::<Result<Vec<_>>>()?;
+            let synced: Vec<String> = repos.iter().filter(|r| *r != LOCAL).cloned().collect();
+            if sync_first && !synced.is_empty() {
+                sync(&workers, &store, synced, jobs)?;
+            }
+            let sources = load_sources(&workers, &store, &repos, jobs)?;
+            let chosen = choose(&sources, &targets)?;
+            let packages = if chosen.iter().any(|c| matches!(c, Chosen::Repo { .. })) {
+                let keyring = keyring()?;
+                let ctx = Ctx {
+                    workers: &workers,
+                    store: &store,
+                    keyring: &keyring,
+                };
+                get_packages(&ctx, &chosen, fetch, jobs)?
+            } else {
+                chosen
+                    .iter()
+                    .filter_map(|c| match c {
+                        Chosen::Local(pkg) => Some((*pkg).clone()),
+                        Chosen::Repo { .. } => None,
+                    })
+                    .collect()
             };
-            let sources = sources(&ctx, &packages, &repos.repos, jobs)?;
-            let packages = get_packages(&ctx, &sources, jobs)?;
             let r = install::build(&workers, &store, &packages, &output)?;
             eprintln!(
                 "built {}: {} files, {} dirs, {} symlinks, {} hard links",
@@ -289,218 +305,278 @@ struct Ctx<'a> {
     keyring: &'a Keyring,
 }
 
-/// Where a package comes from.
-enum Source {
+/// A package file given to `skl import`.
+enum LocalSource {
     Path(PathBuf),
     Url(Url),
-    /// A package from a repo's latest snapshot, downloaded from `url`.
+}
+
+/// What a repo offers to a build.
+enum RepoSource {
+    /// The packages imported with `skl import`, sorted by name, newest
+    /// version first.
+    Local(Vec<Package>),
+    /// A configured repo's latest snapshot.
+    Synced(Box<Snapshot>),
+}
+
+/// A package chosen for a build.
+enum Chosen<'a> {
+    /// An imported package.
+    Local(&'a Package),
+    /// A package from a repo's snapshot, downloaded from `url`.
     Repo {
-        repo: String,
-        entry: Box<DbEntry>,
+        repo: &'a str,
+        entry: &'a DbEntry,
         url: Url,
     },
 }
 
-/// A package as given on the command line.
-enum Arg {
-    Source(Source),
-    /// A package name, possibly qualified with a repo.
-    Name {
-        repo: Option<String>,
-        name: String,
-    },
-}
-
-/// Read a package argument: a URL stays a URL; `REPO/NAME` where `REPO`
-/// is one of `repos` is a qualified name; anything else that contains `/`
-/// or ends in `.pkg.tar.zst` is a path; the rest are names. `REPO/NAME`
-/// where `REPO` is another of the `configured` repos is an error, as it is
-/// more likely a mistake than a path.
-fn parse_arg(arg: &OsString, repos: &[String], configured: &[String]) -> Result<Arg> {
-    let Some(s) = arg.to_str() else {
-        return Ok(Arg::Source(Source::Path(arg.into())));
+/// Read a package argument of `build`: `NAME`, or `REPO/NAME` where `REPO`
+/// is one of `repos`.
+fn parse_target(arg: &str, repos: &[String]) -> Result<Target> {
+    let (repo, name) = match arg.split_once('/') {
+        Some((repo, name)) => (Some(repo), name),
+        None => (None, arg),
     };
-    if Url::is_url(s) {
-        return Ok(Arg::Source(Source::Url(Url::parse(s)?)));
-    }
-    if !s.ends_with(".pkg.tar.zst") {
-        if let Some((repo, name)) = s.split_once('/')
-            && repos.iter().any(|r| r == repo)
-            && !name.contains('/')
-        {
-            return Ok(Arg::Name {
-                repo: Some(repo.to_owned()),
-                name: name.to_owned(),
-            });
-        }
-        if let Some((repo, name)) = s.split_once('/')
-            && configured.iter().any(|r| r == repo)
-            && !name.contains('/')
-        {
-            bail!("{s}: repo {repo} is not among --repo (write ./{s} for a file)");
-        }
-        if !s.contains('/') {
-            return Ok(Arg::Name {
-                repo: None,
-                name: s.to_owned(),
-            });
-        }
-    }
-    Ok(Arg::Source(Source::Path(arg.into())))
+    let known = |repo: &str| repo == LOCAL || skladiste::repo::check_name(repo).is_ok();
+    ensure!(
+        arch::repo::check_name(name).is_ok() && repo.is_none_or(known),
+        "{arg:?} is not NAME or REPO/NAME (to build with package files, \
+         import them with `skl import` and use --repo {LOCAL})"
+    );
+    let repo = repo
+        .map(|repo| {
+            repos
+                .iter()
+                .position(|r| r == repo)
+                .with_context(|| format!("{arg}: repo {repo} is not among --repo"))
+        })
+        .transpose()?;
+    Ok(Target {
+        name: name.to_owned(),
+        repo,
+    })
 }
 
-/// Where to get each package in `args` from. Names are resolved with their
-/// dependencies against the latest snapshots of `repos`, in priority order
-/// (see [`resolve`]). Dependencies of packages given as paths or URLs are
-/// not resolved.
-fn sources(
-    ctx: &Ctx,
-    args: &[OsString],
+/// What each of `repos` offers: the latest snapshot of a configured repo,
+/// or the imported packages for `@local`.
+fn load_sources(
+    workers: &Workers,
+    store: &Store,
     repos: &[String],
     jobs: NonZeroUsize,
-) -> Result<Vec<Source>> {
-    let configured = ctx.store.repos()?;
-    let args = args
-        .iter()
-        .map(|arg| parse_arg(arg, repos, &configured))
-        .collect::<Result<Vec<_>>>()?;
-    let mut sources = Vec::new();
-    let mut targets = Vec::new();
-    for arg in args {
-        match arg {
-            Arg::Source(source) => sources.push(source),
-            Arg::Name { repo, name } => targets.push(Target {
-                // Qualified names have a repo among `repos`.
-                repo: repo.and_then(|r| repos.iter().position(|x| *x == r)),
-                name,
-            }),
+) -> Result<Vec<RepoSource>> {
+    let sources = par_map(repos, jobs, |repo| {
+        if repo == LOCAL {
+            load_local(store).map(RepoSource::Local)
+        } else {
+            Snapshot::load(workers, store, repo).map(|s| RepoSource::Synced(Box::new(s)))
         }
-    }
-    let Some(first) = targets.first() else {
-        return Ok(sources);
-    };
-    if repos.is_empty() {
-        bail!(
-            "{:?} is a package name, which needs repos to look in (--repo)",
-            first.name
-        );
-    }
-    let snapshots = load_snapshots(ctx, repos, jobs)?;
-    let candidates = snapshots
-        .iter()
-        .map(Snapshot::candidates)
-        .collect::<Result<Vec<_>>>()?;
-    let candidates: Vec<&[Candidate]> = candidates.iter().map(Vec::as_slice).collect();
-    let chosen = resolve::resolve(&candidates, &targets, arch::version::vercmp)?;
-    eprintln!(
-        "resolved {} packages ({} given by name)",
-        chosen.len(),
-        targets.len()
-    );
-    for (r, i) in chosen {
-        let snapshot = &snapshots[r];
-        let entry = &snapshot.entries[i];
-        ensure!(
-            entry.arch == arch::repo::ARCH || entry.arch == "any",
-            "package {}/{} is for {}, not {}",
-            snapshot.repo,
-            entry.name,
-            entry.arch,
-            arch::repo::ARCH
-        );
-        sources.push(Source::Repo {
-            repo: snapshot.repo.clone(),
-            url: snapshot.config.package_url(&entry.filename)?,
-            entry: Box::new(entry.clone()),
-        });
+    })?;
+    for source in &sources {
+        match source {
+            RepoSource::Local(pkgs) => {
+                eprintln!("using {LOCAL} ({} imported packages)", pkgs.len());
+            }
+            RepoSource::Synced(s) => eprintln!(
+                "using {} as synced at {} ({} packages)",
+                s.repo,
+                s.record.fetched,
+                s.entries.len()
+            ),
+        }
     }
     Ok(sources)
 }
 
-/// The latest snapshot of each of `repos`.
-fn load_snapshots(ctx: &Ctx, repos: &[String], jobs: NonZeroUsize) -> Result<Vec<Snapshot>> {
-    let snapshots = par_map(repos, jobs, |repo| {
-        Snapshot::load(ctx.workers, ctx.store, repo)
-    })?;
-    for s in &snapshots {
-        eprintln!(
-            "using {} as synced at {} ({} packages)",
-            s.repo,
-            s.record.fetched,
-            s.entries.len()
-        );
+/// The manifests of all packages in `@local`, sorted by name, newest
+/// version first, so that the resolver prefers the newest that fits.
+fn load_local(store: &Store) -> Result<Vec<Package>> {
+    let mut pkgs = Vec::new();
+    for hash in store.packages(LOCAL)? {
+        if let Some(pkg) = store.load_package(LOCAL, &hash)? {
+            pkgs.push(pkg);
+        }
     }
-    Ok(snapshots)
+    pkgs.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| arch::version::vercmp(&b.version, &a.version))
+    });
+    Ok(pkgs)
 }
 
-/// [`get_package`] for each source, `jobs` at once, each import by its own
-/// worker (so a compromised worker can't change another package's
-/// manifest). Downloads start first, largest first (by the size in the
-/// repo's database where known), then the largest archives, as they take
-/// longest.
-fn get_packages(ctx: &Ctx, sources: &[Source], jobs: NonZeroUsize) -> Result<Vec<Package>> {
-    let downloaded = |repo: &str, name: &str| match ctx.store.open_download(repo, name) {
+/// Resolve `targets` with their dependencies against `sources`, in
+/// priority order (see [`resolve`]).
+fn choose<'a>(sources: &'a [RepoSource], targets: &[Target]) -> Result<Vec<Chosen<'a>>> {
+    let candidates = sources
+        .iter()
+        .map(|source| match source {
+            RepoSource::Local(pkgs) => pkgs
+                .iter()
+                .map(arch::repo::package_candidate)
+                .collect::<Result<Vec<_>>>()
+                .with_context(|| format!("in repo {LOCAL}")),
+            RepoSource::Synced(snapshot) => snapshot.candidates(),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let candidates: Vec<&[Candidate]> = candidates.iter().map(Vec::as_slice).collect();
+    let chosen = resolve::resolve(&candidates, targets, arch::version::vercmp)?;
+    eprintln!(
+        "resolved {} packages ({} requested)",
+        chosen.len(),
+        targets.len()
+    );
+    chosen
+        .into_iter()
+        .map(|(r, i)| match &sources[r] {
+            RepoSource::Local(pkgs) => Ok(Chosen::Local(&pkgs[i])),
+            RepoSource::Synced(snapshot) => {
+                let entry = &snapshot.entries[i];
+                ensure!(
+                    entry.arch == arch::repo::ARCH || entry.arch == "any",
+                    "package {}/{} is for {}, not {}",
+                    snapshot.repo,
+                    entry.name,
+                    entry.arch,
+                    arch::repo::ARCH
+                );
+                Ok(Chosen::Repo {
+                    repo: &snapshot.repo,
+                    url: snapshot.config.package_url(&entry.filename)?,
+                    entry,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Call `f` on each item, `jobs` at once, starting with the largest
+/// `key`; the results are in the order of `items`.
+fn par_map_largest_first<T: Sync, K: Ord + Copy + Sync, R: Send>(
+    items: &[T],
+    jobs: NonZeroUsize,
+    key: impl Fn(&T) -> K,
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let mut order: Vec<(usize, K)> = items.iter().map(key).enumerate().collect();
+    order.sort_by_key(|&(_, key)| std::cmp::Reverse(key));
+    let mut results = par_map(&order, jobs, |&(i, _)| Ok((i, f(&items[i])?)))?;
+    results.sort_by_key(|&(i, _)| i);
+    Ok(results.into_iter().map(|(_, r)| r).collect())
+}
+
+/// The size of a download in the store, if it is there.
+fn downloaded(store: &Store, repo: &str, name: &str) -> Option<u64> {
+    match store.open_download(repo, name) {
         Ok(Some(f)) => Some(f.metadata().map_or(0, |m| m.len())),
         _ => None,
-    };
-    let mut order: Vec<(usize, &Source, (bool, u64))> = sources
-        .iter()
-        .enumerate()
-        .map(|(i, source)| {
-            let key = match source {
-                Source::Path(p) => (false, p.metadata().map_or(0, |m| m.len())),
-                Source::Url(url) => {
-                    downloaded(LOCAL, url.file_name()).map_or((true, u64::MAX), |n| (false, n))
-                }
-                Source::Repo { repo, entry, .. } => {
-                    downloaded(repo, &entry.filename).map_or((true, entry.csize), |n| (false, n))
-                }
-            };
-            (i, source, key)
-        })
-        .collect();
-    order.sort_by_key(|&(_, _, key)| std::cmp::Reverse(key));
-    let pkgs = par_map(&order, jobs, |&(i, source, _)| {
-        Ok((i, get_package(ctx, source)?))
-    })?;
-    let mut slots: Vec<Option<Package>> = vec![None; sources.len()];
-    for (i, pkg) in pkgs {
-        slots[i] = Some(pkg);
     }
-    Ok(slots.into_iter().flatten().collect())
 }
 
-/// Load a package's manifest from the store, downloading and importing the
-/// archive if needed. The signature is checked first, every time, also for
-/// earlier downloads. Packages are identified by their repo and the hash
-/// of the archive file. A package from a repo must have the SHA-256, name
-/// and version that the repo's database gives. The file is opened once, so
-/// the parsed content is the content that was verified and hashed, unless
-/// the file is written to meanwhile (see planning/BUGS.md; only the
-/// supervisor writes downloads). Concurrent calls for the same archive each
-/// import it.
-fn get_package(ctx: &Ctx, source: &Source) -> Result<Package> {
-    let (mut file, what, repo, entry) = match source {
-        Source::Path(path) => {
-            let mut file =
-                File::open(path).with_context(|| format!("opening {}", path.display()))?;
-            let sig_path = with_suffix(path, ".sig");
-            let sig =
-                File::open(&sig_path).with_context(|| format!("opening {}", sig_path.display()))?;
-            let sig =
-                read_signature(sig).with_context(|| format!("reading {}", sig_path.display()))?;
-            verify(ctx.keyring, &sig, &mut file)
-                .with_context(|| format!("verifying {}", path.display()))?;
-            (file, path.display().to_string(), LOCAL, None)
+/// Import the package files `args` (paths or URLs) into `@local`, `jobs`
+/// at once, each by its own worker (so a compromised worker can't change
+/// another package's manifest). Downloads start first, then the largest
+/// archives, as they take longest.
+fn import_local(ctx: &Ctx, args: &[OsString], jobs: NonZeroUsize) -> Result<()> {
+    let sources = args
+        .iter()
+        .map(|arg| match arg.to_str() {
+            Some(s) if Url::is_url(s) => Ok(LocalSource::Url(Url::parse(s)?)),
+            _ => Ok(LocalSource::Path(arg.into())),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let key = |source: &LocalSource| match source {
+        LocalSource::Path(p) => (false, p.metadata().map_or(0, |m| m.len())),
+        LocalSource::Url(url) => {
+            downloaded(ctx.store, LOCAL, url.file_name()).map_or((true, 0), |n| (false, n))
         }
-        Source::Url(url) => (fetch(ctx, url)?, url.to_string(), LOCAL, None),
-        Source::Repo { repo, entry, url } => (
-            fetch_from_repo(ctx, repo, entry, url)?,
-            format!("{repo}/{}", entry.filename),
-            repo.as_str(),
-            Some(entry),
-        ),
     };
+    par_map_largest_first(&sources, jobs, key, |source| {
+        let (file, what) = match source {
+            LocalSource::Path(path) => {
+                let mut file =
+                    File::open(path).with_context(|| format!("opening {}", path.display()))?;
+                let sig_path = with_suffix(path, ".sig");
+                let sig = File::open(&sig_path)
+                    .with_context(|| format!("opening {}", sig_path.display()))?;
+                let sig = read_signature(sig)
+                    .with_context(|| format!("reading {}", sig_path.display()))?;
+                verify(ctx.keyring, &sig, &mut file)
+                    .with_context(|| format!("verifying {}", path.display()))?;
+                (file, path.display().to_string())
+            }
+            LocalSource::Url(url) => (fetch(ctx, url)?, url.to_string()),
+        };
+        let (pkg, new) = import_archive(ctx, file, &what, LOCAL, None)?;
+        if !new {
+            eprintln!("{} {} was already imported", pkg.name, pkg.version);
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// The manifest of each of `chosen`, in the same order. Packages from
+/// repo snapshots are verified, and downloaded (if `fetch`) and imported
+/// where needed (see [`get_repo_package`]), `jobs` at once, each import by
+/// its own worker (so a compromised worker can't change another package's
+/// manifest). Downloads start first, largest first by the size in the
+/// repo's database, then the largest archives, as they take longest.
+fn get_packages(
+    ctx: &Ctx,
+    chosen: &[Chosen],
+    fetch: bool,
+    jobs: NonZeroUsize,
+) -> Result<Vec<Package>> {
+    let key = |chosen: &Chosen| match chosen {
+        Chosen::Local(_) => (false, 0),
+        Chosen::Repo { repo, entry, .. } => {
+            downloaded(ctx.store, repo, &entry.filename).map_or((true, entry.csize), |n| (false, n))
+        }
+    };
+    par_map_largest_first(chosen, jobs, key, |chosen| match chosen {
+        Chosen::Local(pkg) => Ok((*pkg).clone()),
+        Chosen::Repo { repo, entry, url } => get_repo_package(ctx, repo, entry, url, fetch),
+    })
+}
+
+/// Load the manifest of a package from a repo's snapshot, importing the
+/// archive if needed, and downloading it first if it isn't in the store
+/// and `fetch` allows. The signature is checked first, every time, also
+/// for earlier downloads. The archive must have the SHA-256, and the
+/// package the name and version, that the repo's database gives.
+fn get_repo_package(
+    ctx: &Ctx,
+    repo: &str,
+    entry: &DbEntry,
+    url: &Url,
+    fetch: bool,
+) -> Result<Package> {
+    let file = fetch_from_repo(ctx, repo, entry, url, fetch)?;
+    let what = format!("{repo}/{}", entry.filename);
+    let (pkg, _) = import_archive(ctx, file, &what, repo, Some(entry))?;
+    check_identity(&pkg, entry).with_context(|| format!("checking {what}"))?;
+    Ok(pkg)
+}
+
+/// Load the manifest of the package in `file`, whose signature was
+/// verified, from the store, importing it if needed (the second value
+/// tells whether it was). Packages are identified by their repo and the
+/// hash of the archive file. With `entry`, the SHA-256 must be the one it
+/// gives. The file is read from the same open file as it was verified
+/// from, so the parsed content is the content that was verified and
+/// hashed, unless the file is written to meanwhile (see planning/BUGS.md;
+/// only the supervisor writes downloads). Concurrent calls for the same
+/// archive each import it.
+fn import_archive(
+    ctx: &Ctx,
+    mut file: File,
+    what: &str,
+    repo: &str,
+    entry: Option<&DbEntry>,
+) -> Result<(Package, bool)> {
     file.seek(SeekFrom::Start(0))?;
     let mut sha256 = entry.map(|_| Sha256::new());
     let hash = hash_reader(Tee {
@@ -511,33 +587,30 @@ fn get_package(ctx: &Ctx, source: &Source) -> Result<Package> {
     if let (Some(entry), Some(sha256)) = (entry, sha256) {
         check_sha256(sha256, entry).with_context(|| format!("checking {what}"))?;
     }
-    let pkg = match ctx.store.load_package(repo, &hash)? {
-        Some(pkg) => pkg,
-        None => {
-            file.seek(SeekFrom::Start(0))?;
-            let (pkg, stats) = ctx
-                .workers
-                .import_arch(ctx.store, file)
-                .with_context(|| format!("importing {what}"))?;
-            if let Some(entry) = entry {
-                check_identity(&pkg, entry).with_context(|| format!("importing {what}"))?;
-            }
-            ctx.store.save_package(repo, &hash, &pkg)?;
-            eprintln!(
-                "imported {} {}: {} files, {} new objects ({:.1} MiB)",
-                pkg.name,
-                pkg.version,
-                stats.files,
-                stats.new_objects,
-                mib(stats.new_bytes)
-            );
-            pkg
-        }
-    };
-    if let Some(entry) = entry {
-        check_identity(&pkg, entry).with_context(|| format!("checking {what}"))?;
+    if let Some(pkg) = ctx.store.load_package(repo, &hash)? {
+        return Ok((pkg, false));
     }
-    Ok(pkg)
+    file.seek(SeekFrom::Start(0))?;
+    let importing = || format!("importing {what}");
+    let (pkg, stats) = ctx
+        .workers
+        .import_arch(ctx.store, file)
+        .with_context(importing)?;
+    // The metadata must be usable for dependency resolution.
+    arch::repo::package_candidate(&pkg).with_context(importing)?;
+    if let Some(entry) = entry {
+        check_identity(&pkg, entry).with_context(importing)?;
+    }
+    ctx.store.save_package(repo, &hash, &pkg)?;
+    eprintln!(
+        "imported {} {}: {} files, {} new objects ({:.1} MiB)",
+        pkg.name,
+        pkg.version,
+        stats.files,
+        stats.new_objects,
+        mib(stats.new_bytes)
+    );
+    Ok((pkg, true))
 }
 
 /// `.PKGINFO`'s name and version must be those of the database entry.
@@ -627,8 +700,9 @@ fn fetch(ctx: &Ctx, url: &Url) -> Result<File> {
 }
 
 /// The verified archive of a package in a repo: downloaded earlier, or
-/// now. The signature, size and SHA-256 come from the repo's database.
-fn fetch_from_repo(ctx: &Ctx, repo: &str, entry: &DbEntry, url: &Url) -> Result<File> {
+/// now if `fetch` allows. The signature, size and SHA-256 come from the
+/// repo's database.
+fn fetch_from_repo(ctx: &Ctx, repo: &str, entry: &DbEntry, url: &Url, fetch: bool) -> Result<File> {
     let name = &entry.filename;
     let sig = entry
         .pgpsig
@@ -640,6 +714,10 @@ fn fetch_from_repo(ctx: &Ctx, repo: &str, entry: &DbEntry, url: &Url) -> Result<
         })?;
         return Ok(file);
     }
+    ensure!(
+        fetch,
+        "{repo}/{name} is not in the store (use --fetch to download packages)"
+    );
     download_package(ctx, repo, name, url, sig, Some(entry))
 }
 
@@ -737,39 +815,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn package_arguments() {
-        let repos = ["core".to_owned(), "extra".to_owned()];
-        let configured = ["core".to_owned(), "extra".to_owned(), "multilib".to_owned()];
-        let parse = |s: &str| parse_arg(&s.into(), &repos, &configured);
-        let name = |s: &str| match parse(s).unwrap() {
-            Arg::Name { repo, name } => (repo, name),
-            Arg::Source(_) => panic!("{s} is not a name"),
-        };
-        let path = |s: &str| match parse(s).unwrap() {
-            Arg::Source(Source::Path(p)) => p,
-            _ => panic!("{s} is not a path"),
-        };
-        assert_eq!(name("bash"), (None, "bash".to_owned()));
-        assert_eq!(
-            name("extra/bash"),
-            (Some("extra".to_owned()), "bash".to_owned())
-        );
-        assert_eq!(path("./core/bash"), Path::new("./core/bash"));
-        assert_eq!(path("core/a/b"), Path::new("core/a/b"));
-        assert_eq!(path("other/bash"), Path::new("other/bash"));
-        assert_eq!(
-            path("bash-5.3-1-x86_64.pkg.tar.zst"),
-            Path::new("bash-5.3-1-x86_64.pkg.tar.zst")
-        );
-        assert_eq!(
-            path("core/bash-5.3-1-x86_64.pkg.tar.zst"),
-            Path::new("core/bash-5.3-1-x86_64.pkg.tar.zst")
-        );
-        assert!(matches!(
-            parse("https://x/a.pkg.tar.zst"),
-            Ok(Arg::Source(Source::Url(_)))
-        ));
-        let e = parse("multilib/bash").err().unwrap().to_string();
+    fn build_arguments() {
+        let repos = ["core".to_owned(), LOCAL.to_owned()];
+        let parse = |s: &str| parse_target(s, &repos).map(|t| (t.repo, t.name));
+        assert_eq!(parse("bash").unwrap(), (None, "bash".to_owned()));
+        assert_eq!(parse("core/bash").unwrap(), (Some(0), "bash".to_owned()));
+        assert_eq!(parse("@local/bash").unwrap(), (Some(1), "bash".to_owned()));
+        let e = parse("extra/bash").unwrap_err().to_string();
         assert!(e.contains("not among --repo"), "{e}");
+        for bad in [
+            "./bash-5.3-1-x86_64.pkg.tar.zst",
+            "core/a/b",
+            "/abs/path",
+            "https://x/a.pkg.tar.zst",
+            "",
+        ] {
+            let e = parse(bad).unwrap_err().to_string();
+            assert!(e.contains("skl import"), "{e}");
+        }
+    }
+
+    #[test]
+    fn local_packages_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let add = |name: &str, version: &str, depends: &[&str]| {
+            let id = format!("{name} {version}");
+            let hash = store.add_object(&mut id.as_bytes()).unwrap().hash;
+            let pkg = Package {
+                name: name.into(),
+                version: version.into(),
+                depends: depends.iter().map(|d| (*d).to_owned()).collect(),
+                provides: vec![],
+                conflicts: vec![],
+                entries: vec![],
+            };
+            store.save_package(LOCAL, &hash, &pkg).unwrap();
+        };
+        add("lib", "1.9-1", &[]);
+        add("lib", "1.10-1", &[]);
+        add("lib", "2.0-1", &[]);
+        add("app", "1-1", &["lib<2"]);
+        let sources = [RepoSource::Local(load_local(&store).unwrap())];
+        let build = |names: &[&str]| -> Vec<String> {
+            let targets: Vec<Target> = names
+                .iter()
+                .map(|n| parse_target(n, &[LOCAL.to_owned()]).unwrap())
+                .collect();
+            choose(&sources, &targets)
+                .unwrap()
+                .iter()
+                .map(|c| match c {
+                    Chosen::Local(pkg) => format!("{} {}", pkg.name, pkg.version),
+                    Chosen::Repo { .. } => unreachable!(),
+                })
+                .collect()
+        };
+        assert_eq!(build(&["lib"]), ["lib 2.0-1"]);
+        assert_eq!(build(&["@local/app"]), ["app 1-1", "lib 1.10-1"]);
+    }
+
+    #[test]
+    fn largest_first() {
+        let order = std::sync::Mutex::new(Vec::new());
+        let items = [2, 9, 4];
+        let out = par_map_largest_first(
+            &items,
+            NonZeroUsize::MIN,
+            |&n| n,
+            |&n| {
+                order.lock().unwrap().push(n);
+                Ok(n * 10)
+            },
+        )
+        .unwrap();
+        assert_eq!(out, [20, 90, 40]);
+        assert_eq!(*order.lock().unwrap(), [9, 4, 2]);
     }
 }
