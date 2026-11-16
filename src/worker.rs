@@ -30,6 +30,10 @@
 //!   `CHUNK`s, ending with `DONE` with the response's headers of interest
 //!   ([`http::Response`]). It can't reach any other host, and the
 //!   supervisor writes the file. No filesystem access, no ioctls.
+//! - `read-arch-db`: fd 0 is an Arch repo database, fd 1 a pipe. The
+//!   worker reads it with [`arch::repo::read_db`] and sends the entries in
+//!   `DONE`; the supervisor validates them. No filesystem access, no
+//!   ioctls.
 //! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
 //!   and the store directory and image root are bound at `/store`
 //!   (read-only) and `/image` in the worker's mount namespace. The worker
@@ -184,6 +188,20 @@ impl Workers {
         let mut conn = receiver(ours)?;
         let result = receive_import(store, &mut conn);
         drop(conn);
+        worker.finish(result)
+    }
+
+    /// Read an Arch repo database in a worker, and validate the entries.
+    pub fn read_arch_db(&self, db: File) -> Result<Vec<arch::repo::DbEntry>> {
+        use rustix::pipe::{PipeFlags, pipe_with};
+        let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+        let worker = self.spawn("read-arch-db", db.into(), result_w, &[], None, &[])?;
+        let result = read_result(&mut BufReader::new(File::from(result_r))).and_then(|json| {
+            let entries: Vec<arch::repo::DbEntry> =
+                serde_json::from_slice(&json).context("parsing result from worker")?;
+            arch::repo::validate(&entries)?;
+            Ok(entries)
+        });
         worker.finish(result)
     }
 
@@ -722,6 +740,7 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
         ("download", [url, roots]) if dirs.is_empty() && roots == "custom-roots" => {
             download_worker(layers, url, true, out)
         }
+        ("read-arch-db", []) if dirs.is_empty() => read_db_worker(layers),
         ("install", []) => {
             let [store, root] = <[OwnedFd; 2]>::try_from(dirs)
                 .map_err(|_| anyhow::anyhow!("install worker needs two directories"))?;
@@ -779,6 +798,17 @@ fn import_worker(layers: Layers, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
     };
     let pkg = arch::import(archive, sink)?;
     Ok(serde_json::to_vec(&pkg)?)
+}
+
+fn read_db_worker(layers: Layers) -> Result<Vec<u8>> {
+    // SAFETY: the supervisor passes the database as fd 0.
+    let db = unsafe { File::from_raw_fd(0) };
+    let policy = Policy {
+        max_memory: Some(IMPORT_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(layers, &policy)?;
+    Ok(serde_json::to_vec(&arch::repo::read_db(db)?)?)
 }
 
 /// Worker side of `import-arch`: sends contents to the supervisor.

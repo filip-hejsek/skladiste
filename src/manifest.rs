@@ -201,26 +201,30 @@ impl<'de> Deserialize<'de> for XattrValue {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").unwrap();
+    for &b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)].into());
+        s.push(DIGITS[usize::from(b & 15)].into());
     }
     s
 }
 
-fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        s.is_ascii() && s.len().is_multiple_of(2),
-        "invalid hex string: {s}"
-    );
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| anyhow::anyhow!("invalid hex string: {s}"))
-        })
+pub(crate) fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bad = || anyhow::anyhow!("invalid hex string: {s}");
+    if !s.len().is_multiple_of(2) {
+        return Err(bad());
+    }
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Ok(digit(pair[0]).ok_or_else(bad)? << 4 | digit(pair[1]).ok_or_else(bad)?))
         .collect()
 }
 

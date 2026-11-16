@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22.1"
 blake3 = "1.8.7"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+flate2 = "1.1.11"
 httparse = "1.10.1"
 landlock = "0.4.7"
 libc = "0.2.191"

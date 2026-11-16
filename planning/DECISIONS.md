@@ -80,8 +80,31 @@ are in BUGS.md.
   half-written. Records of repos synced together are written only after
   all of them were downloaded. A repo's latest record is its current
   snapshot.
+- Databases are read in a `read-arch-db` worker (`src/arch/repo.rs`):
+  fd 0 the database, one `DONE` with the entries as JSON, the import
+  worker's sandbox and memory limit. gzip (as Arch serves them) and
+  zstd are accepted; each entry must be a `NAME-VERSION/desc` of at most
+  1 MiB (no other files, so the old format with separate `depends`
+  files is rejected rather than read without dependencies). Fields:
+  `FILENAME`, `NAME`, `BASE`, `VERSION`, `CSIZE`, `ISIZE`, `SHA256SUM`,
+  `PGPSIG` (base64-decoded in the worker, hex in JSON), `ARCH`, and
+  `DEPENDS`, `PROVIDES`, `CONFLICTS`, `REPLACES` as strings; `BASE`,
+  `ISIZE` and `PGPSIG` are optional. The supervisor validates: name and
+  version character sets, the entry's directory is `NAME-VERSION`, no
+  duplicate names, `FILENAME` a plain file name, the hash 64 hex digits,
+  the signature at most `MAX_SIGNATURE_SIZE`, dependencies printable
+  ASCII. `skl sync` reads each database before recording it.
+- gzip with `flate2` and its default pure-Rust backend (`miniz_oxide`);
+  5 crates added to `Cargo.lock`.
+- Databases are parsed on every use, not cached. `extra.db` (15,279
+  entries, 8.7 MiB) takes about 360 ms through the worker: gunzip 85 ms,
+  tar and `desc` parsing 60 ms, 17 MB of JSON written in 25 ms and
+  parsed by the supervisor in 55-85 ms, validation 13 ms, and the
+  worker's start (`gzip -dc` alone takes 150 ms on the same machine).
+  Encoding the signatures as hex with `write!` took 100 ms before it
+  was replaced. Cache by database hash only if this matters.
 - No conditional requests yet: syncing core and extra (8.8 MiB) took
-  0.9 s.
+  0.9 s, 1.35 s with reading them.
 - The keyring is needed only to import packages (`import`, `build`).
 
 ## Downloads

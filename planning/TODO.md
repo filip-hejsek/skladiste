@@ -7,20 +7,10 @@ Next priorities: dependency resolution, then install scripts and hooks.
 
 ## Arch frontend
 
-- Repo databases (sync dbs) and building by package name. Repos and
-  `skl sync` are done (see Repos in DECISIONS.md); the rest is agreed,
-  to be done in this order, one commit each:
-  2. Reading databases in a `read-arch-db` worker (`src/arch/repo.rs`;
-     fd 0 the database, one `DONE` with JSON; import worker's sandbox,
-     a size cap per `desc`). Fields: `FILENAME`, `NAME`, `BASE`,
-     `VERSION`, `CSIZE`, `ISIZE`, `SHA256SUM`, `PGPSIG` (base64-decoded),
-     `ARCH`, `DEPENDS`, `PROVIDES`, `CONFLICTS`, `REPLACES`, the latter
-     as strings. The supervisor validates: name and version character
-     sets, the entry's directory matches `NAME-VERSION`, no duplicate
-     names, `FILENAME` a plain file name, the hash 64 hex digits, the
-     signature at most `MAX_SIGNATURE_SIZE`. Parse on every use and
-     measure (`gzip -dc extra.db`, 15,245 entries, takes 75 ms); cache by
-     database hash only if needed.
+- Repo databases (sync dbs) and building by package name. Repos,
+  `skl sync` and reading databases are done (see Repos in
+  DECISIONS.md); the rest is agreed, to be done in this order, one
+  commit each:
   3. Package ids include the repo: `<repo>/<archive hash>`, manifests in
      `packages/<repo>/<hash>.json` (objects are shared, so a package in
      two repos costs only its manifest twice). Packages given as paths

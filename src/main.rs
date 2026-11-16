@@ -91,7 +91,8 @@ enum Command {
     /// Download the databases of repos.
     ///
     /// Every version is kept; builds use the latest. Repos synced together
-    /// get their new versions only once all of them were downloaded.
+    /// get their new versions only once all of them were downloaded and
+    /// read.
     Sync {
         /// Repos to sync [default: all].
         repos: Vec<String>,
@@ -224,7 +225,7 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 /// Download the databases of `repos` (all if empty), and record the new
-/// versions once all of them were downloaded.
+/// versions once all of them were downloaded and read.
 fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize) -> Result<()> {
     let repos = if repos.is_empty() {
         store.repos()?
@@ -238,12 +239,17 @@ fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize
         .iter()
         .map(|name| store.repo_config(name))
         .collect::<Result<Vec<arch::repo::Config>>>()?;
-    let records = par_map(&configs, jobs, |config| {
-        arch::repo::fetch_db(workers, store, config)
+    let synced = par_map(&configs, jobs, |config| {
+        let record = arch::repo::fetch_db(workers, store, config)?;
+        let entries = arch::repo::load_db(workers, store, &record)?;
+        Ok((record, entries.len()))
     })?;
-    for (name, record) in repos.iter().zip(&records) {
+    for (name, (record, packages)) in repos.iter().zip(&synced) {
         store.save_sync(name, record)?;
-        eprintln!("synced {name} ({:.1} MiB)", mib(record.size));
+        eprintln!(
+            "synced {name}: {packages} packages ({:.1} MiB)",
+            mib(record.size)
+        );
     }
     Ok(())
 }
