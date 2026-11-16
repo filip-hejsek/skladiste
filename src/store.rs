@@ -2,9 +2,11 @@
 //!
 //! Layout:
 //! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
-//! - `packages/<id>.json` — imported package manifests
-//! - `downloads/<name>` — downloaded package archives (and their
-//!   signatures), by file name
+//! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
+//!   and the archive's hash (packages given as paths or URLs belong to
+//!   the pseudo-repo [`repo::LOCAL`])
+//! - `downloads/<repo>/<name>` — downloaded package archives (and their
+//!   signatures), by repo and file name
 //! - `repos/<repo>/config.json` — a repo's configuration (see
 //!   [`crate::repo`]); its format is the frontend's
 //! - `repos/<repo>/syncs/<time>.json` — a record of each version of the
@@ -75,8 +77,10 @@ fn object_name(hash: &Hash) -> String {
     format!("objects/{}/{}", &hex[..2], &hex[2..])
 }
 
-fn package_name(id: &str) -> String {
-    format!("packages/{id}.json")
+/// `packages/<repo>/<hash>.json`.
+fn package_name(repo: &str, hash: &Hash) -> Result<String> {
+    repo::check_name_or_local(repo)?;
+    Ok(format!("packages/{repo}/{hash}.json"))
 }
 
 impl Store {
@@ -194,9 +198,9 @@ impl Store {
         )
     }
 
-    /// Open `downloads/<name>`, if it exists.
-    pub fn open_download(&self, name: &str) -> Result<Option<File>> {
-        let path = download_path(name)?;
+    /// Open `downloads/<repo>/<name>`, if it exists.
+    pub fn open_download(&self, repo: &str, name: &str) -> Result<Option<File>> {
+        let path = download_path(repo, name)?;
         match self.openat(&path, OFlags::RDONLY, 0) {
             Ok(fd) => Ok(Some(File::from(fd))),
             Err(Errno::NOENT) => Ok(None),
@@ -256,14 +260,20 @@ impl Store {
         result
     }
 
-    pub fn load_package(&self, id: &str) -> Result<Option<Package>> {
-        self.read_json(&package_name(id))
+    /// The manifest of the package from `repo` whose archive has `hash`,
+    /// if it was imported.
+    pub fn load_package(&self, repo: &str, hash: &Hash) -> Result<Option<Package>> {
+        self.read_json(&package_name(repo, hash)?)
     }
 
-    /// Save a manifest under `id`, replacing any saved before. Concurrent
-    /// saves of the same package don't interfere; one of them wins.
-    pub fn save_package(&self, id: &str, pkg: &Package) -> Result<()> {
-        self.write_replace(&package_name(id), &serde_json::to_vec(pkg)?)
+    /// Save the manifest of the package from `repo` whose archive has
+    /// `hash`, replacing any saved before. Concurrent saves of the same
+    /// package don't interfere; one of them wins.
+    pub fn save_package(&self, repo: &str, hash: &Hash, pkg: &Package) -> Result<()> {
+        let name = package_name(repo, hash)?;
+        mkdir_exist_ok(&self.dir, &format!("packages/{repo}"))
+            .with_context(|| format!("creating packages/{repo}"))?;
+        self.write_replace(&name, &serde_json::to_vec(pkg)?)
     }
 
     /// Add repo `name` with `config` (in the frontend's format). Fails if
@@ -349,13 +359,14 @@ impl Store {
     }
 }
 
-/// `downloads/<name>`, if `name` is a plain file name.
-fn download_path(name: &str) -> Result<String> {
+/// `downloads/<repo>/<name>`, if `name` is a plain file name.
+fn download_path(repo: &str, name: &str) -> Result<String> {
+    repo::check_name_or_local(repo)?;
     anyhow::ensure!(
         !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\0']),
         "bad file name {name:?} for a download"
     );
-    Ok(format!("downloads/{name}"))
+    Ok(format!("downloads/{repo}/{name}"))
 }
 
 /// An unnamed file being written in the store's `tmp/` directory; freed
@@ -370,11 +381,13 @@ impl TmpFile<'_> {
         &mut self.file
     }
 
-    /// Save the file as `downloads/<name>`, replacing any file there.
-    /// Returns the open file.
-    pub fn save_download(self, name: &str) -> Result<File> {
-        let dest = download_path(name)?;
+    /// Save the file as `downloads/<repo>/<name>`, replacing any file
+    /// there. Returns the open file.
+    pub fn save_download(self, repo: &str, name: &str) -> Result<File> {
+        let dest = download_path(repo, name)?;
         let dir = &self.store.dir;
+        mkdir_exist_ok(dir, &format!("downloads/{repo}"))
+            .with_context(|| format!("creating downloads/{repo}"))?;
         // Linking doesn't replace, so remove the old file first. A
         // concurrent save of the same download can link in between; then
         // replace that one.
@@ -447,6 +460,30 @@ mod tests {
     }
 
     #[test]
+    fn packages_by_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let hash = store.add_object(&mut &b"archive"[..]).unwrap().hash;
+        let pkg = |version: &str| Package {
+            name: "a".into(),
+            version: version.into(),
+            entries: vec![],
+        };
+        store.save_package(repo::LOCAL, &hash, &pkg("1-1")).unwrap();
+        store.save_package("core", &hash, &pkg("2-1")).unwrap();
+        let load = |repo| store.load_package(repo, &hash).unwrap().map(|p| p.version);
+        assert_eq!(load(repo::LOCAL).as_deref(), Some("1-1"));
+        assert_eq!(load("core").as_deref(), Some("2-1"));
+        assert_eq!(load("extra"), None);
+        assert!(store.save_package("../x", &hash, &pkg("1")).is_err());
+        assert!(
+            dir.path()
+                .join(format!("packages/core/{hash}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
     fn repos_and_syncs() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -493,13 +530,13 @@ mod tests {
         for content in [&b"old"[..], b"new"] {
             let mut tmp = store.tmp_file().unwrap();
             tmp.file().write_all(content).unwrap();
-            let mut file = tmp.save_download("a.pkg").unwrap();
+            let mut file = tmp.save_download("core", "a.pkg").unwrap();
             file.rewind().unwrap();
             let mut read = Vec::new();
             file.read_to_end(&mut read).unwrap();
             assert_eq!(read, content);
         }
-        let saved = std::fs::read(dir.path().join("downloads/a.pkg")).unwrap();
+        let saved = std::fs::read(dir.path().join("downloads/core/a.pkg")).unwrap();
         assert_eq!(saved, b"new");
         assert!(tmp_is_empty(dir.path()));
     }

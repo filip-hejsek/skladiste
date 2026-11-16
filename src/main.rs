@@ -14,6 +14,7 @@ use skladiste::http::{RootCerts, Url};
 use skladiste::install;
 use skladiste::jobs::{default_jobs, par_map};
 use skladiste::manifest::Package;
+use skladiste::repo::LOCAL;
 use skladiste::store::{Store, hash_reader};
 use skladiste::worker::{self, Workers};
 
@@ -66,8 +67,8 @@ enum Command {
     ///
     /// Packages are files or http(s) URLs. Each package's signature is read
     /// from the same path or URL with `.sig` appended. Downloads are kept in
-    /// the store's `downloads/` directory and not downloaded again from a
-    /// URL with the same file name. Redirects are not followed.
+    /// the store's `downloads/@local/` directory and not downloaded again
+    /// from a URL with the same file name. Redirects are not followed.
     Import {
         #[arg(required = true)]
         packages: Vec<OsString>,
@@ -287,7 +288,7 @@ fn get_packages(ctx: &Ctx, sources: &[Source], jobs: NonZeroUsize) -> Result<Vec
         .map(|(i, source)| {
             let key = match source {
                 Source::Path(p) => size(p),
-                Source::Url(url) => match ctx.store.open_download(url.file_name()) {
+                Source::Url(url) => match ctx.store.open_download(LOCAL, url.file_name()) {
                     Ok(Some(f)) => f.metadata().map_or(0, |m| m.len()),
                     _ => u64::MAX,
                 },
@@ -308,8 +309,8 @@ fn get_packages(ctx: &Ctx, sources: &[Source], jobs: NonZeroUsize) -> Result<Vec
 
 /// Load a package's manifest from the store, downloading and importing the
 /// archive if needed. The signature is checked first, every time, also for
-/// earlier downloads. Packages are identified by the hash of the archive
-/// file. The file is opened once, so the parsed content is the content that
+/// earlier downloads. Packages are identified by their repo and the hash
+/// of the archive file. The file is opened once, so the parsed content is the content that
 /// was verified and hashed, unless the file is written to meanwhile (see
 /// planning/BUGS.md; only the supervisor writes downloads). Concurrent
 /// calls for the same archive each import it.
@@ -330,10 +331,9 @@ fn get_package(ctx: &Ctx, source: &Source) -> Result<Package> {
         Source::Url(url) => (fetch(ctx, url)?, url.to_string()),
     };
     file.seek(SeekFrom::Start(0))?;
-    let id = hash_reader(&mut file)
-        .with_context(|| format!("reading {what}"))?
-        .to_string();
-    if let Some(pkg) = ctx.store.load_package(&id)? {
+    let hash = hash_reader(&mut file).with_context(|| format!("reading {what}"))?;
+    let repo = LOCAL;
+    if let Some(pkg) = ctx.store.load_package(repo, &hash)? {
         return Ok(pkg);
     }
     file.seek(SeekFrom::Start(0))?;
@@ -341,7 +341,7 @@ fn get_package(ctx: &Ctx, source: &Source) -> Result<Package> {
         .workers
         .import_arch(ctx.store, file)
         .with_context(|| format!("importing {what}"))?;
-    ctx.store.save_package(&id, &pkg)?;
+    ctx.store.save_package(repo, &hash, &pkg)?;
     eprintln!(
         "imported {} {}: {} files, {} new objects ({:.1} MiB)",
         pkg.name,
@@ -360,12 +360,12 @@ fn fetch(ctx: &Ctx, url: &Url) -> Result<File> {
     let name = url.file_name();
     let sig_name = format!("{name}.sig");
     let store = ctx.store;
-    if let Some(sig) = store.open_download(&sig_name)?
-        && let Some(mut file) = store.open_download(name)?
+    if let Some(sig) = store.open_download(LOCAL, &sig_name)?
+        && let Some(mut file) = store.open_download(LOCAL, name)?
     {
         let sig = read_signature(sig).with_context(|| format!("reading downloaded {sig_name}"))?;
         verify(ctx.keyring, &sig, &mut file).with_context(|| {
-            format!("verifying {name}, downloaded earlier (delete downloads/{name} in the store to download it again)")
+            format!("verifying {name}, downloaded earlier (delete downloads/{LOCAL}/{name} in the store to download it again)")
         })?;
         return Ok(file);
     }
@@ -383,13 +383,13 @@ fn fetch(ctx: &Ctx, url: &Url) -> Result<File> {
         .with_context(|| format!("downloading {url}"))?;
     drop(w);
     verify(ctx.keyring, &sig, tmp.file()).with_context(|| format!("verifying {url}"))?;
-    let file = tmp.save_download(name)?;
+    let file = tmp.save_download(LOCAL, name)?;
     let mut sig_tmp = store.tmp_file()?;
     sig_tmp
         .file()
         .write_all(&sig)
         .with_context(|| format!("writing {sig_name}"))?;
-    sig_tmp.save_download(&sig_name)?;
+    sig_tmp.save_download(LOCAL, &sig_name)?;
     eprintln!("downloaded {name} ({:.1} MiB)", mib(size));
     Ok(file)
 }

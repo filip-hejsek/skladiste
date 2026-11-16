@@ -26,9 +26,10 @@ are in BUGS.md.
   SHA-256.
 - Rejected for now: the fs-verity digest as the content address. fs-verity
   is left for later, so there's no need to tie the store to it now.
-- Layout: `objects/ab/cdef…` (read-only, mode 0444), `packages/<id>.json`
-  for imported manifests, `repos/<repo>/` for repos (see Repos), `tmp/`
-  for objects and manifests being written.
+- Layout: `objects/ab/cdef…` (read-only, mode 0444),
+  `packages/<repo>/<hash>.json` for imported manifests,
+  `downloads/<repo>/` for downloaded packages, `repos/<repo>/` for repos
+  (see Repos), `tmp/` for objects and manifests being written.
   Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
   then linked into place unless an identical object already exists;
   linking fails if the name exists, so of concurrent adds of the same
@@ -44,8 +45,11 @@ are in BUGS.md.
   `CAP_DAC_READ_SEARCH`; so writing to the store needs `/proc` (only the
   supervisor writes). Manifests are written to a named file in `tmp/` and
   renamed over any earlier one, which linking can't do.
-- An imported package is identified by the BLAKE3 hash of its archive
-  file, so re-importing the same file is skipped.
+- An imported package is identified by its repo and the BLAKE3 hash of
+  its archive file (`<repo>/<hash>`), so re-importing the same file is
+  skipped. Objects are shared, so a package in two repos costs only its
+  manifest twice. Packages given as paths or URLs belong to the
+  pseudo-repo `@local`.
 - Manifests are JSON; hashes and xattr values are hex strings.
 
 ## Arch frontend
@@ -155,8 +159,9 @@ are in BUGS.md.
   bubblewrap for one input sent once).
 - The worker sends the response's `Last-Modified` header with its
   final `DONE`.
-- Downloads are kept in the store's `downloads/` by file name (the URL's
-  last path segment; Arch file names include the version), written to
+- Downloads are kept in the store's `downloads/<repo>/` by file name
+  (the URL's last path segment; Arch file names include the version; the
+  same name can have different content in different repos), written to
   an unnamed file in `tmp/` and linked into place only after the
   signature verified (removing any file there first), so a file there
   is complete; the signature is saved after the

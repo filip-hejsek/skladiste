@@ -13,12 +13,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::Hash;
 
+/// Pseudo-repo of packages given as paths or URLs.
+pub const LOCAL: &str = "@local";
+
 /// Longest repo name accepted.
 const MAX_NAME: usize = 64;
 
 /// Check the name of a configured repo: ASCII letters, digits and `._+-`,
 /// not starting with `.` or `-`. Names starting with `@` are reserved for
-/// pseudo-repos.
+/// pseudo-repos such as [`LOCAL`].
 pub fn check_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
@@ -30,6 +33,15 @@ pub fn check_name(name: &str) -> Result<()> {
         "bad repo name {name:?} (allowed: ASCII letters, digits and ._+-, not first . or -)"
     );
     Ok(())
+}
+
+/// Check a repo name that may also be a pseudo-repo.
+pub(crate) fn check_name_or_local(name: &str) -> Result<()> {
+    if name == LOCAL {
+        Ok(())
+    } else {
+        check_name(name)
+    }
 }
 
 /// One fetched version of a repo's database (a snapshot), kept as
@@ -88,6 +100,8 @@ mod tests {
         for bad in ["", ".x", "-x", "a/b", "@local", "é", &"a".repeat(65)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
+        check_name_or_local(LOCAL).unwrap();
+        assert!(check_name_or_local("@other").is_err());
     }
 
     #[test]

@@ -21,8 +21,9 @@ formats can be added as frontends.
   many entries could not be chowned
 - Archives and repo databases are parsed and images filled by worker
   processes started in new namespaces with bubblewrap (`bwrap` must be in
-  `PATH`) and confined with Landlock and seccomp; `skl` refuses to run where these aren't
-  available (builds with the `insecure` feature can turn them off)
+  `PATH`) and confined with Landlock and seccomp; `skl` refuses to run
+  where these aren't available (builds with the `insecure` feature can
+  turn them off)
 
 ## Usage
 
@@ -46,8 +47,9 @@ An image is a btrfs subvolume. Unprivileged users can remove it with `rm -rf`.
 ## Store layout
 
 - `objects/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
-- `packages/<id>.json` — imported package manifests, keyed by the archive's hash
-- `downloads/` — downloaded packages and their signatures
+- `packages/<repo>/<hash>.json` — imported package manifests, keyed by the
+  archive's hash; packages given as paths or URLs are in the repo `@local`
+- `downloads/<repo>/` — downloaded packages and their signatures
 - `repos/<repo>/` — a repo's configuration and a record of each version of
   its database that was synced (the database itself is an object)
 - `tmp/` — staging area for new objects

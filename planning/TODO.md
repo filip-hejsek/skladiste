@@ -8,15 +8,9 @@ Next priorities: dependency resolution, then install scripts and hooks.
 ## Arch frontend
 
 - Repo databases (sync dbs) and building by package name. Repos,
-  `skl sync` and reading databases are done (see Repos in
-  DECISIONS.md); the rest is agreed, to be done in this order, one
-  commit each:
-  3. Package ids include the repo: `<repo>/<archive hash>`, manifests in
-     `packages/<repo>/<hash>.json` (objects are shared, so a package in
-     two repos costs only its manifest twice). Packages given as paths
-     or URLs belong to the pseudo-repo `@local`. Downloads move to
-     `downloads/<repo>/<file name>`, as the same file name can have
-     different content in different repos.
+  `skl sync`, reading databases and package ids with the repo are done
+  (see Repos in DECISIONS.md); the rest is agreed, to be done in this
+  order, one commit each:
   4. Build by name. A build lists the repos it may use in priority order
      (`--repo`) and uses each one's latest snapshot, failing if a repo
      was never synced; a name can be qualified (`repo/name`). Restrictions are
