@@ -123,7 +123,8 @@ Next priorities: dependency resolution, then install scripts and hooks.
 ## Store
 
 - Garbage collection of objects no package or sync record references,
-  and of old repo database snapshots.
+  and of old repo database snapshots. Must not race with `add_object`
+  finding an object already present (see DECISIONS.md, store layout).
 - Detect modified files cheaply by comparing extents (FIEMAP) with the
   store object; on a mismatch, rehash instead of reporting a
   modification, since defrag also breaks sharing.

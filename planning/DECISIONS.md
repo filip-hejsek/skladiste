@@ -31,8 +31,13 @@ are in BUGS.md.
   Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
   then linked into place unless an identical object already exists;
   linking fails if the name exists, so of concurrent adds of the same
-  object (threads or processes) exactly one counts it as new. An unnamed
-  file leaves nothing behind if skl is killed, and nobody can open it by
+  object (threads or processes) exactly one counts it as new. The
+  existing object must be the one kept, with the new copy dropped:
+  replacing it would leave images reflinked to the old extents, so the
+  same content would be stored twice. A future GC must not delete an
+  object between an add finding it present and the caller recording a
+  reference to it (e.g. by locking, or by sparing objects added during
+  the GC). An unnamed file leaves nothing behind if skl is killed, and nobody can open it by
   name while it's written. Linking goes through `/proc/self/fd/N`
   (`AT_SYMLINK_FOLLOW`), since `AT_EMPTY_PATH` needs
   `CAP_DAC_READ_SEARCH`; so writing to the store needs `/proc` (only the
