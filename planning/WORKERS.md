@@ -35,7 +35,10 @@ mirrors, which is where the remaining design work is.
 - Cancelling: the supervisor kills the worker. (For the download
   worker, shutting down the network socket would be gentler, if the
   supervisor kept a copy of it; not decided.) With a window of two,
-  queued items aren't worth cancelling one by one.
+  queued items aren't worth cancelling one by one. The item queued
+  behind the cancelled one wasn't started and goes back to the
+  scheduler, so a cancel costs a worker start and whatever state the
+  worker held (for the download worker, see Fallback).
 
 ## Download worker
 
@@ -86,6 +89,38 @@ mirrors, which is where the remaining design work is.
   (`SCM_RIGHTS` on the input queue), which still needs no other
   channel.
 
+## Fallback to another mirror
+
+A sketch; the thresholds are open. This was a large part of the
+motivation for the rejected control socket (cancel notifications), so
+it is worked out here as far as it bears on that choice.
+
+- A slow download isn't cancelled when it turns slow: the file is
+  started on a second mirror as well, and the slow one is cancelled
+  only once the second is confirmed to make progress. If every mirror
+  is slow (a slow network), nothing is confirmed and nothing is
+  cancelled, so there is no loop of cancels.
+- Both can then be healthy at once: the first recovers while the
+  second gets going, and each has more items queued. One copy of the
+  file has to go. The supervisor compares what the loser has left
+  with the price of a reconnect:
+  - little left: nothing is cancelled. Both finish, the second result
+    is discarded, and both workers keep their connections.
+  - otherwise: the one expected to finish later is killed. Its mirror
+    isn't given up: a new worker with a new connection takes the next
+    item.
+- So a healthy mirror loses at most one connection per file that was
+  started twice. No design avoids that: HTTP/1.1 can end a response
+  early only by closing the connection, so a worker told to cancel
+  would have to close and reconnect too. What a surviving worker
+  would save is the worker start and the TLS session cache, the same
+  cost as for a reconnect, with the same measurement to make and the
+  same way out: the supervisor shuts down the network socket, the
+  worker reports the item as ended and stays, and the next item
+  carries a new socket. That is still no channel besides the queues.
+- A cancel by the supervisor is no strike against the mirror and has
+  no delay before the next connection (see Limits).
+
 ## Status mailbox
 
 An option kept open for workers whose progress the supervisor can't
@@ -135,9 +170,11 @@ in TODO.md.
 
 - A control socket next to the queues, for blocking requests from the
   worker (a new connection), advisory messages and cancel
-  notifications. Its only concrete user was reconnecting, which a new
-  worker does without a round trip, and the mailbox covers status. The
-  design and what it cost are in rejected/control-socket.md.
+  notifications. Reconnecting is done by a new worker without a round
+  trip, the mailbox covers status, and cancelling one of two downloads
+  of a file costs the connection with or without a notification (see
+  Fallback). The design and what it cost are in
+  rejected/control-socket.md.
 - Any number of input and output queues per worker: an idle worker
   wouldn't know what to block on, and outputs could stall each other.
 - A long input queue filled in advance: writing it can block, which

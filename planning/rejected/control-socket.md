@@ -5,10 +5,15 @@ next to their queues: blocking requests from the worker (e.g. for a
 new connection), advisory messages and cancel notifications. It was
 never implemented. The design in use is in ../WORKERS.md.
 
-Why it was rejected: its only concrete user was the download worker
-asking for a new connection, and that needs no round trip if a worker
-lives only as long as its connection and resuming moves into the item.
-Status updates fit a memfd mailbox better than advisory messages.
+Why it was rejected: its concrete users were the download worker
+asking for a new connection, and cancelling a download during mirror
+fallback while keeping the worker and the items queued behind it. A
+new connection needs no round trip if a worker lives only as long as
+its connection and resuming moves into the item. A cancelled download
+loses its connection anyway, since HTTP/1.1 can end a response early
+only by closing, so a notification would save a worker start and no
+more (Fallback in ../WORKERS.md). Status updates fit a memfd mailbox
+better than advisory messages.
 Without those users, what remains is the cost: a service thread per
 worker, rules for who may block on what, a list of protocol
 violations, and a wait for output before a limit can be replenished.
