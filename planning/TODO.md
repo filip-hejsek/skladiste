@@ -86,15 +86,15 @@ Next priorities: dependency resolution, then install scripts and hooks.
     share its worker. Different origins don't share a worker, which
     matters because databases are unsigned.
   - Protocol: the worker gets a list of paths and streams each body as
-    start, chunks, end, tagged with its position in the list. It waits
+    start, chunks, end, in the order of the list. It waits
     for each response before the next request; this round trip is with
     the server, not between processes. No pipelining: some servers and
     CDNs handle it badly.
-  - Reconnecting: in the first implementation, when the server closes
-    the connection (keep-alive request limits, timeouts), the
-    supervisor restarts the worker and submits the items it hasn't
-    finished again. Later the worker asks the supervisor for a new
-    socket instead.
+  - Reconnecting: when the server closes the connection (keep-alive
+    request limits, timeouts), the worker exits and the supervisor
+    starts a new one with a new connection, resuming the file in
+    progress. The design is in WORKERS.md; limits, retries and
+    scheduling across mirrors are still open there.
   - `skl` gets a download stage that hands each verified file to the
     import jobs, instead of each job downloading its own package; this
     is where download order matters. `skl sync` can use the same
@@ -173,6 +173,9 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - Script runner: bubblewrap with user, mount, pid, net, ipc and uts
   namespaces, root is the image, no access to the store (can build on
   `src/bwrap.rs`).
+- Workers that handle a queue of items (first user: the download
+  worker per mirror): the design is in WORKERS.md. Measure the time of
+  a worker start first.
 - Low priority: signature verification in a worker (one per import
   run, not per package). It runs in the supervisor now, so a parser
   exploit gets `skl`'s privileges, which may exceed the image's.

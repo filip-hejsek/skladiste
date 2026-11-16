@@ -15,7 +15,8 @@ are in DECISIONS.md.
 - **Pipeline across processes.** Data between processes flows one way,
   without a round trip per item, and is buffered at both ends. A worker
   refers to what it sent by its position in the stream, and the receiver
-  resolves that. One-way flow also keeps blocking I/O free of deadlocks.
+  resolves that. One-way flow also keeps blocking I/O free of deadlocks:
+  no cycles, also not through the supervisor's threads.
 - **File descriptors, not paths.** Library code works on fds it is given;
   only the CLI opens paths. This is what lets parts of skl run sandboxed.
 - **The core doesn't know package formats.** Format-specific code lives
