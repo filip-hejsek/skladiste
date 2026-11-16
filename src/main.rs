@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -5,10 +6,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 
 use skladiste::arch;
+use skladiste::arch::repo::{DbEntry, Snapshot};
 use skladiste::arch::signature::{self, Keyring};
 use skladiste::http::{RootCerts, Url};
 use skladiste::install;
@@ -65,11 +68,19 @@ struct Cli {
 enum Command {
     /// Import Arch packages into the store.
     ///
-    /// Packages are files or http(s) URLs. Each package's signature is read
-    /// from the same path or URL with `.sig` appended. Downloads are kept in
-    /// the store's `downloads/@local/` directory and not downloaded again
-    /// from a URL with the same file name. Redirects are not followed.
+    /// Packages are names, files or http(s) URLs. A name is looked up in
+    /// the repos given with `--repo`, or in one of them as `REPO/NAME`;
+    /// the package's signature, size and SHA-256 come from the repo's
+    /// database. Other arguments containing `/` or ending in
+    /// `.pkg.tar.zst` are files (write `./REPO/NAME` for a file that would
+    /// read as a name). The signature of a file or URL is read from the
+    /// same path or URL with `.sig` appended. Downloads are kept in the
+    /// store's `downloads/<repo>/` directory (`@local` for URLs) and not
+    /// downloaded again for the same file name. Redirects are not
+    /// followed.
     Import {
+        #[command(flatten)]
+        repos: Repos,
         #[arg(required = true)]
         packages: Vec<OsString>,
     },
@@ -80,6 +91,8 @@ enum Command {
         /// Path of the new subvolume (must not exist).
         #[arg(short, long)]
         output: PathBuf,
+        #[command(flatten)]
+        repos: Repos,
         /// Arch packages as for `import`, imported first if needed.
         #[arg(required = true)]
         packages: Vec<OsString>,
@@ -98,6 +111,14 @@ enum Command {
         /// Repos to sync [default: all].
         repos: Vec<String>,
     },
+}
+
+#[derive(clap::Args)]
+struct Repos {
+    /// Repo to take packages given by name from (repeatable; the first
+    /// repo that has a name wins). Each repo's latest sync is used.
+    #[arg(long = "repo", value_name = "REPO")]
+    repos: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -163,16 +184,21 @@ fn run(cli: Cli) -> Result<()> {
         load_keyring(prefix)
     };
     match cli.command {
-        Command::Import { packages } => {
+        Command::Import { repos, packages } => {
             let keyring = keyring()?;
             let ctx = Ctx {
                 workers: &workers,
                 store: &store,
                 keyring: &keyring,
             };
-            get_packages(&ctx, &parse_sources(&packages)?, jobs)?;
+            let sources = sources(&ctx, &packages, &repos.repos, jobs)?;
+            get_packages(&ctx, &sources, jobs)?;
         }
-        Command::Build { output, packages } => {
+        Command::Build {
+            output,
+            repos,
+            packages,
+        } => {
             if output.symlink_metadata().is_ok() {
                 bail!("{} already exists", output.display());
             }
@@ -182,7 +208,8 @@ fn run(cli: Cli) -> Result<()> {
                 store: &store,
                 keyring: &keyring,
             };
-            let packages = get_packages(&ctx, &parse_sources(&packages)?, jobs)?;
+            let sources = sources(&ctx, &packages, &repos.repos, jobs)?;
+            let packages = get_packages(&ctx, &sources, jobs)?;
             let r = install::build(&workers, &store, &packages, &output)?;
             eprintln!(
                 "built {}: {} files, {} dirs, {} symlinks, {} hard links",
@@ -265,33 +292,161 @@ struct Ctx<'a> {
 enum Source {
     Path(PathBuf),
     Url(Url),
+    /// A package from a repo's latest snapshot, downloaded from `url`.
+    Repo {
+        repo: String,
+        entry: Box<DbEntry>,
+        url: Url,
+    },
 }
 
-fn parse_sources(args: &[OsString]) -> Result<Vec<Source>> {
-    args.iter()
-        .map(|arg| match arg.to_str() {
-            Some(s) if Url::is_url(s) => Ok(Source::Url(Url::parse(s)?)),
-            _ => Ok(Source::Path(arg.into())),
+/// A package as given on the command line.
+enum Arg {
+    Source(Source),
+    /// A package name, possibly qualified with a repo.
+    Name {
+        repo: Option<String>,
+        name: String,
+    },
+}
+
+/// Read a package argument: a URL stays a URL; `REPO/NAME` where `REPO`
+/// is one of `repos` is a qualified name; anything else that contains `/`
+/// or ends in `.pkg.tar.zst` is a path; the rest are names. `REPO/NAME`
+/// where `REPO` is another of the `configured` repos is an error, as it is
+/// more likely a mistake than a path.
+fn parse_arg(arg: &OsString, repos: &[String], configured: &[String]) -> Result<Arg> {
+    let Some(s) = arg.to_str() else {
+        return Ok(Arg::Source(Source::Path(arg.into())));
+    };
+    if Url::is_url(s) {
+        return Ok(Arg::Source(Source::Url(Url::parse(s)?)));
+    }
+    if !s.ends_with(".pkg.tar.zst") {
+        if let Some((repo, name)) = s.split_once('/')
+            && repos.iter().any(|r| r == repo)
+            && !name.contains('/')
+        {
+            return Ok(Arg::Name {
+                repo: Some(repo.to_owned()),
+                name: name.to_owned(),
+            });
+        }
+        if let Some((repo, name)) = s.split_once('/')
+            && configured.iter().any(|r| r == repo)
+            && !name.contains('/')
+        {
+            bail!("{s}: repo {repo} is not among --repo (write ./{s} for a file)");
+        }
+        if !s.contains('/') {
+            return Ok(Arg::Name {
+                repo: None,
+                name: s.to_owned(),
+            });
+        }
+    }
+    Ok(Arg::Source(Source::Path(arg.into())))
+}
+
+/// Where to get each package in `args` from. Names are looked up in the
+/// latest snapshots of `repos`, in order: the first repo that has the
+/// name wins, unless the name is qualified.
+fn sources(
+    ctx: &Ctx,
+    args: &[OsString],
+    repos: &[String],
+    jobs: NonZeroUsize,
+) -> Result<Vec<Source>> {
+    let configured = ctx.store.repos()?;
+    let args = args
+        .iter()
+        .map(|arg| parse_arg(arg, repos, &configured))
+        .collect::<Result<Vec<_>>>()?;
+    let first_name = args.iter().find_map(|a| match a {
+        Arg::Name { name, .. } => Some(name),
+        Arg::Source(_) => None,
+    });
+    let snapshots = match first_name {
+        None => Vec::new(),
+        Some(name) if repos.is_empty() => {
+            bail!("{name:?} is a package name, which needs repos to look in (--repo)")
+        }
+        Some(_) => load_snapshots(ctx, repos, jobs)?,
+    };
+    // A package named twice is taken once.
+    let mut named = HashSet::new();
+    let sources = args
+        .into_iter()
+        .map(|arg| match arg {
+            Arg::Source(source) => Ok(Some(source)),
+            Arg::Name { repo, name } => {
+                let found = snapshots
+                    .iter()
+                    .filter(|s| repo.as_ref().is_none_or(|r| *r == s.repo))
+                    .find_map(|s| Some((s, s.get(&name)?)));
+                let Some((snapshot, entry)) = found else {
+                    let repos = repo.map_or_else(|| repos.join(", "), |r| r.clone());
+                    bail!("package {name} not found in {repos}");
+                };
+                ensure!(
+                    entry.arch == arch::repo::ARCH || entry.arch == "any",
+                    "package {}/{name} is for {}, not {}",
+                    snapshot.repo,
+                    entry.arch,
+                    arch::repo::ARCH
+                );
+                if !named.insert((&snapshot.repo, &entry.name)) {
+                    return Ok(None);
+                }
+                Ok(Some(Source::Repo {
+                    repo: snapshot.repo.clone(),
+                    url: snapshot.config.package_url(&entry.filename)?,
+                    entry: Box::new(entry.clone()),
+                }))
+            }
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(sources.into_iter().flatten().collect())
+}
+
+/// The latest snapshot of each of `repos`.
+fn load_snapshots(ctx: &Ctx, repos: &[String], jobs: NonZeroUsize) -> Result<Vec<Snapshot>> {
+    let snapshots = par_map(repos, jobs, |repo| {
+        Snapshot::load(ctx.workers, ctx.store, repo)
+    })?;
+    for s in &snapshots {
+        eprintln!(
+            "using {} as synced at {} ({} packages)",
+            s.repo,
+            s.record.fetched,
+            s.entries.len()
+        );
+    }
+    Ok(snapshots)
 }
 
 /// [`get_package`] for each source, `jobs` at once, each import by its own
 /// worker (so a compromised worker can't change another package's
-/// manifest). Downloads start first, then the largest archives, as they
-/// take longest.
+/// manifest). Downloads start first, largest first (by the size in the
+/// repo's database where known), then the largest archives, as they take
+/// longest.
 fn get_packages(ctx: &Ctx, sources: &[Source], jobs: NonZeroUsize) -> Result<Vec<Package>> {
-    let size = |path: &Path| path.metadata().map_or(0, |m| m.len());
-    let mut order: Vec<(usize, &Source, u64)> = sources
+    let downloaded = |repo: &str, name: &str| match ctx.store.open_download(repo, name) {
+        Ok(Some(f)) => Some(f.metadata().map_or(0, |m| m.len())),
+        _ => None,
+    };
+    let mut order: Vec<(usize, &Source, (bool, u64))> = sources
         .iter()
         .enumerate()
         .map(|(i, source)| {
             let key = match source {
-                Source::Path(p) => size(p),
-                Source::Url(url) => match ctx.store.open_download(LOCAL, url.file_name()) {
-                    Ok(Some(f)) => f.metadata().map_or(0, |m| m.len()),
-                    _ => u64::MAX,
-                },
+                Source::Path(p) => (false, p.metadata().map_or(0, |m| m.len())),
+                Source::Url(url) => {
+                    downloaded(LOCAL, url.file_name()).map_or((true, u64::MAX), |n| (false, n))
+                }
+                Source::Repo { repo, entry, .. } => {
+                    downloaded(repo, &entry.filename).map_or((true, entry.csize), |n| (false, n))
+                }
             };
             (i, source, key)
         })
@@ -310,12 +465,14 @@ fn get_packages(ctx: &Ctx, sources: &[Source], jobs: NonZeroUsize) -> Result<Vec
 /// Load a package's manifest from the store, downloading and importing the
 /// archive if needed. The signature is checked first, every time, also for
 /// earlier downloads. Packages are identified by their repo and the hash
-/// of the archive file. The file is opened once, so the parsed content is the content that
-/// was verified and hashed, unless the file is written to meanwhile (see
-/// planning/BUGS.md; only the supervisor writes downloads). Concurrent
-/// calls for the same archive each import it.
+/// of the archive file. A package from a repo must have the SHA-256, name
+/// and version that the repo's database gives. The file is opened once, so
+/// the parsed content is the content that was verified and hashed, unless
+/// the file is written to meanwhile (see planning/BUGS.md; only the
+/// supervisor writes downloads). Concurrent calls for the same archive each
+/// import it.
 fn get_package(ctx: &Ctx, source: &Source) -> Result<Package> {
-    let (mut file, what) = match source {
+    let (mut file, what, repo, entry) = match source {
         Source::Path(path) => {
             let mut file =
                 File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -326,31 +483,115 @@ fn get_package(ctx: &Ctx, source: &Source) -> Result<Package> {
                 read_signature(sig).with_context(|| format!("reading {}", sig_path.display()))?;
             verify(ctx.keyring, &sig, &mut file)
                 .with_context(|| format!("verifying {}", path.display()))?;
-            (file, path.display().to_string())
+            (file, path.display().to_string(), LOCAL, None)
         }
-        Source::Url(url) => (fetch(ctx, url)?, url.to_string()),
+        Source::Url(url) => (fetch(ctx, url)?, url.to_string(), LOCAL, None),
+        Source::Repo { repo, entry, url } => (
+            fetch_from_repo(ctx, repo, entry, url)?,
+            format!("{repo}/{}", entry.filename),
+            repo.as_str(),
+            Some(entry),
+        ),
     };
     file.seek(SeekFrom::Start(0))?;
-    let hash = hash_reader(&mut file).with_context(|| format!("reading {what}"))?;
-    let repo = LOCAL;
-    if let Some(pkg) = ctx.store.load_package(repo, &hash)? {
-        return Ok(pkg);
+    let mut sha256 = entry.map(|_| Sha256::new());
+    let hash = hash_reader(Tee {
+        inner: &mut file,
+        sha256: sha256.as_mut(),
+    })
+    .with_context(|| format!("reading {what}"))?;
+    if let (Some(entry), Some(sha256)) = (entry, sha256) {
+        check_sha256(sha256, entry).with_context(|| format!("checking {what}"))?;
     }
-    file.seek(SeekFrom::Start(0))?;
-    let (pkg, stats) = ctx
-        .workers
-        .import_arch(ctx.store, file)
-        .with_context(|| format!("importing {what}"))?;
-    ctx.store.save_package(repo, &hash, &pkg)?;
-    eprintln!(
-        "imported {} {}: {} files, {} new objects ({:.1} MiB)",
+    let pkg = match ctx.store.load_package(repo, &hash)? {
+        Some(pkg) => pkg,
+        None => {
+            file.seek(SeekFrom::Start(0))?;
+            let (pkg, stats) = ctx
+                .workers
+                .import_arch(ctx.store, file)
+                .with_context(|| format!("importing {what}"))?;
+            if let Some(entry) = entry {
+                check_identity(&pkg, entry).with_context(|| format!("importing {what}"))?;
+            }
+            ctx.store.save_package(repo, &hash, &pkg)?;
+            eprintln!(
+                "imported {} {}: {} files, {} new objects ({:.1} MiB)",
+                pkg.name,
+                pkg.version,
+                stats.files,
+                stats.new_objects,
+                mib(stats.new_bytes)
+            );
+            pkg
+        }
+    };
+    if let Some(entry) = entry {
+        check_identity(&pkg, entry).with_context(|| format!("checking {what}"))?;
+    }
+    Ok(pkg)
+}
+
+/// `.PKGINFO`'s name and version must be those of the database entry.
+fn check_identity(pkg: &Package, entry: &DbEntry) -> Result<()> {
+    ensure!(
+        pkg.name == entry.name && pkg.version == entry.version,
+        "the package is {} {}, but the repo's database says {} {}",
         pkg.name,
         pkg.version,
-        stats.files,
-        stats.new_objects,
-        mib(stats.new_bytes)
+        entry.name,
+        entry.version
     );
-    Ok(pkg)
+    Ok(())
+}
+
+fn check_sha256(sha256: Sha256, entry: &DbEntry) -> Result<()> {
+    let actual = sha256.finalize();
+    let expected = &entry.sha256;
+    ensure!(
+        hex(&actual).eq_ignore_ascii_case(expected),
+        "SHA-256 is {}, but the repo's database says {expected}",
+        hex(&actual)
+    );
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Passes reads through, also hashing them with SHA-256 if wanted.
+struct Tee<'a, R> {
+    inner: R,
+    sha256: Option<&'a mut Sha256>,
+}
+
+impl<R: Read> Read for Tee<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(h) = self.sha256.as_mut() {
+            h.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+/// Writes through, hashing with SHA-256.
+struct Sha256Writer<W> {
+    inner: W,
+    sha256: Sha256,
+}
+
+impl<W: Write> Write for Sha256Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.sha256.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// The verified archive from `url`: downloaded earlier, or now. Only
@@ -374,23 +615,70 @@ fn fetch(ctx: &Ctx, url: &Url) -> Result<File> {
     ctx.workers
         .download(&sig_url, &mut sig, signature::MAX_SIGNATURE_SIZE)
         .with_context(|| format!("downloading {sig_url}"))?;
+    download_package(ctx, LOCAL, name, url, &sig, None)
+}
+
+/// The verified archive of a package in a repo: downloaded earlier, or
+/// now. The signature, size and SHA-256 come from the repo's database.
+fn fetch_from_repo(ctx: &Ctx, repo: &str, entry: &DbEntry, url: &Url) -> Result<File> {
+    let name = &entry.filename;
+    let sig = entry
+        .pgpsig
+        .as_deref()
+        .with_context(|| format!("{repo}/{name} has no signature in the repo's database"))?;
+    if let Some(mut file) = ctx.store.open_download(repo, name)? {
+        verify(ctx.keyring, sig, &mut file).with_context(|| {
+            format!("verifying {name}, downloaded earlier (delete downloads/{repo}/{name} in the store to download it again)")
+        })?;
+        return Ok(file);
+    }
+    download_package(ctx, repo, name, url, sig, Some(entry))
+}
+
+/// Download `url` and keep it as `name` in `repo`'s downloads if `sig`
+/// verifies, with the signature next to it (`.sig`), written after the
+/// archive. With `entry`, the size and SHA-256 must be those it gives.
+fn download_package(
+    ctx: &Ctx,
+    repo: &str,
+    name: &str,
+    url: &Url,
+    sig: &[u8],
+    entry: Option<&DbEntry>,
+) -> Result<File> {
+    let store = ctx.store;
     let mut tmp = store.tmp_file()?;
-    let mut w = BufWriter::with_capacity(64 << 10, tmp.file());
-    let size = ctx
-        .workers
-        .download(url, &mut w, u64::MAX)
-        .and_then(|d| Ok(w.flush().map(|()| d.size)?))
-        .with_context(|| format!("downloading {url}"))?;
-    drop(w);
-    verify(ctx.keyring, &sig, tmp.file()).with_context(|| format!("verifying {url}"))?;
-    let file = tmp.save_download(LOCAL, name)?;
+    let max_size = entry.map_or(u64::MAX, |e| e.csize);
+    let (size, sha256) = {
+        let mut w = Sha256Writer {
+            inner: BufWriter::with_capacity(64 << 10, tmp.file()),
+            sha256: Sha256::new(),
+        };
+        let size = ctx
+            .workers
+            .download(url, &mut w, max_size)
+            .and_then(|d| Ok(w.flush().map(|()| d.size)?))
+            .with_context(|| format!("downloading {url}"))?;
+        (size, w.sha256)
+    };
+    if let Some(entry) = entry {
+        ensure!(
+            size == entry.csize,
+            "{url} has {size} bytes, but the repo's database says {}",
+            entry.csize
+        );
+        check_sha256(sha256, entry).with_context(|| format!("downloading {url}"))?;
+    }
+    verify(ctx.keyring, sig, tmp.file()).with_context(|| format!("verifying {url}"))?;
+    let file = tmp.save_download(repo, name)?;
+    let sig_name = format!("{name}.sig");
     let mut sig_tmp = store.tmp_file()?;
     sig_tmp
         .file()
-        .write_all(&sig)
+        .write_all(sig)
         .with_context(|| format!("writing {sig_name}"))?;
-    sig_tmp.save_download(LOCAL, &sig_name)?;
-    eprintln!("downloaded {name} ({:.1} MiB)", mib(size));
+    sig_tmp.save_download(repo, &sig_name)?;
+    eprintln!("downloaded {repo}/{name} ({:.1} MiB)", mib(size));
     Ok(file)
 }
 
@@ -434,4 +722,46 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = OsString::from(path);
     s.push(suffix);
     s.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_arguments() {
+        let repos = ["core".to_owned(), "extra".to_owned()];
+        let configured = ["core".to_owned(), "extra".to_owned(), "multilib".to_owned()];
+        let parse = |s: &str| parse_arg(&s.into(), &repos, &configured);
+        let name = |s: &str| match parse(s).unwrap() {
+            Arg::Name { repo, name } => (repo, name),
+            Arg::Source(_) => panic!("{s} is not a name"),
+        };
+        let path = |s: &str| match parse(s).unwrap() {
+            Arg::Source(Source::Path(p)) => p,
+            _ => panic!("{s} is not a path"),
+        };
+        assert_eq!(name("bash"), (None, "bash".to_owned()));
+        assert_eq!(
+            name("extra/bash"),
+            (Some("extra".to_owned()), "bash".to_owned())
+        );
+        assert_eq!(path("./core/bash"), Path::new("./core/bash"));
+        assert_eq!(path("core/a/b"), Path::new("core/a/b"));
+        assert_eq!(path("other/bash"), Path::new("other/bash"));
+        assert_eq!(
+            path("bash-5.3-1-x86_64.pkg.tar.zst"),
+            Path::new("bash-5.3-1-x86_64.pkg.tar.zst")
+        );
+        assert_eq!(
+            path("core/bash-5.3-1-x86_64.pkg.tar.zst"),
+            Path::new("core/bash-5.3-1-x86_64.pkg.tar.zst")
+        );
+        assert!(matches!(
+            parse("https://x/a.pkg.tar.zst"),
+            Ok(Arg::Source(Source::Url(_)))
+        ));
+        let e = parse("multilib/bash").err().unwrap().to_string();
+        assert!(e.contains("not among --repo"), "{e}");
+    }
 }

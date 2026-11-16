@@ -110,6 +110,29 @@ are in BUGS.md.
 - No conditional requests yet: syncing core and extra (8.8 MiB) took
   0.9 s, 1.35 s with reading them.
 - The keyring is needed only to import packages (`import`, `build`).
+- Packages can be given by name. A build (or import) lists the repos it
+  may use in priority order (`--repo`) and uses each one's latest
+  snapshot, failing if a repo was never synced; the first repo with the
+  name wins, and `REPO/NAME` takes it from that repo, which must be
+  among `--repo`. Restrictions are per repo only: a single package can
+  install any file, so limiting which names a repo may provide would
+  protect nothing. A package named twice is taken once.
+- Arguments: URLs stay URLs; `REPO/NAME` with one of the `--repo` repos
+  is a qualified name; other arguments containing `/` or ending in
+  `.pkg.tar.zst` are paths (`./REPO/NAME` for a file that would read as
+  a name); anything else is a name. `REPO/NAME` with a configured repo
+  not among `--repo` is an error rather than a path, as it's more likely
+  a mistake.
+- The snapshot's entry gives the URL (`<server>/<FILENAME>`), the
+  signature (`%PGPSIG%`, still saved as `.sig` next to the download;
+  an entry without one is an error), the size limit and exact size
+  (`%CSIZE%`) and `%SHA256SUM%`, checked while downloading, before the
+  file is kept, and again for earlier downloads while hashing the
+  archive for its id. `.PKGINFO`'s name and version must match the
+  entry's, also for packages imported before. The architecture must be
+  `x86_64` or `any`.
+- Downloads start largest first by `%CSIZE%`, before archives already
+  there (largest first).
 
 ## Downloads
 

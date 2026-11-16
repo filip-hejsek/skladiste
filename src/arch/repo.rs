@@ -9,7 +9,7 @@
 //! is given; `skl` runs it in a sandboxed worker and checks the result
 //! with [`validate`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::time::SystemTime;
@@ -68,6 +68,48 @@ impl Config {
     /// URL of the database, `<server>/<db>.db`.
     pub fn db_url(&self) -> Result<Url> {
         Url::parse(&format!("{}/{}.db", self.base(), self.db))
+    }
+
+    /// URL of a package file, `<server>/<file name>`.
+    pub fn package_url(&self, file_name: &str) -> Result<Url> {
+        Url::parse(&format!("{}/{file_name}", self.base()))
+    }
+}
+
+/// A repo's latest snapshot: its database as last synced.
+pub struct Snapshot {
+    pub repo: String,
+    pub config: Config,
+    pub record: SyncRecord,
+    pub entries: Vec<DbEntry>,
+    by_name: HashMap<String, usize>,
+}
+
+impl Snapshot {
+    /// Load the latest snapshot of `repo`, which must have been synced.
+    pub fn load(workers: &Workers, store: &Store, repo: &str) -> Result<Snapshot> {
+        let config: Config = store.repo_config(repo)?;
+        let record = store
+            .latest_sync(repo)?
+            .with_context(|| format!("repo {repo} was never synced (run `skl sync {repo}`)"))?;
+        let entries = load_db(workers, store, &record)?;
+        let by_name = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.clone(), i))
+            .collect();
+        Ok(Snapshot {
+            repo: repo.to_owned(),
+            config,
+            record,
+            entries,
+            by_name,
+        })
+    }
+
+    /// The package called `name`.
+    pub fn get(&self, name: &str) -> Option<&DbEntry> {
+        self.by_name.get(name).map(|&i| &self.entries[i])
     }
 }
 
@@ -491,6 +533,10 @@ mod tests {
         assert_eq!(
             c.db_url().unwrap().to_string(),
             "http://example.org/fixed/custom.db"
+        );
+        assert_eq!(
+            c.package_url("a-1-1-any.pkg.tar.zst").unwrap().to_string(),
+            "http://example.org/fixed/a-1-1-any.pkg.tar.zst"
         );
         assert!(Config::new("ftp://x/$repo", "core").is_err());
         assert!(Config::new("https://x/$repo", "a/b").is_err());

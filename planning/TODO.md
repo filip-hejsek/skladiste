@@ -7,32 +7,19 @@ Next priorities: dependency resolution, then install scripts and hooks.
 
 ## Arch frontend
 
-- Repo databases (sync dbs) and building by package name. Repos,
-  `skl sync`, reading databases and package ids with the repo are done
-  (see Repos in DECISIONS.md); the rest is agreed, to be done in this
-  order, one commit each:
-  4. Build by name. A build lists the repos it may use in priority order
-     (`--repo`) and uses each one's latest snapshot, failing if a repo
-     was never synced; a name can be qualified (`repo/name`). Restrictions are
-     per repo only: a single package can install any file, so limiting
-     which names a repo may provide would protect nothing. Arguments
-     containing `/` or ending in `.pkg.tar.zst` are paths, URLs stay
-     URLs, anything else is a name. The snapshot's entry gives the URL,
-     the signature (`%PGPSIG%`, still saved as `.sig`), the size limit
-     (`%CSIZE%`) and `%SHA256SUM%` (checked while downloading), and
-     `.PKGINFO`'s name and version must match it. Download order by
-     `%CSIZE%`.
-  5. Dependency resolution against the snapshots, with Arch version
-     comparison (`vercmp`) supplied by the frontend rather than the
-     core: versioned dependencies and soname provides are checked across
-     everything going into the image, so incompatible versions (also
-     from snapshots of different times) are reported. This trusts the
-     unsigned databases more, for usability; checking again against
-     `.PKGINFO` (see Mirror trust) limits that. Image metadata records
-     the snapshot used per repo, for upgrades and the check against
-     older versions.
+- Repo databases (sync dbs) and building by package name: done up to
+  building by name (see Repos in DECISIONS.md); still to do:
+  - Dependency resolution against the snapshots, with Arch version
+    comparison (`vercmp`) supplied by the frontend rather than the
+    core: versioned dependencies and soname provides are checked across
+    everything going into the image, so incompatible versions (also
+    from snapshots of different times) are reported. This trusts the
+    unsigned databases more, for usability; checking again against
+    `.PKGINFO` (see Mirror trust) limits that. Image metadata records
+    the snapshot used per repo, for upgrades and the check against
+    older versions.
 
-  Testing until 5: `scripts/fetch-arch-packages.sh --urls` prints the
+  Testing until then: `scripts/fetch-arch-packages.sh --urls` prints the
   URLs, with dependencies resolved by name and provides, ignoring
   versions.
 - Conditional requests in `skl sync` (`If-Modified-Since`, 304): each

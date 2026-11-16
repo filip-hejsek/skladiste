@@ -14,7 +14,8 @@ formats can be added as frontends.
 - Imports Arch `.pkg.tar.zst` packages into the store, after checking
   each package's signature (`.sig` next to it) against the Arch keyring:
   the signing key must be certified by at least 3 of the master keys
-- Builds a new image subvolume from a list of package files or URLs
+- Builds a new image subvolume from a list of packages: names looked up
+  in repos, files or URLs
 - Keeps Arch repo databases (`skl repo add`, `skl sync`), every version
 - No dependency resolution, install scripts or hooks yet
 - Owners are applied only where permitted; unprivileged builds report how
