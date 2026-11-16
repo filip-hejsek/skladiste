@@ -203,6 +203,7 @@ pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<Syn
         url: url.to_string(),
         fetched,
         last_modified: download.last_modified,
+        etag: download.etag,
     })
 }
 

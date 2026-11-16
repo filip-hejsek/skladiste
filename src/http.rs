@@ -239,6 +239,8 @@ impl RootCerts {
 pub struct Response {
     /// The `Last-Modified` header, as sent.
     pub last_modified: Option<String>,
+    /// The `ETag` header, as sent (with its quotes and any `W/`).
+    pub etag: Option<String>,
 }
 
 /// Request `url` over `stream`, an open connection to its host, using TLS
@@ -352,6 +354,7 @@ fn read_head(r: &mut impl BufRead) -> Result<(Framing, Response)> {
     }
     let response = Response {
         last_modified: header("last-modified").next(),
+        etag: header("etag").next(),
     };
     let te: Vec<String> = header("transfer-encoding").collect();
     if !te.is_empty() {
@@ -556,13 +559,15 @@ mod tests {
     }
 
     #[test]
-    fn last_modified() {
-        let resp = b"HTTP/1.1 200 OK\r\nLast-Modified:  Mon, 16 Nov 2026 08:00:00 GMT \r\n\r\nx";
+    fn validators() {
+        let resp = b"HTTP/1.1 200 OK\r\nLast-Modified:  Mon, 16 Nov 2026 08:00:00 GMT \r\n\
+            etag: W/\"6919-abc\"\r\n\r\nx";
         let (_, r) = fetch_response(resp).unwrap();
         assert_eq!(
             r.last_modified.as_deref(),
             Some("Mon, 16 Nov 2026 08:00:00 GMT")
         );
+        assert_eq!(r.etag.as_deref(), Some("W/\"6919-abc\""));
         let (_, r) = fetch_response(b"HTTP/1.1 200 OK\r\n\r\nx").unwrap();
         assert_eq!(r, Response::default());
     }

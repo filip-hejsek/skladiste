@@ -504,6 +504,7 @@ mod tests {
             url: "http://x/a.db".into(),
             fetched: fetched.into(),
             last_modified: None,
+            etag: Some("\"abc\"".to_owned()),
         };
         let (old, new) = (
             record("2026-01-02T00:00:00.000000Z"),

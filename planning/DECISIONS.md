@@ -78,8 +78,9 @@ are in BUGS.md.
   as a store object, and a record `repos/<repo>/syncs/<time>.json` with
   its hash, size, URL, the fetch time (supervisor's clock, UTC with
   microseconds; fixed width, so the names sort by time) and the server's
-  `Last-Modified` (sent by the worker, so untrusted: at most 100 bytes,
-  control characters escaped, for information only). Records are linked
+  `Last-Modified` and `ETag` (sent by the worker, so untrusted: at most
+  100 and 256 bytes, control characters escaped, for information only
+  until requests are conditional). Records are linked
   into place from an unnamed file, so one is never replaced or seen
   half-written. Records of repos synced together are written only after
   all of them were downloaded. A repo's latest record is its current
@@ -218,8 +219,8 @@ are in BUGS.md.
   argument (a bundle of 122 roots is 180 KB of PEM, over Linux's
   128 KiB limit per argument); an extra fd (needs new plumbing through
   bubblewrap for one input sent once).
-- The worker sends the response's `Last-Modified` header with its
-  final `DONE`.
+- The worker sends the response's `Last-Modified` and `ETag` headers
+  with its final `DONE`.
 - Downloads are kept in the store's `downloads/<repo>/` by file name
   (the URL's last path segment; Arch file names include the version; the
   same name can have different content in different repos), written to

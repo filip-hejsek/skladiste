@@ -112,6 +112,8 @@ const INSTALL_CAPS: &[&str] = &[
 
 /// Longest `Last-Modified` value kept from a download worker.
 const MAX_LAST_MODIFIED: usize = 100;
+/// Longest `ETag` value kept from a download worker.
+const MAX_ETAG: usize = 256;
 
 /// A finished download.
 #[derive(Debug)]
@@ -121,6 +123,8 @@ pub struct Downloaded {
     /// The server's `Last-Modified` header, if it sent one, with control
     /// characters escaped. Untrusted: for information only.
     pub last_modified: Option<String>,
+    /// The server's `ETag` header, likewise.
+    pub etag: Option<String>,
 }
 
 /// Statistics about an import, counted by the supervisor.
@@ -563,13 +567,15 @@ fn receive_download(
                 let json = read_payload(&mut *conn, len, MAX_ERROR)?;
                 let response: http::Response =
                     serde_json::from_slice(&json).context("parsing result from worker")?;
-                let last_modified = response
-                    .last_modified
-                    .filter(|v| v.len() <= MAX_LAST_MODIFIED)
-                    .map(|v| sanitize(&v, false));
+                let keep = |value: Option<String>, max| {
+                    value
+                        .filter(|v| v.len() <= max)
+                        .map(|v| sanitize(&v, false))
+                };
                 return Ok(Downloaded {
                     size: total,
-                    last_modified,
+                    last_modified: keep(response.last_modified, MAX_LAST_MODIFIED),
+                    etag: keep(response.etag, MAX_ETAG),
                 });
             }
             ERROR => return Err(read_error(conn, len)),

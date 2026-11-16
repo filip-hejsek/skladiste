@@ -15,8 +15,9 @@ Next priorities: install scripts and hooks.
   that fits each dependency and reports a conflict rather than trying
   another choice.
 - `REPLACES` is read but not used; it matters for upgrades.
-- Conditional requests in `skl sync` (`If-Modified-Since`, 304): each
-  sync downloads the whole database now (`extra.db` is 8.7 MiB).
+- Conditional requests in `skl sync` (`If-None-Match` with the recorded
+  `ETag`, else `If-Modified-Since`; 304): each sync downloads the whole
+  database now (`extra.db` is 8.7 MiB).
 - Manage the keyring in skl (from the `archlinux-keyring` package,
   updated like other packages and verified by the current keyring)
   instead of a path on the command line.

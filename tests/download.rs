@@ -40,7 +40,7 @@ fn serve() -> String {
             let response = match path {
                 "/big.zst" => {
                     let mut r = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLast-Modified: Mon, 16 Nov 2026 08:00:00 GMT\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLast-Modified: Mon, 16 Nov 2026 08:00:00 GMT\r\nETag: \"6919-abc\"\r\n\r\n",
                         big.len()
                     )
                     .into_bytes();
@@ -186,11 +186,12 @@ fn downloads_body() {
         d.last_modified.as_deref(),
         Some("Mon, 16 Nov 2026 08:00:00 GMT")
     );
+    assert_eq!(d.etag.as_deref(), Some("\"6919-abc\""));
     let url = Url::parse(&format!("{base}/chunked.zst")).unwrap();
     let d = workers()
         .download(&url, &mut std::io::sink(), u64::MAX)
         .unwrap();
-    assert_eq!(d.last_modified, None);
+    assert_eq!((d.last_modified, d.etag), (None, None));
 }
 
 #[test]

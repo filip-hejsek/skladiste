@@ -54,7 +54,7 @@ fn serve(files: Vec<(&'static str, Vec<u8>)>) -> String {
             let response = match files.iter().find(|(p, _)| *p == path) {
                 Some((_, content)) => {
                     let mut r = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLast-Modified: yesterday\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLast-Modified: yesterday\r\nETag: \"v1\"\r\n\r\n",
                         content.len()
                     )
                     .into_bytes();
@@ -85,6 +85,7 @@ fn sync_and_read() {
     assert_eq!(record.size, db.len() as u64);
     assert_eq!(record.url, format!("{base}/main/x86_64/main.db"));
     assert_eq!(record.last_modified.as_deref(), Some("yesterday"));
+    assert_eq!(record.etag.as_deref(), Some("\"v1\""));
     let entries = repo::load_db(&workers, &store, &record).unwrap();
     let names: Vec<_> = entries
         .iter()

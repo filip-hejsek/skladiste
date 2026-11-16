@@ -57,9 +57,10 @@ pub struct SyncRecord {
     /// When the download finished, by the supervisor's clock, as
     /// [`timestamp`] formats it.
     pub fetched: String,
-    /// The server's `Last-Modified` header: untrusted, for information
-    /// only.
+    /// The server's `Last-Modified` and `ETag` headers: untrusted, for
+    /// information only.
     pub last_modified: Option<String>,
+    pub etag: Option<String>,
 }
 
 /// `time` in UTC as `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`. Of fixed width (for
