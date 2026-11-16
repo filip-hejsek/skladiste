@@ -5,6 +5,11 @@
 //! - `packages/<id>.json` — imported package manifests
 //! - `downloads/<name>` — downloaded package archives (and their
 //!   signatures), by file name
+//! - `repos/<repo>/config.json` — a repo's configuration (see
+//!   [`crate::repo`]); its format is the frontend's
+//! - `repos/<repo>/syncs/<time>.json` — a record of each version of the
+//!   repo's database that was fetched ([`SyncRecord`]); the database
+//!   itself is an object
 //! - `tmp/` — staging area for files being written: unnamed
 //!   (`O_TMPFILE`) until complete and checked, except manifests
 //!
@@ -18,11 +23,14 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::manifest::{Hash, ObjectId, Package};
+use crate::repo::{self, SyncRecord};
 
 pub struct Store {
     dir: OwnedFd,
@@ -81,7 +89,7 @@ impl Store {
             Mode::empty(),
         )
         .with_context(|| format!("opening {}", root.display()))?;
-        for sub in ["objects", "packages", "downloads", "tmp"] {
+        for sub in ["objects", "packages", "downloads", "repos", "tmp"] {
             mkdir_exist_ok(&dir, sub)
                 .with_context(|| format!("creating {}", root.join(sub).display()))?;
         }
@@ -205,9 +213,9 @@ impl Store {
         )
     }
 
-    pub fn load_package(&self, id: &str) -> Result<Option<Package>> {
-        let name = package_name(id);
-        let fd = match self.openat(&name, OFlags::RDONLY, 0) {
+    /// Read a whole file, if it exists.
+    fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let fd = match self.openat(name, OFlags::RDONLY, 0) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("opening {name}")),
@@ -216,30 +224,128 @@ impl Store {
         File::from(fd)
             .read_to_end(&mut data)
             .with_context(|| format!("reading {name}"))?;
-        let pkg = serde_json::from_slice(&data).with_context(|| format!("parsing {name}"))?;
-        Ok(Some(pkg))
+        Ok(Some(data))
     }
 
-    /// Save a manifest under `id`, replacing any saved before. Concurrent
-    /// saves of the same package don't interfere; one of them wins.
-    pub fn save_package(&self, id: &str, pkg: &Package) -> Result<()> {
-        let name = package_name(id);
-        let json = serde_json::to_vec(pkg)?;
+    fn read_json<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        let Some(data) = self.read_file(name)? else {
+            return Ok(None);
+        };
+        let value = serde_json::from_slice(&data).with_context(|| format!("parsing {name}"))?;
+        Ok(Some(value))
+    }
+
+    /// Write `name` through a named file in `tmp/`, replacing any file
+    /// there. Concurrent writes of the same file don't interfere; one of
+    /// them wins.
+    fn write_replace(&self, name: &str, data: &[u8]) -> Result<()> {
         let tmp = self.tmp_name();
         let fd = self
             .openat(&tmp, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, 0o644)
             .with_context(|| format!("creating {tmp}"))?;
         let result = File::from(fd)
-            .write_all(&json)
+            .write_all(data)
             .with_context(|| format!("writing {tmp}"))
             .and_then(|()| {
-                rustix::fs::renameat(&self.dir, &tmp, &self.dir, &name)
+                rustix::fs::renameat(&self.dir, &tmp, &self.dir, name)
                     .with_context(|| format!("moving {tmp} to {name}"))
             });
         if result.is_err() {
             let _ = rustix::fs::unlinkat(&self.dir, &tmp, AtFlags::empty());
         }
         result
+    }
+
+    pub fn load_package(&self, id: &str) -> Result<Option<Package>> {
+        self.read_json(&package_name(id))
+    }
+
+    /// Save a manifest under `id`, replacing any saved before. Concurrent
+    /// saves of the same package don't interfere; one of them wins.
+    pub fn save_package(&self, id: &str, pkg: &Package) -> Result<()> {
+        self.write_replace(&package_name(id), &serde_json::to_vec(pkg)?)
+    }
+
+    /// Add repo `name` with `config` (in the frontend's format). Fails if
+    /// the repo exists.
+    pub fn add_repo(&self, name: &str, config: &impl Serialize) -> Result<()> {
+        repo::check_name(name)?;
+        let dir = format!("repos/{name}");
+        match rustix::fs::mkdirat(&self.dir, &dir, Mode::from_raw_mode(0o755)) {
+            Ok(()) => {}
+            Err(Errno::EXIST) => bail!("repo {name} already exists"),
+            Err(e) => return Err(e).with_context(|| format!("creating {dir}")),
+        }
+        let syncs = format!("{dir}/syncs");
+        rustix::fs::mkdirat(&self.dir, &syncs, Mode::from_raw_mode(0o755))
+            .with_context(|| format!("creating {syncs}"))?;
+        self.write_replace(&format!("{dir}/config.json"), &serde_json::to_vec(config)?)
+    }
+
+    /// Configuration of repo `name`, which must exist.
+    pub fn repo_config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
+        repo::check_name(name)?;
+        self.read_json(&format!("repos/{name}/config.json"))?
+            .with_context(|| format!("no repo {name} (add it with `skl repo add`)"))
+    }
+
+    /// Names of the configured repos, sorted.
+    pub fn repos(&self) -> Result<Vec<String>> {
+        let mut names = self.list_dir("repos")?;
+        names.retain(|n| repo::check_name(n).is_ok());
+        names.sort();
+        Ok(names)
+    }
+
+    /// Names in directory `path`, other than `.` and `..`, unsorted.
+    fn list_dir(&self, path: &str) -> Result<Vec<String>> {
+        let fd = self
+            .openat(path, OFlags::RDONLY | OFlags::DIRECTORY, 0)
+            .with_context(|| format!("opening {path}"))?;
+        let mut names = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&fd).with_context(|| format!("reading {path}"))? {
+            let entry = entry.with_context(|| format!("reading {path}"))?;
+            let name = entry.file_name().to_string_lossy();
+            if name != "." && name != ".." {
+                names.push(name.into_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Record a sync of repo `name`, as `syncs/<fetched>.json`. Fails if
+    /// a record by that name exists.
+    pub fn save_sync(&self, name: &str, record: &SyncRecord) -> Result<()> {
+        repo::check_name(name)?;
+        anyhow::ensure!(
+            record
+                .fetched
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b":.-".contains(&b)),
+            "bad sync time {:?}",
+            record.fetched
+        );
+        let dest = format!("repos/{name}/syncs/{}.json", record.fetched);
+        let mut file = File::from(self.unnamed_file(0o644)?);
+        file.write_all(&serde_json::to_vec(record)?)
+            .with_context(|| format!("writing {dest}"))?;
+        self.link(&file, &dest)
+            .with_context(|| format!("linking {dest}"))
+    }
+
+    /// The latest sync of repo `name` (by fetch time), if it was synced.
+    pub fn latest_sync(&self, name: &str) -> Result<Option<SyncRecord>> {
+        repo::check_name(name)?;
+        let dir = format!("repos/{name}/syncs");
+        let latest = self
+            .list_dir(&dir)?
+            .into_iter()
+            .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+            .max();
+        match latest {
+            Some(file) => self.read_json(&format!("{dir}/{file}")),
+            None => Ok(None),
+        }
     }
 }
 
@@ -337,6 +443,44 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o444);
+        assert!(tmp_is_empty(dir.path()));
+    }
+
+    #[test]
+    fn repos_and_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.repos().unwrap().is_empty());
+        store.add_repo("b", &"config b").unwrap();
+        store.add_repo("a", &"config a").unwrap();
+        let e = store.add_repo("a", &"again").unwrap_err();
+        assert!(e.to_string().contains("already exists"), "{e}");
+        assert!(store.add_repo("../x", &"").is_err());
+        assert_eq!(store.repos().unwrap(), ["a", "b"]);
+        assert_eq!(store.repo_config::<String>("a").unwrap(), "config a");
+        assert!(store.repo_config::<String>("c").is_err());
+
+        assert_eq!(store.latest_sync("a").unwrap(), None);
+        let record = |fetched: &str| SyncRecord {
+            hash: store.add_object(&mut fetched.as_bytes()).unwrap().hash,
+            size: 1,
+            url: "http://x/a.db".into(),
+            fetched: fetched.into(),
+            last_modified: None,
+        };
+        let (old, new) = (
+            record("2026-01-02T00:00:00.000000Z"),
+            record("2026-01-10T00:00:00.000000Z"),
+        );
+        store.save_sync("a", &new).unwrap();
+        store.save_sync("a", &old).unwrap();
+        assert!(
+            store.save_sync("a", &old).is_err(),
+            "records aren't replaced"
+        );
+        assert!(store.save_sync("a", &record("../../x")).is_err());
+        assert_eq!(store.latest_sync("a").unwrap(), Some(new));
+        assert_eq!(store.latest_sync("b").unwrap(), None);
         assert!(tmp_is_empty(dir.path()));
     }
 

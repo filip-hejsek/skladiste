@@ -39,8 +39,11 @@ fn serve() -> String {
             let big = content(3 << 20);
             let response = match path {
                 "/big.zst" => {
-                    let mut r = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", big.len())
-                        .into_bytes();
+                    let mut r = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nLast-Modified: Mon, 16 Nov 2026 08:00:00 GMT\r\n\r\n",
+                        big.len()
+                    )
+                    .into_bytes();
                     r.extend_from_slice(&big);
                     r
                 }
@@ -72,8 +75,8 @@ fn download(url: &str, max_size: u64) -> anyhow::Result<Vec<u8>> {
 
 fn download_with(workers: &Workers, url: &str, max_size: u64) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
-    let size = workers.download(&Url::parse(url)?, &mut out, max_size)?;
-    assert_eq!(size, out.len() as u64);
+    let d = workers.download(&Url::parse(url)?, &mut out, max_size)?;
+    assert_eq!(d.size, out.len() as u64);
     Ok(out)
 }
 
@@ -174,6 +177,20 @@ fn downloads_body() {
     let expected = content(3 << 20);
     assert!(download(&format!("{base}/big.zst"), u64::MAX).unwrap() == expected);
     assert!(download(&format!("{base}/chunked.zst"), u64::MAX).unwrap() == expected);
+
+    let url = Url::parse(&format!("{base}/big.zst")).unwrap();
+    let d = workers()
+        .download(&url, &mut std::io::sink(), u64::MAX)
+        .unwrap();
+    assert_eq!(
+        d.last_modified.as_deref(),
+        Some("Mon, 16 Nov 2026 08:00:00 GMT")
+    );
+    let url = Url::parse(&format!("{base}/chunked.zst")).unwrap();
+    let d = workers()
+        .download(&url, &mut std::io::sink(), u64::MAX)
+        .unwrap();
+    assert_eq!(d.last_modified, None);
 }
 
 #[test]

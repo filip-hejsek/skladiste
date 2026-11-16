@@ -7,6 +7,7 @@ pub mod http;
 pub mod install;
 pub mod jobs;
 pub mod manifest;
+pub mod repo;
 mod sandbox;
 pub mod store;
 pub mod worker;

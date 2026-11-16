@@ -27,8 +27,9 @@
 //!   certificates on fd 1 (a `CERT` frame each, in DER, then an empty
 //!   `DONE`); otherwise the worker uses the built-in ones. The worker sends
 //!   the request (over TLS for `https`) and streams the response body in
-//!   `CHUNK`s, ending with an empty `DONE`. It can't reach any other host,
-//!   and the supervisor writes the file. No filesystem access, no ioctls.
+//!   `CHUNK`s, ending with `DONE` with the response's headers of interest
+//!   ([`http::Response`]). It can't reach any other host, and the
+//!   supervisor writes the file. No filesystem access, no ioctls.
 //! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
 //!   and the store directory and image root are bound at `/store`
 //!   (read-only) and `/image` in the worker's mount namespace. The worker
@@ -105,6 +106,19 @@ const INSTALL_CAPS: &[&str] = &[
     "CAP_SETFCAP",
 ];
 
+/// Longest `Last-Modified` value kept from a download worker.
+const MAX_LAST_MODIFIED: usize = 100;
+
+/// A finished download.
+#[derive(Debug)]
+pub struct Downloaded {
+    /// Size of the body, counted by the supervisor.
+    pub size: u64,
+    /// The server's `Last-Modified` header, if it sent one, with control
+    /// characters escaped. Untrusted: for information only.
+    pub last_modified: Option<String>,
+}
+
 /// Statistics about an import, counted by the supervisor.
 #[derive(Debug, Default)]
 pub struct ImportStats {
@@ -174,10 +188,10 @@ impl Workers {
     }
 
     /// Download `url` in a worker and write the body to `dest`, failing
-    /// if it is longer than `max_size`. Returns its size. The connection is
-    /// opened here and handed to the worker, which has no network access
-    /// of its own. Redirects are not followed.
-    pub fn download(&self, url: &Url, dest: &mut dyn Write, max_size: u64) -> Result<u64> {
+    /// if it is longer than `max_size`. The connection is opened here and
+    /// handed to the worker, which has no network access of its own.
+    /// Redirects are not followed.
+    pub fn download(&self, url: &Url, dest: &mut dyn Write, max_size: u64) -> Result<Downloaded> {
         use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
         let conn = http::connect(url, DOWNLOAD_TIMEOUT)?;
         let (ours, theirs) = socketpair(
@@ -512,7 +526,7 @@ fn receive_download(
     conn: &mut BufReader<File>,
     dest: &mut dyn Write,
     max_size: u64,
-) -> Result<u64> {
+) -> Result<Downloaded> {
     let mut total: u64 = 0;
     let mut buf = Vec::new();
     loop {
@@ -527,7 +541,19 @@ fn receive_download(
                 conn.read_exact(&mut buf).context("reading from worker")?;
                 dest.write_all(&buf).context("writing download")?;
             }
-            DONE if len == 0 => return Ok(total),
+            DONE => {
+                let json = read_payload(&mut *conn, len, MAX_ERROR)?;
+                let response: http::Response =
+                    serde_json::from_slice(&json).context("parsing result from worker")?;
+                let last_modified = response
+                    .last_modified
+                    .filter(|v| v.len() <= MAX_LAST_MODIFIED)
+                    .map(|v| sanitize(&v, false));
+                return Ok(Downloaded {
+                    size: total,
+                    last_modified,
+                });
+            }
             ERROR => return Err(read_error(conn, len)),
             _ => bail!("unexpected message {tag} ({len} bytes) from worker"),
         }
@@ -806,10 +832,10 @@ fn download_worker(
     } else {
         RootCerts::default()
     };
-    http::get(conn, &url, &roots, &mut |data| {
+    let response = http::get(conn, &url, &roots, &mut |data| {
         write_frame(out, CHUNK, data)
     })?;
-    Ok(Vec::new())
+    Ok(serde_json::to_vec(&response)?)
 }
 
 /// System calls the installer makes besides [`sandbox`]'s basic set.

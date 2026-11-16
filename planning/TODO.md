@@ -7,24 +7,9 @@ Next priorities: dependency resolution, then install scripts and hooks.
 
 ## Arch frontend
 
-- Repo databases (sync dbs) and building by package name. Design
-  agreed; to be done in this order, one commit each:
-  1. Repos and `skl sync`. A repo is a local name, the trust unit, with
-     its configuration in the store (`skl repo add NAME URL`, kept in
-     `repos/<name>/config.json`): a URL template in pacman's format
-     (`…/$repo/os/$arch`, arch fixed to `x86_64`) and the remote
-     database name (`core` for `core.db`), later its keyring.
-     Frontend-specific configuration may move out of the store later.
-     `skl sync` downloads each repo's database (gzip tar, unsigned) with
-     `Workers::download` and a size limit, and keeps every version: the
-     database as a store object, plus a record
-     `repos/<repo>/syncs/<time>.json` with its hash and size, the URL,
-     the fetch time (supervisor's clock) and the server's
-     `Last-Modified` (sent by the worker, so untrusted and only for
-     information). Records of repos synced together are written only
-     after all of them downloaded and parsed. A build uses each repo's
-     latest snapshot; it fails if a repo was never synced. Conditional
-     requests (304) if cheap, else later.
+- Repo databases (sync dbs) and building by package name. Repos and
+  `skl sync` are done (see Repos in DECISIONS.md); the rest is agreed,
+  to be done in this order, one commit each:
   2. Reading databases in a `read-arch-db` worker (`src/arch/repo.rs`;
      fd 0 the database, one `DONE` with JSON; import worker's sandbox,
      a size cap per `desc`). Fields: `FILENAME`, `NAME`, `BASE`,
@@ -43,7 +28,8 @@ Next priorities: dependency resolution, then install scripts and hooks.
      `downloads/<repo>/<file name>`, as the same file name can have
      different content in different repos.
   4. Build by name. A build lists the repos it may use in priority order
-     (`--repo`); a name can be qualified (`repo/name`). Restrictions are
+     (`--repo`) and uses each one's latest snapshot, failing if a repo
+     was never synced; a name can be qualified (`repo/name`). Restrictions are
      per repo only: a single package can install any file, so limiting
      which names a repo may provide would protect nothing. Arguments
      containing `/` or ending in `.pkg.tar.zst` are paths, URLs stay
@@ -65,6 +51,8 @@ Next priorities: dependency resolution, then install scripts and hooks.
   Testing until 5: `scripts/fetch-arch-packages.sh --urls` prints the
   URLs, with dependencies resolved by name and provides, ignoring
   versions.
+- Conditional requests in `skl sync` (`If-Modified-Since`, 304): each
+  sync downloads the whole database now (`extra.db` is 8.7 MiB).
 - Manage the keyring in skl (from the `archlinux-keyring` package,
   updated like other packages and verified by the current keyring)
   instead of a path on the command line.

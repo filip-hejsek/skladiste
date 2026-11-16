@@ -15,6 +15,7 @@ use tar::EntryType;
 use crate::manifest::{Entry, EntryKind, ObjectId, Package, XattrValue, normalize_path};
 use crate::store::ObjectSink;
 
+pub mod repo;
 pub mod signature;
 
 /// Read a package archive, adding file contents to `objects`.

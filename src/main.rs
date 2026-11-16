@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+use skladiste::arch;
 use skladiste::arch::signature::{self, Keyring};
 use skladiste::http::{RootCerts, Url};
 use skladiste::install;
@@ -25,8 +26,9 @@ struct Cli {
 
     /// Arch keyring to verify package signatures with, as the path without
     /// suffix: PREFIX.gpg, PREFIX-trusted and PREFIX-revoked are read.
+    /// Needed for importing packages.
     #[arg(long, env = "SKL_KEYRING", value_name = "PREFIX")]
-    keyring: PathBuf,
+    keyring: Option<PathBuf>,
 
     /// PEM file of root certificates to check HTTPS servers against,
     /// instead of the Mozilla roots built into skl (e.g. a CA bundle such
@@ -34,8 +36,8 @@ struct Cli {
     #[arg(long, env = "SKL_CA_CERTS", value_name = "FILE")]
     ca_certs: Option<PathBuf>,
 
-    /// Number of packages to download and import at once [default: number
-    /// of CPUs].
+    /// Number of packages (or repo databases) to download and import at
+    /// once [default: number of CPUs].
     #[arg(short, long, global = true)]
     jobs: Option<NonZeroUsize>,
 
@@ -81,6 +83,38 @@ enum Command {
         #[arg(required = true)]
         packages: Vec<OsString>,
     },
+    /// Manage repos.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Download the databases of repos.
+    ///
+    /// Every version is kept; builds use the latest. Repos synced together
+    /// get their new versions only once all of them were downloaded.
+    Sync {
+        /// Repos to sync [default: all].
+        repos: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Add an Arch repo.
+    Add {
+        /// Name of the repo in skl.
+        name: String,
+        /// Server URL in the format of pacman's `Server`, e.g.
+        /// `https://geo.mirror.pkgbuild.com/$repo/os/$arch` ($arch is
+        /// x86_64).
+        server: String,
+        /// Name of the database on the server (`core` for core.db)
+        /// [default: NAME].
+        #[arg(long)]
+        db: Option<String>,
+    },
+    /// List repos with the time of their latest sync.
+    List,
 }
 
 fn main() -> ExitCode {
@@ -118,21 +152,34 @@ fn run(cli: Cli) -> Result<()> {
         workers.set_root_certs(roots);
     }
     let store = Store::open(&cli.store)?;
-    let keyring = load_keyring(&cli.keyring)?;
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
-    let ctx = Ctx {
-        workers: &workers,
-        store: &store,
-        keyring: &keyring,
+    let keyring = || -> Result<Keyring> {
+        let prefix = cli
+            .keyring
+            .as_deref()
+            .context("no keyring given (--keyring or SKL_KEYRING)")?;
+        load_keyring(prefix)
     };
     match cli.command {
         Command::Import { packages } => {
+            let keyring = keyring()?;
+            let ctx = Ctx {
+                workers: &workers,
+                store: &store,
+                keyring: &keyring,
+            };
             get_packages(&ctx, &parse_sources(&packages)?, jobs)?;
         }
         Command::Build { output, packages } => {
             if output.symlink_metadata().is_ok() {
                 bail!("{} already exists", output.display());
             }
+            let keyring = keyring()?;
+            let ctx = Ctx {
+                workers: &workers,
+                store: &store,
+                keyring: &keyring,
+            };
             let packages = get_packages(&ctx, &parse_sources(&packages)?, jobs)?;
             let r = install::build(&workers, &store, &packages, &output)?;
             eprintln!(
@@ -153,6 +200,50 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("warning: could not set {} xattrs", r.xattr_failures);
             }
         }
+        Command::Repo {
+            command: RepoCommand::Add { name, server, db },
+        } => {
+            let config = arch::repo::Config::new(&server, db.as_deref().unwrap_or(&name))?;
+            store.add_repo(&name, &config)?;
+        }
+        Command::Repo {
+            command: RepoCommand::List,
+        } => {
+            for name in store.repos()? {
+                let config: arch::repo::Config = store.repo_config(&name)?;
+                let synced = match store.latest_sync(&name)? {
+                    Some(record) => record.fetched,
+                    None => "never synced".to_owned(),
+                };
+                println!("{name}\t{}\t{}\t{synced}", config.db, config.server);
+            }
+        }
+        Command::Sync { repos } => sync(&workers, &store, repos, jobs)?,
+    }
+    Ok(())
+}
+
+/// Download the databases of `repos` (all if empty), and record the new
+/// versions once all of them were downloaded.
+fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize) -> Result<()> {
+    let repos = if repos.is_empty() {
+        store.repos()?
+    } else {
+        repos
+    };
+    if repos.is_empty() {
+        bail!("no repos (add one with `skl repo add`)");
+    }
+    let configs = repos
+        .iter()
+        .map(|name| store.repo_config(name))
+        .collect::<Result<Vec<arch::repo::Config>>>()?;
+    let records = par_map(&configs, jobs, |config| {
+        arch::repo::fetch_db(workers, store, config)
+    })?;
+    for (name, record) in repos.iter().zip(&records) {
+        store.save_sync(name, record)?;
+        eprintln!("synced {name} ({:.1} MiB)", mib(record.size));
     }
     Ok(())
 }
@@ -282,7 +373,7 @@ fn fetch(ctx: &Ctx, url: &Url) -> Result<File> {
     let size = ctx
         .workers
         .download(url, &mut w, u64::MAX)
-        .and_then(|size| Ok(w.flush().map(|()| size)?))
+        .and_then(|d| Ok(w.flush().map(|()| d.size)?))
         .with_context(|| format!("downloading {url}"))?;
     drop(w);
     verify(ctx.keyring, &sig, tmp.file()).with_context(|| format!("verifying {url}"))?;

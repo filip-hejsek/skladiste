@@ -14,7 +14,8 @@ formats can be added as frontends.
 - Imports Arch `.pkg.tar.zst` packages into the store, after checking
   each package's signature (`.sig` next to it) against the Arch keyring:
   the signing key must be certified by at least 3 of the master keys
-- Builds a new image subvolume from a list of package files
+- Builds a new image subvolume from a list of package files or URLs
+- Keeps Arch repo databases (`skl repo add`, `skl sync`), every version
 - No dependency resolution, install scripts or hooks yet
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
@@ -46,6 +47,9 @@ An image is a btrfs subvolume. Unprivileged users can remove it with `rm -rf`.
 
 - `objects/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
 - `packages/<id>.json` — imported package manifests, keyed by the archive's hash
+- `downloads/` — downloaded packages and their signatures
+- `repos/<repo>/` — a repo's configuration and a record of each version of
+  its database that was synced (the database itself is an object)
 - `tmp/` — staging area for new objects
 
 ## License

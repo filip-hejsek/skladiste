@@ -27,7 +27,8 @@ are in BUGS.md.
 - Rejected for now: the fs-verity digest as the content address. fs-verity
   is left for later, so there's no need to tie the store to it now.
 - Layout: `objects/ab/cdef…` (read-only, mode 0444), `packages/<id>.json`
-  for imported manifests, `tmp/` for objects and manifests being written.
+  for imported manifests, `repos/<repo>/` for repos (see Repos), `tmp/`
+  for objects and manifests being written.
   Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
   then linked into place unless an identical object already exists;
   linking fails if the name exists, so of concurrent adds of the same
@@ -55,6 +56,33 @@ are in BUGS.md.
   (`.MTREE`, `.BUILDINFO`, `.INSTALL`, `.CHANGELOG`) are ignored for now.
 - Owner, mode and mtime come from the tar headers; xattrs come from
   `SCHILY.xattr.*` PAX records, as written by bsdtar.
+
+## Repos
+
+- A repo is a local name and the unit of trust: a build will list the
+  repos it may use, and restrictions are per repo. Names are ASCII
+  letters, digits and `._+-`; names starting with `@` are kept for
+  pseudo-repos.
+- Configuration is in the store, `repos/<name>/config.json`, written by
+  `skl repo add NAME SERVER [--db DB]`. For Arch: a URL template in the
+  format of pacman's `Server` (`…/$repo/os/$arch`, `$arch` is always
+  `x86_64`) and the remote database name (`core` for `core.db`; default
+  the repo's name). The store doesn't interpret it; frontend-specific
+  configuration may move out of the store later.
+- `skl sync` downloads each repo's database with `Workers::download`
+  (at most 64 MiB, held in memory) and keeps every version: the database
+  as a store object, and a record `repos/<repo>/syncs/<time>.json` with
+  its hash, size, URL, the fetch time (supervisor's clock, UTC with
+  microseconds; fixed width, so the names sort by time) and the server's
+  `Last-Modified` (sent by the worker, so untrusted: at most 100 bytes,
+  control characters escaped, for information only). Records are linked
+  into place from an unnamed file, so one is never replaced or seen
+  half-written. Records of repos synced together are written only after
+  all of them were downloaded. A repo's latest record is its current
+  snapshot.
+- No conditional requests yet: syncing core and extra (8.8 MiB) took
+  0.9 s.
+- The keyring is needed only to import packages (`import`, `build`).
 
 ## Downloads
 
@@ -102,6 +130,8 @@ are in BUGS.md.
   argument (a bundle of 122 roots is 180 KB of PEM, over Linux's
   128 KiB limit per argument); an extra fd (needs new plumbing through
   bubblewrap for one input sent once).
+- The worker sends the response's `Last-Modified` header with its
+  final `DONE`.
 - Downloads are kept in the store's `downloads/` by file name (the URL's
   last path segment; Arch file names include the version), written to
   an unnamed file in `tmp/` and linked into place only after the

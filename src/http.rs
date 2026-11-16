@@ -234,6 +234,13 @@ impl RootCerts {
     }
 }
 
+/// What a response said besides its body.
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Response {
+    /// The `Last-Modified` header, as sent.
+    pub last_modified: Option<String>,
+}
+
 /// Request `url` over `stream`, an open connection to its host, using TLS
 /// for `https` with server certificates checked against `roots`, and pass
 /// the body of a `200 OK` response to `body` in pieces. Any other status
@@ -243,7 +250,7 @@ pub(crate) fn get(
     url: &Url,
     roots: &RootCerts,
     body: &mut dyn FnMut(&[u8]) -> io::Result<()>,
-) -> Result<()> {
+) -> Result<Response> {
     if !url.tls {
         return request(stream, url, body);
     }
@@ -263,7 +270,7 @@ fn request(
     mut stream: impl Read + Write,
     url: &Url,
     body: &mut dyn FnMut(&[u8]) -> io::Result<()>,
-) -> Result<()> {
+) -> Result<Response> {
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: skl/{}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
         url.path,
@@ -275,7 +282,7 @@ fn request(
         .and_then(|()| stream.flush())
         .context("sending request")?;
     let mut r = BufReader::with_capacity(BUF_SIZE, stream);
-    let framing = read_head(&mut r)?;
+    let (framing, response) = read_head(&mut r)?;
     match framing {
         Framing::Chunked => copy_chunked(&mut r, body),
         Framing::Length(len) => {
@@ -285,7 +292,8 @@ fn request(
         }
         Framing::Close => copy(&mut r, body).map(|_| ()),
     }
-    .context("reading response body")
+    .context("reading response body")?;
+    Ok(response)
 }
 
 /// How the end of the body is marked.
@@ -298,7 +306,7 @@ enum Framing {
 }
 
 /// Read the status line and headers; succeeds only for `200 OK`.
-fn read_head(r: &mut impl BufRead) -> Result<Framing> {
+fn read_head(r: &mut impl BufRead) -> Result<(Framing, Response)> {
     let mut head = Vec::new();
     loop {
         let start = head.len();
@@ -342,6 +350,9 @@ fn read_head(r: &mut impl BufRead) -> Result<Framing> {
     if let Some(enc) = header("content-encoding").find(|e| !e.eq_ignore_ascii_case("identity")) {
         bail!("unsupported content encoding {enc:?}");
     }
+    let response = Response {
+        last_modified: header("last-modified").next(),
+    };
     let te: Vec<String> = header("transfer-encoding").collect();
     if !te.is_empty() {
         ensure!(
@@ -349,7 +360,7 @@ fn read_head(r: &mut impl BufRead) -> Result<Framing> {
             "unsupported transfer encoding {:?}",
             te.join(", ")
         );
-        return Ok(Framing::Chunked);
+        return Ok((Framing::Chunked, response));
     }
     let mut length = None;
     for value in header("content-length") {
@@ -361,7 +372,7 @@ fn read_head(r: &mut impl BufRead) -> Result<Framing> {
         ensure!(length.is_none_or(|l| l == n), "conflicting content lengths");
         length = Some(n);
     }
-    Ok(length.map_or(Framing::Close, Framing::Length))
+    Ok((length.map_or(Framing::Close, Framing::Length), response))
 }
 
 /// Copy everything from `r` to `body`; returns the number of bytes.
@@ -488,6 +499,10 @@ mod tests {
 
     /// Run a plain HTTP request against a canned response.
     fn fetch(response: &[u8]) -> Result<Vec<u8>> {
+        fetch_response(response).map(|(body, _)| body)
+    }
+
+    fn fetch_response(response: &[u8]) -> Result<(Vec<u8>, Response)> {
         struct Fake<'a> {
             input: &'a [u8],
             sent: Vec<u8>,
@@ -521,7 +536,7 @@ mod tests {
             "{sent}"
         );
         assert!(sent.ends_with("\r\n\r\n"));
-        r.map(|()| out)
+        r.map(|r| (out, r))
     }
 
     fn err(response: &[u8]) -> String {
@@ -538,6 +553,18 @@ mod tests {
                 .contains("conflicting")
         );
         assert!(err(b"HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\nhello").contains("bad content"));
+    }
+
+    #[test]
+    fn last_modified() {
+        let resp = b"HTTP/1.1 200 OK\r\nLast-Modified:  Mon, 16 Nov 2026 08:00:00 GMT \r\n\r\nx";
+        let (_, r) = fetch_response(resp).unwrap();
+        assert_eq!(
+            r.last_modified.as_deref(),
+            Some("Mon, 16 Nov 2026 08:00:00 GMT")
+        );
+        let (_, r) = fetch_response(b"HTTP/1.1 200 OK\r\n\r\nx").unwrap();
+        assert_eq!(r, Response::default());
     }
 
     #[test]
