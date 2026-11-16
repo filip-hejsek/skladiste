@@ -76,8 +76,9 @@ are in BUGS.md.
   `x86_64`) and the remote database name (`core` for `core.db`; default
   the repo's name). The store doesn't interpret it; frontend-specific
   configuration may move out of the store later.
-- `skl sync` downloads each repo's database with `Workers::download`
-  (at most 64 MiB, held in memory) and keeps every version: the database
+- `skl sync` downloads each repo's database with the download stage
+  (see Downloads; at most 64 MiB, held in memory) and keeps every
+  version: the database
   as a store object, and a record `repos/<repo>/syncs/<time>.json` with
   its hash, size, URL, the fetch time (supervisor's clock, UTC with
   microseconds; fixed width, so the names sort by time) and the server's
@@ -149,8 +150,9 @@ are in BUGS.md.
   archive for its id. `.PKGINFO`'s name and version must match the
   entry's, also for packages imported before. The architecture must be
   `x86_64` or `any`.
-- Downloads start largest first by `%CSIZE%`, before archives already
-  there (largest first).
+- Downloads go largest first by `%CSIZE%`. The import jobs take
+  finished downloads first, then the archives already there (largest
+  first).
 
 ## Dependency resolution
 
@@ -200,23 +202,103 @@ are in BUGS.md.
   worker therefore has the import worker's sandbox: no network
   namespace of the host, no files, no DNS, and it can reach no other
   host, including services on localhost. It streams only the response
-  body; the supervisor writes the file, so no other process holds an fd
-  to it. Rejected: a worker in the host's network namespace doing its
-  own DNS (needs `/etc/resolv.conf` and more system calls, and can
+  bodies; the supervisor writes the files, so no other process holds an
+  fd to them. Rejected: a worker in the host's network namespace doing
+  its own DNS (needs `/etc/resolv.conf` and more system calls, and can
   connect anywhere; Landlock can restrict only TCP ports); an HTTP
   client library such as ureq (it opens its own connections; its
   transport API is unstable).
-- One connection and one worker per file, `Connection: close`, no
-  keep-alive or pipelining: the worker's protocol stays one-way. Two
-  workers per package (signature, then archive), started within the
-  import jobs (`-j`), so downloads overlap with imports.
+- One worker per origin (scheme, host, port), with one connection that
+  is kept open between requests: the files of an origin are downloaded
+  one after another, in the order given. Parallelism comes from
+  downloading from several origins at once (at most `-j`), not from
+  several connections to one host, which is gentler on mirrors.
+  Requests aren't pipelined: the worker waits for each response before
+  the next request (a round trip with the server, not between
+  processes), as some servers and CDNs handle pipelining badly.
+- Isolation per origin is enough: the worker parses only TLS and
+  response heads, never bodies, so only the server (or a network
+  attacker before the certificate is checked) can attack it, and a
+  compromised worker can do only what that server could already do.
+  Repos sharing a host (e.g. a CDN) control only bodies, so they share
+  its worker. Different origins don't share a worker, which matters
+  because databases are unsigned.
+- The worker handles a queue of files (`src/worker/download.rs`; the
+  design is in WORKERS.md). The supervisor sends items (a path, and
+  what continues a file), keeping at most two unanswered, so the worker
+  has the next file at hand without a round trip and sending never
+  blocks. The worker answers each in order with a start (the length,
+  a validator, `Last-Modified` and `ETag`), the body in chunks and an
+  end. One supervisor thread per worker reads this, writes the file
+  and counts the bytes itself; a length the worker reports only serves
+  to fail early when it is over the limit.
+- A worker lives as long as its connection. When the server closes it,
+  or after a response that ends it (`Connection: close`, HTTP/1.0, a
+  body that runs until the close, or a status other than `200` and
+  `206`, whose body the worker doesn't read), the worker exits and the
+  supervisor connects again and starts a new one for the files left. A
+  worker start takes about 4 ms (bwrap, exec, Landlock and seccomp:
+  4.0-4.6 ms for a 2-byte download from localhost, 3.7-3.9 ms for a
+  `read-arch-db` worker that fails at once), little next to the TCP
+  and TLS handshakes of the new connection. Rejected: passing a new
+  socket to the running worker (`SCM_RIGHTS`), which would save only
+  that.
+- A file whose connection broke is continued where it stopped, if its
+  response had a strong validator: an `ETag` that isn't weak, or, only
+  if there is no `ETag`, a `Last-Modified` at least a second older than
+  `Date`. The request has `Range` and `If-Range`; a `206` must start at
+  the offset and end the file at the length the first response gave.
+  Otherwise the file is fetched again from the beginning. The offset is
+  the supervisor's count of what it received, and the validator is
+  opaque to it (at most 256 printable ASCII characters). If the server
+  has another version by then (it answers `200`), packages from a
+  repo's snapshot fail, as the database says by SHA-256 what the file
+  is; databases and URLs given to `skl import` are downloaded again
+  from the beginning. Details and reasons are in WORKERS.md.
+- Limits: a connection that neither completes a file nor gets the file
+  under way further than any connection before is a strike. The next
+  connection to that origin then waits 1 s, doubled with each strike,
+  and at 3 strikes (per origin and run, not reset by progress in
+  between) the download fails. A read or write that times out counts
+  as a connection that ended. A connection that can't be opened fails
+  the download at once, as before. Other limits are open (WORKERS.md).
+- The download stage runs next to the import jobs (`fetch_and_run` in
+  `src/main.rs`) instead of within them. The thread of an origin checks
+  each finished file (size and SHA-256 from the database, then the
+  signature), keeps it in the store's downloads and hands the open file
+  to the jobs, which take finished downloads before archives that were
+  there already. At most 64 files wait for a job (each is an open fd);
+  then the thread blocks and its worker stalls, which is the wanted
+  back-pressure. A download's file is created when its body starts, so
+  queued downloads hold no fd. `skl sync` uses the same stage: the
+  jobs read the databases.
+- After a failure anywhere, no new download or import starts. A
+  download whose body has started is finished and kept; then its worker
+  is killed.
+- Rejected: one connection and one worker per file (`Connection:
+  close`), started within the import jobs, as it was before. Measured
+  with 42 packages (39.5 MiB) from `geo.mirror.pkgbuild.com` into an
+  empty store (`build --fetch`, 4 CPUs), on a fast link where a new
+  connection takes about 0.2 s to the first response byte: 21-25 s with
+  `-j1`, 5.8-7.1 s `-j4`, 3.8-4.2 s `-j8`; with a worker per origin
+  4.6-5.3 s whatever `-j`. `curl` took 4.1 s for the same files over
+  one connection and 19.1 s with a connection per file; verifying,
+  importing and installing them without downloading takes 1.35 s. So
+  on such a link several connections to the host would still gain a
+  little (the `-j8` above); that is left to downloading from several
+  mirrors. On a link of about 2.4 MB/s a worker per file was
+  bandwidth-bound (43 packages, 43 MiB: 32.7 s with `-j1`, 19.8 s
+  `-j4`, 18.0 s `-j8` and `-j16`; sequential `curl` 28.6 s), where one
+  connection isn't measured. Syncing core and extra took 1.3-1.4 s
+  either way.
 - HTTP/1.1 is written by hand on `httparse` for the response head:
   `Content-Length`, chunked or until close; `Accept-Encoding: identity`,
-  other encodings are rejected. Only `200` is accepted; redirects are
-  reported with their target and not followed (the supervisor would
-  have to connect again). Reads and writes time out after 30 s
-  (`SO_RCVTIMEO`/`SO_SNDTIMEO` set by the supervisor, also in effect in
-  the worker). The worker's memory limit is 256 MiB.
+  other encodings are rejected. Only `200` is accepted, and `206` for
+  a continuation; redirects are reported with their target and not
+  followed. A `408` counts as a connection that ended (some servers
+  send it when they close an idle connection). Reads and writes time
+  out after 30 s (`SO_RCVTIMEO`/`SO_SNDTIMEO` set by the supervisor,
+  also in effect in the worker). The worker's memory limit is 256 MiB.
 - TLS: rustls with the `ring` provider (C and assembly from BoringSSL)
   and the Mozilla roots compiled in (`webpki-roots`), so the worker
   needs no files. A memory-safe crypto backend matters less here than
@@ -230,13 +312,13 @@ are in BUGS.md.
   `/etc/ssl/certs/ca-certificates.crt` (or a TLS-intercepting proxy's).
   The supervisor reads and checks them at startup (each must be a usable
   trust anchor; non-certificate PEM sections are ignored) and sends them
-  in DER to each `https` download worker on its socket before the worker
-  sends anything, so the worker still needs no files. Rejected: an
+  in DER to each `https` download worker on its socket, before the
+  first item, so the worker still needs no files. Rejected: an
   argument (a bundle of 122 roots is 180 KB of PEM, over Linux's
   128 KiB limit per argument); an extra fd (needs new plumbing through
   bubblewrap for one input sent once).
 - The worker sends the response's `Last-Modified` and `ETag` headers
-  with its final `DONE`.
+  with the start of each file.
 - Downloads are kept in the store's `downloads/<repo>/` by file name
   (the URL's last path segment; Arch file names include the version; the
   same name can have different content in different repos), written to
@@ -248,11 +330,6 @@ are in BUGS.md.
   downloaded again.
 - Worker error messages are shown with control characters escaped, as
   they can contain text from servers or archives.
-- Measured with 43 packages (43 MiB) from `geo.mirror.pkgbuild.com`
-  over a link of about 2.4 MB/s, into an empty store: 32.7 s with
-  `-j1`, 19.8 s `-j4`, 18.0 s `-j8` and `-j16` (bandwidth-bound);
-  sequential `curl` took 28.6 s for the same files. glibc alone (10.9
-  MB) took 4.75 s including verifying and importing, curl 4.36 s.
 
 ## Package signatures
 
@@ -471,14 +548,16 @@ are in BUGS.md.
   read-write in its mount namespace.
 - Workers end with one result or error message; an error the worker
   sent is reported in preference to its exit status, and death by
-  `SIGSYS` is reported as a blocked system call.
+  `SIGSYS` is reported as a blocked system call. The download worker
+  is the exception: it handles a queue of files (see Downloads).
 - Packages are imported in parallel, `-j` at once (default: the number
   of CPUs), each by its own worker (a compromised worker could otherwise
   change another package's manifest) and one supervisor thread per
-  worker (`jobs::par_map`). The largest archives start first, since the
-  largest package bounds the total time. After a failure no new imports
-  start; running ones finish and are saved. The same archive given twice
-  is imported twice; not worth coordinating between threads. Importing
+  worker (`jobs::par_map_iter`). The largest archives start first, since
+  the largest package bounds the total time. After a failure no new
+  imports start; running ones finish and are saved. The same archive
+  given twice is imported twice; not worth coordinating between
+  threads. Importing
   the 17 packages below (now 109 MiB of archives): 0.81 s with `-j1`,
   0.51 s with `-j2`, 0.50 s with `-j4`, 0.50 s with `-j8` on 8 CPUs,
   where perl alone takes 0.27 s. Sys time grows with more threads

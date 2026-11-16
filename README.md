@@ -17,6 +17,8 @@ formats can be added as frontends.
 - Builds a new image subvolume from a list of package names, looked up
   in repos and among package files imported before (`skl import`)
 - Keeps Arch repo databases (`skl repo add`, `skl sync`), every version
+- Downloads over one connection per server, kept open between files, and
+  continues a file after a broken connection where the server allows
 - Resolves dependencies pacman-style (versioned dependencies, provides,
   conflicts)
 - No install scripts or hooks yet

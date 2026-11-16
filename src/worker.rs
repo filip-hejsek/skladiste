@@ -21,15 +21,14 @@
 //!   refers to objects by their position in the stream ([`ObjectId`]), and
 //!   the supervisor fills in the hashes, so a compromised parser can't put
 //!   content under the wrong hash. No filesystem access, no ioctls.
-//! - `download`: fd 0 is a TCP connection the supervisor opened to the
-//!   URL's host (passed as an argument), fd 1 a socket. With a second
-//!   argument `custom-roots`, the supervisor first sends the root
-//!   certificates on fd 1 (a `CERT` frame each, in DER, then an empty
-//!   `DONE`); otherwise the worker uses the built-in ones. The worker sends
-//!   the request (over TLS for `https`) and streams the response body in
-//!   `CHUNK`s, ending with `DONE` with the response's headers of interest
-//!   ([`http::Response`]). It can't reach any other host, and the
-//!   supervisor writes the file. No filesystem access, no ioctls.
+//! - `download`: fd 0 is a TCP connection the supervisor opened to an
+//!   origin, fd 1 a socket. Unlike the others, this worker handles a queue:
+//!   the supervisor sends it the files to request over that connection, one
+//!   after another, and it streams each response body back, speaking TLS
+//!   for `https`. It can't reach any other host, and the supervisor writes
+//!   the files. No filesystem access, no ioctls. See the `download` module
+//!   here for the protocol, and [`Workers::download_all`] for the stage
+//!   that runs one such worker per origin.
 //! - `read-arch-db`: fd 0 is an Arch repo database, fd 1 a pipe. The
 //!   worker reads it with [`arch::repo::read_db`] and sends the entries in
 //!   `DONE`; the supervisor validates them. No filesystem access, no
@@ -58,11 +57,15 @@ use landlock::AccessFs;
 
 use crate::arch;
 use crate::bwrap::{self, Mount, Namespaces};
-use crate::http::{self, RootCerts, Url};
+use crate::http::RootCerts;
 use crate::install::{self, Report};
 use crate::manifest::{Content, Entry, ObjectId, Package};
 use crate::sandbox::{self, Layers, Policy};
 use crate::store::{ObjectSink, Store};
+
+mod download;
+
+pub use download::{Downloaded, Request, Sink};
 
 /// First argument that makes `skl` run as a worker. `main` must check for
 /// it before doing anything else.
@@ -72,15 +75,12 @@ const BEGIN: u8 = 1;
 const CHUNK: u8 = 2;
 const DONE: u8 = 3;
 const ERROR: u8 = 4;
-const CERT: u8 = 5;
 
 /// Chunk size the worker sends; the supervisor accepts up to [`MAX_CHUNK`].
 const CHUNK_SIZE: usize = 64 << 10;
 const MAX_CHUNK: usize = 1 << 20;
 const MAX_DONE: usize = 256 << 20;
 const MAX_ERROR: usize = 64 << 10;
-/// Largest root certificate the download worker accepts.
-const MAX_CERT: usize = 64 << 10;
 /// Buffer size for writing and reading messages. Chunks at least this
 /// large bypass the buffer.
 const BUF_SIZE: usize = CHUNK_SIZE;
@@ -92,11 +92,9 @@ const IMPORT_MAX_MEMORY: u64 = 1 << 30;
 /// Address space limit of the install worker, which holds the whole plan
 /// (about 40 MiB were enough for an image of 17,000 entries).
 const INSTALL_MAX_MEMORY: u64 = 4 << 30;
-/// Address space limit of the download worker (TLS and a few buffers).
-const DOWNLOAD_MAX_MEMORY: u64 = 256 << 20;
-
-/// Timeout for connecting, and for each read and write once connected.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay before a download's next connection after the first one that got
+/// nothing; see [`Workers::set_retry_delay`].
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Capabilities the install worker keeps when skl runs as root: to set
 /// owners, then modes (including setuid and setgid bits), times and xattrs
@@ -109,23 +107,6 @@ const INSTALL_CAPS: &[&str] = &[
     "CAP_FSETID",
     "CAP_SETFCAP",
 ];
-
-/// Longest `Last-Modified` value kept from a download worker.
-const MAX_LAST_MODIFIED: usize = 100;
-/// Longest `ETag` value kept from a download worker.
-const MAX_ETAG: usize = 256;
-
-/// A finished download.
-#[derive(Debug)]
-pub struct Downloaded {
-    /// Size of the body, counted by the supervisor.
-    pub size: u64,
-    /// The server's `Last-Modified` header, if it sent one, with control
-    /// characters escaped. Untrusted: for information only.
-    pub last_modified: Option<String>,
-    /// The server's `ETag` header, likewise.
-    pub etag: Option<String>,
-}
 
 /// Statistics about an import, counted by the supervisor.
 #[derive(Debug, Default)]
@@ -140,6 +121,7 @@ pub struct Workers {
     exe: PathBuf,
     layers: Layers,
     roots: RootCerts,
+    retry_delay: Duration,
 }
 
 impl Workers {
@@ -150,6 +132,7 @@ impl Workers {
             exe: exe.into(),
             layers: Layers::default(),
             roots: RootCerts::default(),
+            retry_delay: RETRY_DELAY,
         }
     }
 
@@ -157,6 +140,13 @@ impl Workers {
     /// built-in ones by default).
     pub fn set_root_certs(&mut self, roots: RootCerts) {
         self.roots = roots;
+    }
+
+    /// How long a download waits before it connects to a server again
+    /// after a connection that got nothing (one second by default). The
+    /// wait doubles with each such connection to the same server.
+    pub fn set_retry_delay(&mut self, delay: Duration) {
+        self.retry_delay = delay;
     }
 
     /// Run workers without new namespaces (and without bubblewrap).
@@ -206,40 +196,6 @@ impl Workers {
             arch::repo::validate(&entries)?;
             Ok(entries)
         });
-        worker.finish(result)
-    }
-
-    /// Download `url` in a worker and write the body to `dest`, failing
-    /// if it is longer than `max_size`. The connection is opened here and
-    /// handed to the worker, which has no network access of its own.
-    /// Redirects are not followed.
-    pub fn download(&self, url: &Url, dest: &mut dyn Write, max_size: u64) -> Result<Downloaded> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-        let conn = http::connect(url, DOWNLOAD_TIMEOUT)?;
-        let (ours, theirs) = socketpair(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC,
-            None,
-        )
-        .context("creating socket")?;
-        let custom = self.roots.custom().filter(|_| url.tls);
-        let url = url.to_string();
-        let mut args = vec![&*url];
-        if custom.is_some() {
-            args.push("custom-roots");
-        }
-        let worker = self.spawn("download", conn.into(), theirs, &[], None, &args)?;
-        let ours = File::from(ours);
-        // The worker reads all certificates before it writes anything but
-        // an error, which then explains a failure to send them.
-        let sent = custom.map_or(Ok(()), |certs| send_certs(&ours, certs));
-        let mut conn = receiver(ours.into())?;
-        let result = receive_download(&mut conn, dest, max_size).and_then(|size| {
-            sent?;
-            Ok(size)
-        });
-        drop(conn);
         worker.finish(result)
     }
 
@@ -507,81 +463,12 @@ fn send_json(fd: OwnedFd, value: &(impl serde::Serialize + ?Sized)) -> Result<()
     w.flush().context("sending to worker")
 }
 
-/// Send root certificates to a download worker.
-fn send_certs(conn: &File, certs: &[rustls::pki_types::CertificateDer]) -> Result<()> {
-    let mut w = BufWriter::new(conn);
-    for cert in certs {
-        anyhow::ensure!(
-            cert.len() <= MAX_CERT,
-            "root certificate of {} bytes is too large (limit {MAX_CERT})",
-            cert.len()
-        );
-        write_frame(&mut w, CERT, cert)?;
-    }
-    write_frame(&mut w, DONE, &[])?;
-    w.flush().context("sending root certificates to worker")
-}
-
-/// Worker side of [`send_certs`].
-fn receive_certs(conn: &File) -> Result<RootCerts> {
-    let mut r = BufReader::new(conn);
-    let mut certs = Vec::new();
-    loop {
-        match read_header(&mut r).context("reading root certificates")? {
-            (CERT, len) => certs.push(read_payload(&mut r, len, MAX_CERT)?.into()),
-            (DONE, 0) => return RootCerts::from_der(certs),
-            (tag, len) => bail!("unexpected message {tag} ({len} bytes) from supervisor"),
-        }
-    }
-}
-
 /// The supervisor's end of a socket that only the worker writes to (any
 /// input for the worker was sent before).
 fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
     // Nothing more is sent to the worker.
     rustix::net::shutdown(&ours, rustix::net::Shutdown::Write).context("shutting down socket")?;
     Ok(BufReader::with_capacity(BUF_SIZE, File::from(ours)))
-}
-
-/// Supervisor side of `download`.
-fn receive_download(
-    conn: &mut BufReader<File>,
-    dest: &mut dyn Write,
-    max_size: u64,
-) -> Result<Downloaded> {
-    let mut total: u64 = 0;
-    let mut buf = Vec::new();
-    loop {
-        let (tag, len) = read_header(&mut *conn).context("reading from worker")?;
-        match tag {
-            CHUNK if len <= MAX_CHUNK => {
-                total += len as u64;
-                if total > max_size {
-                    bail!("file is larger than {max_size} bytes");
-                }
-                buf.resize(len, 0);
-                conn.read_exact(&mut buf).context("reading from worker")?;
-                dest.write_all(&buf).context("writing download")?;
-            }
-            DONE => {
-                let json = read_payload(&mut *conn, len, MAX_ERROR)?;
-                let response: http::Response =
-                    serde_json::from_slice(&json).context("parsing result from worker")?;
-                let keep = |value: Option<String>, max| {
-                    value
-                        .filter(|v| v.len() <= max)
-                        .map(|v| sanitize(&v, false))
-                };
-                return Ok(Downloaded {
-                    size: total,
-                    last_modified: keep(response.last_modified, MAX_LAST_MODIFIED),
-                    etag: keep(response.etag, MAX_ETAG),
-                });
-            }
-            ERROR => return Err(read_error(conn, len)),
-            _ => bail!("unexpected message {tag} ({len} bytes) from worker"),
-        }
-    }
 }
 
 /// Supervisor side of `import-arch`.
@@ -742,9 +629,9 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
         .collect::<Result<Vec<OwnedFd>>>()?;
     match (kind.as_str(), &extra[..]) {
         ("import-arch", []) if dirs.is_empty() => import_worker(layers, out),
-        ("download", [url]) if dirs.is_empty() => download_worker(layers, url, false, out),
-        ("download", [url, roots]) if dirs.is_empty() && roots == "custom-roots" => {
-            download_worker(layers, url, true, out)
+        ("download", [origin]) if dirs.is_empty() => download::worker(layers, origin, false, out),
+        ("download", [origin, roots]) if dirs.is_empty() && roots == "custom-roots" => {
+            download::worker(layers, origin, true, out)
         }
         ("read-arch-db", []) if dirs.is_empty() => read_db_worker(layers),
         ("install", []) => {
@@ -846,32 +733,6 @@ impl ObjectSink for RemoteSink<'_> {
         self.next += 1;
         Ok(id)
     }
-}
-
-/// `custom_roots`: read the root certificates from fd 1 first.
-fn download_worker(
-    layers: Layers,
-    url: &str,
-    custom_roots: bool,
-    out: &mut BufWriter<File>,
-) -> Result<Vec<u8>> {
-    let url = Url::parse(url)?;
-    // SAFETY: the supervisor passes the connection as fd 0.
-    let conn = unsafe { File::from_raw_fd(0) };
-    let policy = Policy {
-        max_memory: Some(DOWNLOAD_MAX_MEMORY),
-        ..Policy::default()
-    };
-    sandbox::confine(layers, &policy)?;
-    let roots = if custom_roots {
-        receive_certs(out.get_ref())?
-    } else {
-        RootCerts::default()
-    };
-    let response = http::get(conn, &url, &roots, &mut |data| {
-        write_frame(out, CHUNK, data)
-    })?;
-    Ok(serde_json::to_vec(&response)?)
 }
 
 /// System calls the installer makes besides [`sandbox`]'s basic set.

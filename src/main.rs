@@ -1,9 +1,13 @@
+use std::cmp::Reverse;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, sync_channel};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -14,12 +18,12 @@ use skladiste::arch::repo::{DbEntry, Snapshot};
 use skladiste::arch::signature::{self, Keyring};
 use skladiste::http::{RootCerts, Url};
 use skladiste::install;
-use skladiste::jobs::{default_jobs, par_map};
+use skladiste::jobs::{both, default_jobs, par_map, par_map_iter};
 use skladiste::manifest::Package;
 use skladiste::repo::LOCAL;
 use skladiste::resolve::{self, Candidate, Target};
-use skladiste::store::{Store, hash_reader};
-use skladiste::worker::{self, Workers};
+use skladiste::store::{Store, TmpFile, hash_reader};
+use skladiste::worker::{self, Downloaded, Request, Sink, Workers};
 
 #[derive(Parser)]
 #[command(name = "skl", about = "Content-addressed package manager on btrfs")]
@@ -40,8 +44,8 @@ struct Cli {
     #[arg(long, env = "SKL_CA_CERTS", value_name = "FILE")]
     ca_certs: Option<PathBuf>,
 
-    /// Number of packages (or repo databases) to download and import at
-    /// once [default: number of CPUs].
+    /// Number of packages to import (or repo databases to read) at once,
+    /// and of servers to download from at once [default: number of CPUs].
     #[arg(short, long, global = true)]
     jobs: Option<NonZeroUsize>,
 
@@ -210,7 +214,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let sources = load_sources(&workers, &store, &repos, jobs)?;
             let chosen = choose(&sources, &targets)?;
-            let packages = if chosen.iter().any(|c| matches!(c, Chosen::Repo { .. })) {
+            let packages = if chosen.iter().any(|c| matches!(c, Chosen::Repo(_))) {
                 let keyring = keyring()?;
                 let ctx = Ctx {
                     workers: &workers,
@@ -223,7 +227,7 @@ fn run(cli: Cli) -> Result<()> {
                     .iter()
                     .filter_map(|c| match c {
                         Chosen::Local(pkg) => Some((*pkg).clone()),
-                        Chosen::Repo { .. } => None,
+                        Chosen::Repo(_) => None,
                     })
                     .collect()
             };
@@ -284,12 +288,28 @@ fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize
         .iter()
         .map(|name| store.repo_config(name))
         .collect::<Result<Vec<arch::repo::Config>>>()?;
-    let synced = par_map(&configs, jobs, |config| {
-        let record = arch::repo::fetch_db(workers, store, config)?;
-        let entries = arch::repo::load_db(workers, store, &record)?;
-        Ok((record, entries.len()))
-    })?;
-    for (name, (record, packages)) in repos.iter().zip(&synced) {
+    let requests = configs
+        .iter()
+        .map(arch::repo::db_request)
+        .collect::<Result<Vec<_>>>()?;
+    let urls: Vec<Url> = requests.iter().map(|r| r.url.clone()).collect();
+    let mut synced = fetch_and_run(
+        workers,
+        jobs,
+        Vec::new(),
+        requests,
+        |i, data, downloaded| {
+            let record = arch::repo::db_record(store, &urls[i], &data, downloaded)?;
+            Ok(Some((i, record)))
+        },
+        |(i, record)| {
+            let entries = arch::repo::load_db(workers, store, &record)?;
+            Ok((i, record, entries.len()))
+        },
+    )?;
+    synced.sort_by_key(|&(i, ..)| i);
+    for (i, record, packages) in &synced {
+        let name = &repos[*i];
         store.save_sync(name, record)?;
         eprintln!(
             "synced {name}: {packages} packages ({:.1} MiB)",
@@ -297,6 +317,75 @@ fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize
         );
     }
     Ok(())
+}
+
+/// Downloads that wait for a job, at most; the download stage waits when
+/// there are more. Each can keep a file open.
+const MAX_WAITING: usize = 64;
+
+/// Download `requests`, and meanwhile run `job` on up to `jobs` threads:
+/// on what `downloaded` makes of each finished download (if anything),
+/// and on the items in `ready`, in their order. Returns the results of
+/// `job` in no particular order.
+///
+/// Downloads go one after another per server, in the order of `requests`
+/// (see [`Workers::download_all`]). `downloaded` is called with the index
+/// of the request, on the thread that downloads from its server, so the
+/// next download from there waits for it. Finished downloads are taken
+/// before items of `ready`, so that the download stage isn't held up.
+///
+/// Once something fails, no new downloads or jobs start; those under way
+/// finish.
+fn fetch_and_run<S: Sink, T: Send, R: Send>(
+    workers: &Workers,
+    jobs: NonZeroUsize,
+    ready: Vec<T>,
+    requests: Vec<Request<S>>,
+    downloaded: impl Fn(usize, S, Downloaded) -> Result<Option<T>> + Sync,
+    job: impl Fn(T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let failed = &AtomicBool::new(false);
+    let downloaded = &downloaded;
+    let (tx, rx) = sync_channel(MAX_WAITING);
+    let feed = Feed {
+        downloads: rx,
+        ready: ready.into_iter(),
+    };
+    let (downloads, results) = std::thread::scope(|s| {
+        // Owns the sender, so the jobs end when the downloads have.
+        let stage = s.spawn(move || {
+            workers.download_all(requests, jobs, failed, |i, sink, download| {
+                if let Some(item) = downloaded(i, sink, download)? {
+                    // Fails only once the jobs have stopped for a failure.
+                    let _ = tx.send(item);
+                }
+                Ok(())
+            })
+        });
+        let results = par_map_iter(feed, jobs, failed, job);
+        let downloads = stage
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+        (downloads, results)
+    });
+    Ok(both(downloads, results)?.1)
+}
+
+/// What the jobs of [`fetch_and_run`] work on.
+struct Feed<T> {
+    downloads: Receiver<T>,
+    ready: std::vec::IntoIter<T>,
+}
+
+impl<T> Iterator for Feed<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if let Ok(item) = self.downloads.try_recv() {
+            return Some(item);
+        }
+        self.ready.next().or_else(|| self.downloads.recv().ok())
+    }
 }
 
 struct Ctx<'a> {
@@ -309,6 +398,16 @@ struct Ctx<'a> {
 enum LocalSource {
     Path(PathBuf),
     Url(Url),
+}
+
+/// A package for one of `skl import`'s jobs.
+enum LocalArchive<'a> {
+    /// A file, with its signature in the `.sig` file next to it.
+    Path(&'a Path),
+    /// A download that an earlier run kept in the store.
+    Kept(&'a Url),
+    /// A download of this run, verified and kept in the store.
+    Fetched(&'a Url, File),
 }
 
 /// What a repo offers to a build.
@@ -324,12 +423,27 @@ enum RepoSource {
 enum Chosen<'a> {
     /// An imported package.
     Local(&'a Package),
-    /// A package from a repo's snapshot, downloaded from `url`.
-    Repo {
-        repo: &'a str,
-        entry: &'a DbEntry,
-        url: Url,
-    },
+    Repo(RepoPackage<'a>),
+}
+
+/// A package from a repo's snapshot, downloaded from `url`.
+struct RepoPackage<'a> {
+    repo: &'a str,
+    entry: &'a DbEntry,
+    url: Url,
+}
+
+impl RepoPackage<'_> {
+    /// The package's signature, from the repo's database.
+    fn signature(&self) -> Result<&[u8]> {
+        let Self { repo, entry, .. } = self;
+        entry.pgpsig.as_deref().with_context(|| {
+            format!(
+                "{repo}/{} has no signature in the repo's database",
+                entry.filename
+            )
+        })
+    }
 }
 
 /// Read a package argument of `build`: `NAME`, or `REPO/NAME` where `REPO`
@@ -442,43 +556,28 @@ fn choose<'a>(sources: &'a [RepoSource], targets: &[Target]) -> Result<Vec<Chose
                     entry.arch,
                     arch::repo::ARCH
                 );
-                Ok(Chosen::Repo {
+                Ok(Chosen::Repo(RepoPackage {
                     repo: &snapshot.repo,
                     url: snapshot.config.package_url(&entry.filename)?,
                     entry,
-                })
+                }))
             }
         })
         .collect()
 }
 
-/// Call `f` on each item, `jobs` at once, starting with the largest
-/// `key`; the results are in the order of `items`.
-fn par_map_largest_first<T: Sync, K: Ord + Copy + Sync, R: Send>(
-    items: &[T],
-    jobs: NonZeroUsize,
-    key: impl Fn(&T) -> K,
-    f: impl Fn(&T) -> Result<R> + Sync,
-) -> Result<Vec<R>> {
-    let mut order: Vec<(usize, K)> = items.iter().map(key).enumerate().collect();
-    order.sort_by_key(|&(_, key)| std::cmp::Reverse(key));
-    let mut results = par_map(&order, jobs, |&(i, _)| Ok((i, f(&items[i])?)))?;
-    results.sort_by_key(|&(i, _)| i);
-    Ok(results.into_iter().map(|(_, r)| r).collect())
-}
-
 /// The size of a download in the store, if it is there.
-fn downloaded(store: &Store, repo: &str, name: &str) -> Option<u64> {
-    match store.open_download(repo, name) {
-        Ok(Some(f)) => Some(f.metadata().map_or(0, |m| m.len())),
-        _ => None,
-    }
+fn kept_size(store: &Store, repo: &str, name: &str) -> Result<Option<u64>> {
+    let file = store.open_download(repo, name)?;
+    Ok(file.map(|f| f.metadata().map_or(0, |m| m.len())))
 }
 
 /// Import the package files `args` (paths or URLs) into `@local`, `jobs`
 /// at once, each by its own worker (so a compromised worker can't change
-/// another package's manifest). Downloads start first, then the largest
-/// archives, as they take longest.
+/// another package's manifest). URLs that the store has no download for
+/// are downloaded meanwhile, the signature (`.sig`) before the archive.
+/// The largest archives that are there are imported first, as they take
+/// longest.
 fn import_local(ctx: &Ctx, args: &[OsString], jobs: NonZeroUsize) -> Result<()> {
     let sources = args
         .iter()
@@ -487,75 +586,198 @@ fn import_local(ctx: &Ctx, args: &[OsString], jobs: NonZeroUsize) -> Result<()> 
             _ => Ok(LocalSource::Path(arg.into())),
         })
         .collect::<Result<Vec<_>>>()?;
-    let key = |source: &LocalSource| match source {
-        LocalSource::Path(p) => (false, p.metadata().map_or(0, |m| m.len())),
-        LocalSource::Url(url) => {
-            downloaded(ctx.store, LOCAL, url.file_name()).map_or((true, 0), |n| (false, n))
-        }
-    };
-    par_map_largest_first(&sources, jobs, key, |source| {
-        let (file, what) = match source {
+    let mut ready = Vec::new();
+    let mut missing = Vec::new();
+    for source in &sources {
+        match source {
             LocalSource::Path(path) => {
-                let mut file =
-                    File::open(path).with_context(|| format!("opening {}", path.display()))?;
-                let sig_path = with_suffix(path, ".sig");
-                let sig = File::open(&sig_path)
-                    .with_context(|| format!("opening {}", sig_path.display()))?;
-                let sig = read_signature(sig)
-                    .with_context(|| format!("reading {}", sig_path.display()))?;
-                verify(ctx.keyring, &sig, &mut file)
-                    .with_context(|| format!("verifying {}", path.display()))?;
-                (file, path.display().to_string())
+                let size = path.metadata().map_or(0, |m| m.len());
+                ready.push((size, LocalArchive::Path(path)));
             }
-            LocalSource::Url(url) => (fetch(ctx, url)?, url.to_string()),
-        };
-        let (pkg, new) = import_archive(ctx, file, &what, LOCAL, None)?;
-        if !new {
-            eprintln!("{} {} was already imported", pkg.name, pkg.version);
+            LocalSource::Url(url) => {
+                let name = url.file_name();
+                // Only verified downloads are kept, the archive first, so
+                // an archive whose signature is there was complete.
+                let sig = kept_size(ctx.store, LOCAL, &format!("{name}.sig"))?;
+                match (sig, kept_size(ctx.store, LOCAL, name)?) {
+                    (Some(_), Some(size)) => ready.push((size, LocalArchive::Kept(url))),
+                    _ => missing.push(url),
+                }
+            }
         }
-        Ok(())
-    })?;
+    }
+    ready.sort_by_key(|&(size, _)| Reverse(size));
+    let ready = ready.into_iter().map(|(_, archive)| archive).collect();
+    // Nothing says what a URL should have, so if a file changes on the
+    // server while it is downloaded, the new one is taken.
+    let requests = missing
+        .iter()
+        .flat_map(|url| {
+            [
+                Request {
+                    url: url.with_suffix(".sig"),
+                    max_size: signature::MAX_SIGNATURE_SIZE,
+                    restart_if_changed: true,
+                    sink: LocalSink::Signature(Vec::new()),
+                },
+                Request {
+                    url: (*url).clone(),
+                    max_size: u64::MAX,
+                    restart_if_changed: true,
+                    sink: LocalSink::Archive(ArchiveSink::new(ctx.store)),
+                },
+            ]
+        })
+        .collect();
+    // The signature and the archive of each package, until both are there.
+    type Parts<'a> = (Option<Vec<u8>>, Option<ArchiveSink<'a>>);
+    let parts: Vec<Mutex<Parts>> = missing.iter().map(|_| Mutex::default()).collect();
+    fetch_and_run(
+        ctx.workers,
+        jobs,
+        ready,
+        requests,
+        |n, sink, _| {
+            let url = missing[n / 2];
+            let mut parts = parts[n / 2].lock().unwrap();
+            match sink {
+                LocalSink::Signature(sig) => parts.0 = Some(sig),
+                LocalSink::Archive(archive) => parts.1 = Some(archive),
+            }
+            let (sig, archive) = match (parts.0.take(), parts.1.take()) {
+                (Some(sig), Some(archive)) => (sig, archive),
+                // The package's other file isn't there yet.
+                rest => {
+                    *parts = rest;
+                    return Ok(None);
+                }
+            };
+            let file = keep_download(ctx, LOCAL, url.file_name(), url, &sig, archive, None)?;
+            Ok(Some(LocalArchive::Fetched(url, file)))
+        },
+        |archive| {
+            let (file, what) = match archive {
+                LocalArchive::Path(path) => {
+                    let mut file =
+                        File::open(path).with_context(|| format!("opening {}", path.display()))?;
+                    let sig_path = with_suffix(path, ".sig");
+                    let sig = File::open(&sig_path)
+                        .with_context(|| format!("opening {}", sig_path.display()))?;
+                    let sig = read_signature(sig)
+                        .with_context(|| format!("reading {}", sig_path.display()))?;
+                    verify(ctx.keyring, &sig, &mut file)
+                        .with_context(|| format!("verifying {}", path.display()))?;
+                    (file, path.display().to_string())
+                }
+                LocalArchive::Kept(url) => (open_kept(ctx, url)?, url.to_string()),
+                LocalArchive::Fetched(url, file) => (file, url.to_string()),
+            };
+            let (pkg, new) = import_archive(ctx, file, &what, LOCAL, None)?;
+            if !new {
+                eprintln!("{} {} was already imported", pkg.name, pkg.version);
+            }
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
 /// The manifest of each of `chosen`, in the same order. Packages from
-/// repo snapshots are verified, and downloaded (if `fetch`) and imported
-/// where needed (see [`get_repo_package`]), `jobs` at once, each import by
-/// its own worker (so a compromised worker can't change another package's
-/// manifest). Downloads start first, largest first by the size in the
-/// repo's database, then the largest archives, as they take longest.
+/// repo snapshots are verified, and imported where needed, `jobs` at once,
+/// each import by its own worker (so a compromised worker can't change
+/// another package's manifest). Those that the store has no download for
+/// are downloaded meanwhile, if `fetch` allows, largest first by the size
+/// in the repo's database. Of the archives that are there, the largest
+/// are imported first, as they take longest.
 fn get_packages(
     ctx: &Ctx,
     chosen: &[Chosen],
     fetch: bool,
     jobs: NonZeroUsize,
 ) -> Result<Vec<Package>> {
-    let key = |chosen: &Chosen| match chosen {
-        Chosen::Local(_) => (false, 0),
-        Chosen::Repo { repo, entry, .. } => {
-            downloaded(ctx.store, repo, &entry.filename).map_or((true, entry.csize), |n| (false, n))
+    let mut packages: Vec<Option<Package>> = Vec::new();
+    let mut kept = Vec::new();
+    let mut missing = Vec::new();
+    for (i, chosen) in chosen.iter().enumerate() {
+        let pkg = match chosen {
+            Chosen::Local(pkg) => {
+                packages.push(Some((*pkg).clone()));
+                continue;
+            }
+            Chosen::Repo(pkg) => pkg,
+        };
+        packages.push(None);
+        pkg.signature()?;
+        let (repo, name) = (pkg.repo, &pkg.entry.filename);
+        match kept_size(ctx.store, repo, name)? {
+            Some(size) => kept.push((size, i, pkg)),
+            None => {
+                ensure!(
+                    fetch,
+                    "{repo}/{name} is not in the store (use --fetch to download packages)"
+                );
+                missing.push((i, pkg));
+            }
         }
-    };
-    par_map_largest_first(chosen, jobs, key, |chosen| match chosen {
-        Chosen::Local(pkg) => Ok((*pkg).clone()),
-        Chosen::Repo { repo, entry, url } => get_repo_package(ctx, repo, entry, url, fetch),
-    })
+    }
+    kept.sort_by_key(|&(size, ..)| Reverse(size));
+    missing.sort_by_key(|&(_, pkg)| Reverse(pkg.entry.csize));
+    let ready = kept.into_iter().map(|(_, i, pkg)| (i, pkg, None)).collect();
+    // The database says what each file is, so another version of one
+    // can't be right.
+    let requests = missing
+        .iter()
+        .map(|&(_, pkg)| Request {
+            url: pkg.url.clone(),
+            max_size: pkg.entry.csize,
+            restart_if_changed: false,
+            sink: ArchiveSink::new(ctx.store),
+        })
+        .collect();
+    let imported = fetch_and_run(
+        ctx.workers,
+        jobs,
+        ready,
+        requests,
+        |n, archive, _| {
+            let (i, pkg) = missing[n];
+            let (name, sig) = (&pkg.entry.filename, pkg.signature()?);
+            let file = keep_download(ctx, pkg.repo, name, &pkg.url, sig, archive, Some(pkg.entry))?;
+            Ok(Some((i, pkg, Some(file))))
+        },
+        |(i, pkg, fetched)| Ok((i, get_repo_package(ctx, pkg, fetched)?)),
+    )?;
+    for (i, pkg) in imported {
+        packages[i] = Some(pkg);
+    }
+    packages
+        .into_iter()
+        .map(|pkg| pkg.context("a package was not imported"))
+        .collect()
 }
 
-/// Load the manifest of a package from a repo's snapshot, importing the
-/// archive if needed, and downloading it first if it isn't in the store
-/// and `fetch` allows. The signature is checked first, every time, also
-/// for earlier downloads. The archive must have the SHA-256, and the
-/// package the name and version, that the repo's database gives.
-fn get_repo_package(
-    ctx: &Ctx,
-    repo: &str,
-    entry: &DbEntry,
-    url: &Url,
-    fetch: bool,
-) -> Result<Package> {
-    let file = fetch_from_repo(ctx, repo, entry, url, fetch)?;
-    let what = format!("{repo}/{}", entry.filename);
+/// Load the manifest of a package from a repo's snapshot, importing its
+/// archive if needed: `fetched`, which was downloaded and verified just
+/// now, or else the download in the store, whose signature is checked
+/// first, every time. The archive must have the SHA-256, and the package
+/// the name and version, that the repo's database gives.
+fn get_repo_package(ctx: &Ctx, pkg: &RepoPackage, fetched: Option<File>) -> Result<Package> {
+    let RepoPackage { repo, entry, .. } = pkg;
+    let name = &entry.filename;
+    let file = match fetched {
+        Some(file) => file,
+        None => {
+            let mut file = ctx
+                .store
+                .open_download(repo, name)?
+                .with_context(|| format!("{repo}/{name} is no longer in the store"))?;
+            verify(ctx.keyring, pkg.signature()?, &mut file).with_context(|| {
+                format!("verifying {name}, downloaded earlier (delete downloads/{repo}/{name} in the store to download it again)")
+            })?;
+            file
+        }
+    };
+    let what = format!("{repo}/{name}");
     let (pkg, _) = import_archive(ctx, file, &what, repo, Some(entry))?;
     check_identity(&pkg, entry).with_context(|| format!("checking {what}"))?;
     Ok(pkg)
@@ -657,106 +879,115 @@ impl<R: Read> Read for Tee<'_, R> {
     }
 }
 
-/// Writes through, hashing with SHA-256.
-struct Sha256Writer<W> {
-    inner: W,
+/// Writes a download to an unnamed file in the store, hashing it with
+/// SHA-256. The file is created when the download begins, so downloads
+/// that wait for their turn keep no file open.
+struct ArchiveSink<'a> {
+    store: &'a Store,
+    tmp: Option<TmpFile<'a>>,
     sha256: Sha256,
+    size: u64,
 }
 
-impl<W: Write> Write for Sha256Writer<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.sha256.update(&buf[..n]);
-        Ok(n)
+impl<'a> ArchiveSink<'a> {
+    fn new(store: &'a Store) -> Self {
+        ArchiveSink {
+            store,
+            tmp: None,
+            sha256: Sha256::new(),
+            size: 0,
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+    fn tmp(&mut self) -> Result<&mut TmpFile<'a>> {
+        if self.tmp.is_none() {
+            self.tmp = Some(self.store.tmp_file()?);
+        }
+        Ok(self.tmp.as_mut().unwrap())
     }
 }
 
-/// The verified archive from `url`: downloaded earlier, or now. Only
-/// verified downloads are kept, the archive first, so an archive whose
-/// signature is there was complete.
-fn fetch(ctx: &Ctx, url: &Url) -> Result<File> {
+impl Sink for ArchiveSink<'_> {
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.tmp()?.file().write_all(data)?;
+        self.sha256.update(data);
+        self.size += data.len() as u64;
+        Ok(())
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        *self = ArchiveSink::new(self.store);
+        Ok(())
+    }
+}
+
+/// Where a download for `skl import` goes.
+enum LocalSink<'a> {
+    /// Kept in memory.
+    Signature(Vec<u8>),
+    Archive(ArchiveSink<'a>),
+}
+
+impl Sink for LocalSink<'_> {
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            LocalSink::Signature(sig) => Sink::write(sig, data),
+            LocalSink::Archive(archive) => archive.write(data),
+        }
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        match self {
+            LocalSink::Signature(sig) => sig.restart(),
+            LocalSink::Archive(archive) => archive.restart(),
+        }
+    }
+}
+
+/// The archive from `url` that an earlier run kept in the store, verified
+/// again with the signature kept next to it.
+fn open_kept(ctx: &Ctx, url: &Url) -> Result<File> {
     let name = url.file_name();
     let sig_name = format!("{name}.sig");
-    let store = ctx.store;
-    if let Some(sig) = store.open_download(LOCAL, &sig_name)?
-        && let Some(mut file) = store.open_download(LOCAL, name)?
-    {
-        let sig = read_signature(sig).with_context(|| format!("reading downloaded {sig_name}"))?;
-        verify(ctx.keyring, &sig, &mut file).with_context(|| {
-            format!("verifying {name}, downloaded earlier (delete downloads/{LOCAL}/{name} in the store to download it again)")
-        })?;
-        return Ok(file);
-    }
-    let sig_url = url.with_suffix(".sig");
-    let mut sig = Vec::new();
-    ctx.workers
-        .download(&sig_url, &mut sig, signature::MAX_SIGNATURE_SIZE)
-        .with_context(|| format!("downloading {sig_url}"))?;
-    download_package(ctx, LOCAL, name, url, &sig, None)
+    let open = |name: &str| {
+        let file = ctx.store.open_download(LOCAL, name)?;
+        file.with_context(|| format!("{LOCAL}/{name} is no longer in the store"))
+    };
+    let (sig, mut file) = (open(&sig_name)?, open(name)?);
+    let sig = read_signature(sig).with_context(|| format!("reading downloaded {sig_name}"))?;
+    verify(ctx.keyring, &sig, &mut file).with_context(|| {
+        format!("verifying {name}, downloaded earlier (delete downloads/{LOCAL}/{name} in the store to download it again)")
+    })?;
+    Ok(file)
 }
 
-/// The verified archive of a package in a repo: downloaded earlier, or
-/// now if `fetch` allows. The signature, size and SHA-256 come from the
-/// repo's database.
-fn fetch_from_repo(ctx: &Ctx, repo: &str, entry: &DbEntry, url: &Url, fetch: bool) -> Result<File> {
-    let name = &entry.filename;
-    let sig = entry
-        .pgpsig
-        .as_deref()
-        .with_context(|| format!("{repo}/{name} has no signature in the repo's database"))?;
-    if let Some(mut file) = ctx.store.open_download(repo, name)? {
-        verify(ctx.keyring, sig, &mut file).with_context(|| {
-            format!("verifying {name}, downloaded earlier (delete downloads/{repo}/{name} in the store to download it again)")
-        })?;
-        return Ok(file);
-    }
-    ensure!(
-        fetch,
-        "{repo}/{name} is not in the store (use --fetch to download packages)"
-    );
-    download_package(ctx, repo, name, url, sig, Some(entry))
-}
-
-/// Download `url` and keep it as `name` in `repo`'s downloads if `sig`
-/// verifies, with the signature next to it (`.sig`), written after the
-/// archive. With `entry`, the size and SHA-256 must be those it gives.
-fn download_package(
+/// Keep the finished download `archive` of `url` as `name` in `repo`'s
+/// downloads if `sig` verifies it, with the signature next to it (`.sig`),
+/// written after the archive: only verified downloads are kept. With
+/// `entry`, the size and SHA-256 must be those it gives.
+fn keep_download(
     ctx: &Ctx,
     repo: &str,
     name: &str,
     url: &Url,
     sig: &[u8],
+    mut archive: ArchiveSink,
     entry: Option<&DbEntry>,
 ) -> Result<File> {
-    let store = ctx.store;
-    let mut tmp = store.tmp_file()?;
-    let max_size = entry.map_or(u64::MAX, |e| e.csize);
-    let (size, sha256) = {
-        let mut w = Sha256Writer {
-            inner: BufWriter::with_capacity(64 << 10, tmp.file()),
-            sha256: Sha256::new(),
-        };
-        let size = ctx
-            .workers
-            .download(url, &mut w, max_size)
-            .and_then(|d| Ok(w.flush().map(|()| d.size)?))
-            .with_context(|| format!("downloading {url}"))?;
-        (size, w.sha256)
-    };
+    let size = archive.size;
     if let Some(entry) = entry {
         ensure!(
             size == entry.csize,
             "{url} has {size} bytes, but the repo's database says {}",
             entry.csize
         );
-        check_sha256(sha256, entry).with_context(|| format!("downloading {url}"))?;
+        check_sha256(archive.sha256.clone(), entry)
+            .with_context(|| format!("downloading {url}"))?;
     }
-    verify(ctx.keyring, sig, tmp.file()).with_context(|| format!("verifying {url}"))?;
-    let file = tmp.save_download(repo, name)?;
+    // An empty download has no file yet.
+    verify(ctx.keyring, sig, archive.tmp()?.file()).with_context(|| format!("verifying {url}"))?;
+    let store = ctx.store;
+    let file = archive.tmp.take().unwrap().save_download(repo, name)?;
     let sig_name = format!("{name}.sig");
     let mut sig_tmp = store.tmp_file()?;
     sig_tmp
@@ -867,7 +1098,7 @@ mod tests {
                 .iter()
                 .map(|c| match c {
                     Chosen::Local(pkg) => format!("{} {}", pkg.name, pkg.version),
-                    Chosen::Repo { .. } => unreachable!(),
+                    Chosen::Repo(_) => unreachable!(),
                 })
                 .collect()
         };
@@ -876,20 +1107,47 @@ mod tests {
     }
 
     #[test]
-    fn largest_first() {
-        let order = std::sync::Mutex::new(Vec::new());
-        let items = [2, 9, 4];
-        let out = par_map_largest_first(
-            &items,
-            NonZeroUsize::MIN,
-            |&n| n,
-            |&n| {
-                order.lock().unwrap().push(n);
-                Ok(n * 10)
-            },
-        )
-        .unwrap();
-        assert_eq!(out, [20, 90, 40]);
-        assert_eq!(*order.lock().unwrap(), [9, 4, 2]);
+    fn downloads_come_before_ready_items() {
+        let (tx, rx) = sync_channel(4);
+        let mut feed = Feed {
+            downloads: rx,
+            ready: vec![1, 2].into_iter(),
+        };
+        tx.send(10).unwrap();
+        assert_eq!(feed.next(), Some(10));
+        assert_eq!(feed.next(), Some(1));
+        tx.send(11).unwrap();
+        assert_eq!(feed.next(), Some(11));
+        assert_eq!(feed.next(), Some(2));
+        // Nothing is ready: waits for the downloads, until they end.
+        tx.send(12).unwrap();
+        drop(tx);
+        assert_eq!(feed.next(), Some(12));
+        assert_eq!(feed.next(), None);
+    }
+
+    #[test]
+    fn jobs_without_downloads() {
+        // No worker is started without requests.
+        let workers = Workers::new("/nonexistent");
+        let jobs = NonZeroUsize::new(3).unwrap();
+        let run = |fail: Option<u32>| {
+            let requests: Vec<Request<Vec<u8>>> = Vec::new();
+            fetch_and_run(
+                &workers,
+                jobs,
+                (0..20).collect(),
+                requests,
+                |_, _, _| Ok(None),
+                |n: u32| {
+                    ensure!(Some(n) != fail, "job {n} failed");
+                    Ok(n * 2)
+                },
+            )
+        };
+        let mut results = run(None).unwrap();
+        results.sort();
+        assert_eq!(results, (0..20).map(|n| n * 2).collect::<Vec<_>>());
+        assert_eq!(run(Some(7)).unwrap_err().to_string(), "job 7 failed");
     }
 }

@@ -23,7 +23,7 @@ use crate::manifest::Package;
 use crate::repo::{self, SyncRecord};
 use crate::resolve::{Candidate, Dep, Op, Provide};
 use crate::store::Store;
-use crate::worker::Workers;
+use crate::worker::{Downloaded, Request, Workers};
 
 /// Largest `desc` file accepted (most are under 2 KiB).
 const MAX_DESC: u64 = 1 << 20;
@@ -218,24 +218,44 @@ fn check_dep_version(version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Download the database of the repo with `config` into the store, and
-/// return a record of it to save once it has been checked.
-pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<SyncRecord> {
-    let url = config.db_url()?;
-    let mut data = Vec::new();
-    let download = workers
-        .download(&url, &mut data, MAX_DB_SIZE)
-        .with_context(|| format!("downloading {url}"))?;
+/// A request for the database of the repo with `config`, to hold in
+/// memory. Databases aren't signed, so if one changes on the server while
+/// it is downloaded, the new one is as good.
+pub fn db_request(config: &Config) -> Result<Request<Vec<u8>>> {
+    Ok(Request {
+        url: config.db_url()?,
+        max_size: MAX_DB_SIZE,
+        restart_if_changed: true,
+        sink: Vec::new(),
+    })
+}
+
+/// Add the database `data`, downloaded from `url` just now, to the store,
+/// and return a record of it to save once it has been checked.
+pub fn db_record(
+    store: &Store,
+    url: &Url,
+    mut data: &[u8],
+    downloaded: Downloaded,
+) -> Result<SyncRecord> {
     let fetched = repo::timestamp(SystemTime::now());
-    let added = store.add_object(&mut &data[..])?;
+    let added = store.add_object(&mut data)?;
     Ok(SyncRecord {
         hash: added.hash,
         size: added.size,
         url: url.to_string(),
         fetched,
-        last_modified: download.last_modified,
-        etag: download.etag,
+        last_modified: downloaded.last_modified,
+        etag: downloaded.etag,
     })
+}
+
+/// Download the database of the repo with `config` into the store, and
+/// return a record of it to save once it has been checked.
+pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<SyncRecord> {
+    let request = db_request(config)?;
+    let (data, downloaded) = workers.download(&request.url, request.sink, request.max_size)?;
+    db_record(store, &request.url, &data, downloaded)
 }
 
 /// Load the database that `record` refers to from the store, and read it

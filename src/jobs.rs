@@ -1,7 +1,8 @@
 //! Running independent jobs on a few threads, e.g. one import worker each.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 
@@ -21,13 +22,40 @@ pub fn par_map<T: Sync, R: Send>(
     jobs: NonZeroUsize,
     f: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
+    par_map_iter(items.iter(), jobs, &AtomicBool::new(false), f)
+}
+
+/// Like [`par_map`], for items that come from an iterator, which may
+/// block: e.g. what an earlier stage hands over through a channel, as it
+/// gets ready. The results are in the order the items came in.
+///
+/// `failed` is shared by the stages of one task. It is set when a call
+/// fails, and once it is set, here or by another stage, no new calls
+/// start. Then fewer results than items are returned, without an error
+/// if no call failed here.
+pub fn par_map_iter<T: Send, R: Send>(
+    items: impl Iterator<Item = T> + Send,
+    jobs: NonZeroUsize,
+    failed: &AtomicBool,
+    f: impl Fn(T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let threads = match items.size_hint() {
+        (_, Some(n)) => jobs.get().min(n),
+        _ => jobs.get(),
+    };
+    let items = Mutex::new(items.enumerate());
     let worker = || {
         let mut done = Vec::new();
         while !failed.load(Ordering::Relaxed) {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(item) = items.get(i) else { break };
+            // May block with the lock held; the other idle threads would
+            // wait for the same item.
+            let Some((i, item)) = items.lock().unwrap().next() else {
+                break;
+            };
+            // Something may have failed while this thread waited.
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
             let result = f(item);
             if result.is_err() {
                 failed.store(true, Ordering::Relaxed);
@@ -36,23 +64,18 @@ pub fn par_map<T: Sync, R: Send>(
         }
         done
     };
-    let threads = jobs.get().min(items.len());
-    let done: Vec<(usize, Result<R>)> = std::thread::scope(|s| {
+    let mut done: Vec<(usize, Result<R>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads).map(|_| s.spawn(worker)).collect();
         handles
             .into_iter()
             .flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
             .collect()
     });
+    done.sort_by_key(|&(i, _)| i);
 
-    let mut slots: Vec<Option<Result<R>>> = items.iter().map(|_| None).collect();
-    for (i, result) in done {
-        slots[i] = Some(result);
-    }
-    let mut results = Vec::with_capacity(items.len());
+    let mut results = Vec::with_capacity(done.len());
     let mut error = None;
-    // Items not started after a failure are `None`.
-    for result in slots.into_iter().flatten() {
+    for (_, result) in done {
         match result {
             Ok(r) => results.push(r),
             Err(e) if error.is_none() => error = Some(e),
@@ -65,11 +88,25 @@ pub fn par_map<T: Sync, R: Send>(
     }
 }
 
+/// The results of two stages of one task that ran at once. If both
+/// failed, the first one's error is returned and the second one's is
+/// printed to stderr, as [`par_map`] does with its items.
+pub fn both<A, B>(first: Result<A>, second: Result<B>) -> Result<(A, B)> {
+    match (first, second) {
+        (Ok(a), Ok(b)) => Ok((a, b)),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+        (Err(e), Err(other)) => {
+            eprintln!("Error: {other:?}");
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     fn jobs(n: usize) -> NonZeroUsize {
@@ -140,5 +177,60 @@ mod tests {
     fn empty() {
         let out = par_map(&[] as &[()], jobs(4), |_| Ok(())).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn items_from_a_channel() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let failed = AtomicBool::new(false);
+        let out = std::thread::scope(|s| {
+            s.spawn(move || {
+                for i in 0..20u64 {
+                    std::thread::sleep(Duration::from_millis(1));
+                    tx.send(i).unwrap();
+                }
+            });
+            par_map_iter(rx.into_iter(), jobs(3), &failed, |i| {
+                // Later items finish first.
+                std::thread::sleep(Duration::from_millis(20 - i));
+                Ok(i * 2)
+            })
+        })
+        .unwrap();
+        assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+        assert!(!failed.into_inner());
+    }
+
+    #[test]
+    fn stops_when_another_stage_failed() {
+        let failed = AtomicBool::new(false);
+        let out = par_map_iter(0..100, jobs(1), &failed, |i| {
+            if i == 2 {
+                failed.store(true, Ordering::Relaxed);
+            }
+            Ok(i)
+        })
+        .unwrap();
+        assert_eq!(out, [0, 1, 2]);
+
+        // A failure here is seen by the other stages.
+        let failed = AtomicBool::new(false);
+        let err = par_map_iter(0..100, jobs(1), &failed, |i| {
+            anyhow::ensure!(i != 2, "item {i} failed");
+            Ok(i)
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "item 2 failed");
+        assert!(failed.into_inner());
+    }
+
+    #[test]
+    fn both_stages() {
+        let ok = |n: u32| -> Result<u32> { Ok(n) };
+        let err = |msg: &str| -> Result<u32> { Err(anyhow::anyhow!("{msg}")) };
+        assert_eq!(both(ok(1), ok(2)).unwrap(), (1, 2));
+        assert_eq!(both(err("a"), ok(2)).unwrap_err().to_string(), "a");
+        assert_eq!(both(ok(1), err("b")).unwrap_err().to_string(), "b");
+        assert_eq!(both(err("a"), err("b")).unwrap_err().to_string(), "a");
     }
 }
