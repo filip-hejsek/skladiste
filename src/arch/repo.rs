@@ -9,7 +9,7 @@
 //! is given; `skl` runs it in a sandboxed worker and checks the result
 //! with [`validate`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::time::SystemTime;
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::arch::signature::MAX_SIGNATURE_SIZE;
 use crate::http::Url;
 use crate::repo::{self, SyncRecord};
+use crate::resolve::{Candidate, Dep, Op, Provide};
 use crate::store::Store;
 use crate::worker::Workers;
 
@@ -82,7 +83,6 @@ pub struct Snapshot {
     pub config: Config,
     pub record: SyncRecord,
     pub entries: Vec<DbEntry>,
-    by_name: HashMap<String, usize>,
 }
 
 impl Snapshot {
@@ -93,24 +93,98 @@ impl Snapshot {
             .latest_sync(repo)?
             .with_context(|| format!("repo {repo} was never synced (run `skl sync {repo}`)"))?;
         let entries = load_db(workers, store, &record)?;
-        let by_name = entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.name.clone(), i))
-            .collect();
         Ok(Snapshot {
             repo: repo.to_owned(),
             config,
             record,
             entries,
-            by_name,
         })
     }
 
-    /// The package called `name`.
-    pub fn get(&self, name: &str) -> Option<&DbEntry> {
-        self.by_name.get(name).map(|&i| &self.entries[i])
+    /// The entries for dependency resolution, in the same order.
+    pub fn candidates(&self) -> Result<Vec<Candidate>> {
+        self.entries
+            .iter()
+            .map(|e| e.candidate())
+            .collect::<Result<_>>()
+            .with_context(|| format!("in repo {}", self.repo))
     }
+}
+
+impl DbEntry {
+    /// This package for dependency resolution.
+    pub fn candidate(&self) -> Result<Candidate> {
+        let deps = |list: &[String]| list.iter().map(|d| parse_dep(d)).collect::<Result<_>>();
+        Ok::<_, anyhow::Error>(Candidate {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            depends: deps(&self.depends)?,
+            provides: self
+                .provides
+                .iter()
+                .map(|p| parse_provide(p))
+                .collect::<Result<_>>()?,
+            conflicts: deps(&self.conflicts)?,
+        })
+        .with_context(|| format!("package {}", self.name))
+    }
+}
+
+/// Parse a dependency or conflict: `NAME`, or `NAME` followed by `<`,
+/// `<=`, `=`, `>=` or `>` and a version.
+pub fn parse_dep(s: &str) -> Result<Dep> {
+    let Some(at) = s.find(['<', '>', '=']) else {
+        check_name(s)?;
+        return Ok(Dep {
+            name: s.to_owned(),
+            version: None,
+        });
+    };
+    let (name, rest) = s.split_at(at);
+    let (op, version) = [
+        ("<=", Op::Le),
+        (">=", Op::Ge),
+        ("<", Op::Lt),
+        (">", Op::Gt),
+        ("=", Op::Eq),
+    ]
+    .into_iter()
+    .find_map(|(text, op)| Some((op, rest.strip_prefix(text)?)))
+    .with_context(|| format!("bad dependency {s:?}"))?;
+    check_name(name)?;
+    check_dep_version(version).with_context(|| format!("bad dependency {s:?}"))?;
+    Ok(Dep {
+        name: name.to_owned(),
+        version: Some((op, version.to_owned())),
+    })
+}
+
+/// Parse a provide: `NAME` or `NAME=VERSION`.
+pub fn parse_provide(s: &str) -> Result<Provide> {
+    let dep = parse_dep(s)?;
+    match dep.version {
+        None => Ok(Provide {
+            name: dep.name,
+            version: None,
+        }),
+        Some((Op::Eq, version)) => Ok(Provide {
+            name: dep.name,
+            version: Some(version),
+        }),
+        Some(_) => bail!("bad provide {s:?} (only = is allowed)"),
+    }
+}
+
+/// A version in a dependency, where the release and epoch are optional.
+fn check_dep_version(version: &str) -> Result<()> {
+    ensure!(
+        !version.is_empty()
+            && version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+~:-".contains(&b)),
+        "bad version {version:?}"
+    );
+    Ok(())
 }
 
 /// Download the database of the repo with `config` into the store, and
@@ -482,6 +556,40 @@ mod tests {
         let dup = format!("{GLIBC}%NAME%\nx\n");
         assert!(err(&make_db(&[("glibc-2.44-1", &dup)])).contains("duplicate field"));
         assert!(err(&make_db(&[("glibc-2.44-1", "junk\n")])).contains("%KEY%"));
+    }
+
+    #[test]
+    fn dependencies() {
+        let dep = |s| parse_dep(s).unwrap().to_string();
+        for s in [
+            "glibc",
+            "glibc>=2.40",
+            "a<1",
+            "a<=1:2-3",
+            "a>1",
+            "libfoo.so=1-64",
+        ] {
+            assert_eq!(dep(s), s);
+        }
+        assert_eq!(
+            parse_dep("a>=1").unwrap(),
+            Dep {
+                name: "a".into(),
+                version: Some((Op::Ge, "1".into()))
+            }
+        );
+        for bad in ["", ">=1", "a>=", "a=>1", "a==1", "a b", "a>=1 2"] {
+            assert!(parse_dep(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_provide("libfoo.so=1-64").unwrap(),
+            Provide {
+                name: "libfoo.so".into(),
+                version: Some("1-64".into())
+            }
+        );
+        assert_eq!(parse_provide("sh").unwrap().version, None);
+        assert!(parse_provide("sh>=1").is_err());
     }
 
     #[test]

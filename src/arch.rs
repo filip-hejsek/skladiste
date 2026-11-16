@@ -17,6 +17,7 @@ use crate::store::ObjectSink;
 
 pub mod repo;
 pub mod signature;
+pub mod version;
 
 /// Read a package archive, adding file contents to `objects`.
 pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package<ObjectId>> {

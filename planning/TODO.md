@@ -3,25 +3,18 @@
 Plans and open questions. Decisions already made are in DECISIONS.md;
 known bugs are in BUGS.md.
 
-Next priorities: dependency resolution, then install scripts and hooks.
+Next priorities: install scripts and hooks.
 
 ## Arch frontend
 
-- Repo databases (sync dbs) and building by package name: done up to
-  building by name (see Repos in DECISIONS.md); still to do:
-  - Dependency resolution against the snapshots, with Arch version
-    comparison (`vercmp`) supplied by the frontend rather than the
-    core: versioned dependencies and soname provides are checked across
-    everything going into the image, so incompatible versions (also
-    from snapshots of different times) are reported. This trusts the
-    unsigned databases more, for usability; checking again against
-    `.PKGINFO` (see Mirror trust) limits that. Image metadata records
-    the snapshot used per repo, for upgrades and the check against
-    older versions.
-
-  Testing until then: `scripts/fetch-arch-packages.sh --urls` prints the
-  URLs, with dependencies resolved by name and provides, ignoring
-  versions.
+- Dependencies of packages given as paths or URLs aren't resolved,
+  and they don't satisfy dependencies of packages given by name (their
+  metadata is known only after import). Resolve after importing them,
+  from `.PKGINFO`.
+- The resolver doesn't search: like pacman, it takes the first package
+  that fits each dependency and reports a conflict rather than trying
+  another choice.
+- `REPLACES` is read but not used; it matters for upgrades.
 - Conditional requests in `skl sync` (`If-Modified-Since`, 304): each
   sync downloads the whole database now (`extra.db` is 8.7 MiB).
 - Manage the keyring in skl (from the `archlinux-keyring` package,
@@ -99,8 +92,10 @@ Next priorities: dependency resolution, then install scripts and hooks.
 ## Images
 
 - Open question: where to record what an image contains (needed for
-  upgrade and verify). Inside the image (e.g. `/var/lib/skl`), or
-  alongside it outside the image. Once package code has run in an image,
+  upgrade and verify), including the snapshot used per repo (for
+  upgrades, and to refuse versions older than those already used).
+  Inside the image (e.g. `/var/lib/skl`), or alongside it outside the
+  image. Once package code has run in an image,
   its contents are untrusted, so state kept inside it can't be trusted
   either.
 - Open question: ownership in unprivileged builds. Alternatives: map a

@@ -17,7 +17,9 @@ formats can be added as frontends.
 - Builds a new image subvolume from a list of packages: names looked up
   in repos, files or URLs
 - Keeps Arch repo databases (`skl repo add`, `skl sync`), every version
-- No dependency resolution, install scripts or hooks yet
+- Resolves dependencies of packages given by name, pacman-style
+  (versioned dependencies, provides, conflicts)
+- No install scripts or hooks yet
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
 - Archives and repo databases are parsed and images filled by worker
@@ -33,11 +35,16 @@ The store and images must be on the same btrfs filesystem.
 ```sh
 export SKL_STORE=/path/on/btrfs/store
 export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
-# Downloads the packages and their dependencies; prints their paths.
-pkgs=$(scripts/fetch-arch-packages.sh pkgs filesystem bash coreutils)
-skl build -o image $pkgs
+mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+skl repo add core "$mirror"
+skl repo add extra "$mirror"
+skl sync
+skl build --repo core --repo extra -o image filesystem bash coreutils
 unshare -r chroot image /usr/bin/bash
 ```
+
+Package files and URLs can be given instead of names (with their
+signatures as `.sig` next to them); their dependencies are not resolved.
 
 HTTPS servers are checked against the Mozilla root certificates built
 into skl; `--ca-certs FILE` (`SKL_CA_CERTS`) uses the certificates in a

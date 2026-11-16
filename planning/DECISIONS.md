@@ -134,6 +134,44 @@ are in BUGS.md.
 - Downloads start largest first by `%CSIZE%`, before archives already
   there (largest first).
 
+## Dependency resolution
+
+- Packages given by name are resolved with their dependencies against
+  the latest snapshots of the `--repo` repos (`src/resolve.rs`). The
+  resolver is format-independent: the frontend turns database entries
+  into candidates (name, version, depends, provides, conflicts; Arch's
+  `NAME`, `NAME<=V` etc. parsed in `src/arch/repo.rs`) and supplies the
+  version comparison (`src/arch/version.rs`, pacman's `vercmp`: epoch,
+  then version with rpm's segment rules, then the release only if both
+  have one). It gives the results of pacman's `alpm_pkg_vercmp`
+  (compiled from `lib/libalpm/version.c`) on 300,000 random pairs of
+  versions; the unit test has all cases of pacman's own test.
+- As in pacman, there's no search: each dependency not yet satisfied by
+  a chosen package takes the first package with that name whose version
+  fits, in repo priority order, else the first package (in priority and
+  database order) that provides it. Names given on the command line can
+  also be provided. A provide satisfies a versioned dependency only if
+  it has a version. A qualified name (`REPO/NAME`) is resolved in that
+  repo only; its dependencies in all of them.
+- Everything going into the image is checked as a whole, so incompatible
+  versions (also from snapshots of different times) are reported rather
+  than installed: every versioned dependency, including soname provides
+  (`libcrypto.so=4-64`), is satisfied; two packages with the same name
+  are an error (e.g. a dependency needs a newer version than another
+  repo's package already chosen); no package conflicts with another
+  (a package's conflicts with itself, as with a package that provides
+  and conflicts with the same name, don't count).
+- This trusts the unsigned databases more, for usability: their
+  dependencies decide what is installed. Checking again against
+  `.PKGINFO` is planned (see Mirror trust in TODO.md).
+- Measured: `filesystem bash coreutils` resolve to 42 packages (the
+  version-blind script picked 43, with `openssl-3` for a dependency on
+  `libcrypto.so=4-64`); `plasma-meta kde-applications-meta texlive-meta
+  gnome-shell` resolve to 1,265 packages in 14 ms (67 ms when checking
+  satisfied dependencies by scanning the chosen packages, before they
+  were indexed by name and provides). Reading the databases dominates
+  (about 400 ms for core and extra).
+
 ## Downloads
 
 - Packages can be given as `http` or `https` URLs instead of files; the

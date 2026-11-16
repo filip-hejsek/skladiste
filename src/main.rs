@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -18,6 +17,7 @@ use skladiste::install;
 use skladiste::jobs::{default_jobs, par_map};
 use skladiste::manifest::Package;
 use skladiste::repo::LOCAL;
+use skladiste::resolve::{self, Candidate, Target};
 use skladiste::store::{Store, hash_reader};
 use skladiste::worker::{self, Workers};
 
@@ -69,8 +69,9 @@ enum Command {
     /// Import Arch packages into the store.
     ///
     /// Packages are names, files or http(s) URLs. A name is looked up in
-    /// the repos given with `--repo`, or in one of them as `REPO/NAME`;
-    /// the package's signature, size and SHA-256 come from the repo's
+    /// the repos given with `--repo`, or in one of them as `REPO/NAME`, and
+    /// its dependencies are added (not those of files and URLs); the
+    /// package's signature, size and SHA-256 come from the repo's
     /// database. Other arguments containing `/` or ending in
     /// `.pkg.tar.zst` are files (write `./REPO/NAME` for a file that would
     /// read as a name). The signature of a file or URL is read from the
@@ -86,7 +87,7 @@ enum Command {
     },
     /// Create a new image subvolume containing the given packages.
     ///
-    /// No dependency resolution is done and install scripts are not run.
+    /// Install scripts are not run.
     Build {
         /// Path of the new subvolume (must not exist).
         #[arg(short, long)]
@@ -115,8 +116,8 @@ enum Command {
 
 #[derive(clap::Args)]
 struct Repos {
-    /// Repo to take packages given by name from (repeatable; the first
-    /// repo that has a name wins). Each repo's latest sync is used.
+    /// Repo to take packages given by name and their dependencies from
+    /// (repeatable, in priority order). Each repo's latest sync is used.
     #[arg(long = "repo", value_name = "REPO")]
     repos: Vec<String>,
 }
@@ -348,9 +349,10 @@ fn parse_arg(arg: &OsString, repos: &[String], configured: &[String]) -> Result<
     Ok(Arg::Source(Source::Path(arg.into())))
 }
 
-/// Where to get each package in `args` from. Names are looked up in the
-/// latest snapshots of `repos`, in order: the first repo that has the
-/// name wins, unless the name is qualified.
+/// Where to get each package in `args` from. Names are resolved with their
+/// dependencies against the latest snapshots of `repos`, in priority order
+/// (see [`resolve`]). Dependencies of packages given as paths or URLs are
+/// not resolved.
 fn sources(
     ctx: &Ctx,
     args: &[OsString],
@@ -362,51 +364,57 @@ fn sources(
         .iter()
         .map(|arg| parse_arg(arg, repos, &configured))
         .collect::<Result<Vec<_>>>()?;
-    let first_name = args.iter().find_map(|a| match a {
-        Arg::Name { name, .. } => Some(name),
-        Arg::Source(_) => None,
-    });
-    let snapshots = match first_name {
-        None => Vec::new(),
-        Some(name) if repos.is_empty() => {
-            bail!("{name:?} is a package name, which needs repos to look in (--repo)")
+    let mut sources = Vec::new();
+    let mut targets = Vec::new();
+    for arg in args {
+        match arg {
+            Arg::Source(source) => sources.push(source),
+            Arg::Name { repo, name } => targets.push(Target {
+                // Qualified names have a repo among `repos`.
+                repo: repo.and_then(|r| repos.iter().position(|x| *x == r)),
+                name,
+            }),
         }
-        Some(_) => load_snapshots(ctx, repos, jobs)?,
+    }
+    let Some(first) = targets.first() else {
+        return Ok(sources);
     };
-    // A package named twice is taken once.
-    let mut named = HashSet::new();
-    let sources = args
-        .into_iter()
-        .map(|arg| match arg {
-            Arg::Source(source) => Ok(Some(source)),
-            Arg::Name { repo, name } => {
-                let found = snapshots
-                    .iter()
-                    .filter(|s| repo.as_ref().is_none_or(|r| *r == s.repo))
-                    .find_map(|s| Some((s, s.get(&name)?)));
-                let Some((snapshot, entry)) = found else {
-                    let repos = repo.map_or_else(|| repos.join(", "), |r| r.clone());
-                    bail!("package {name} not found in {repos}");
-                };
-                ensure!(
-                    entry.arch == arch::repo::ARCH || entry.arch == "any",
-                    "package {}/{name} is for {}, not {}",
-                    snapshot.repo,
-                    entry.arch,
-                    arch::repo::ARCH
-                );
-                if !named.insert((&snapshot.repo, &entry.name)) {
-                    return Ok(None);
-                }
-                Ok(Some(Source::Repo {
-                    repo: snapshot.repo.clone(),
-                    url: snapshot.config.package_url(&entry.filename)?,
-                    entry: Box::new(entry.clone()),
-                }))
-            }
-        })
+    if repos.is_empty() {
+        bail!(
+            "{:?} is a package name, which needs repos to look in (--repo)",
+            first.name
+        );
+    }
+    let snapshots = load_snapshots(ctx, repos, jobs)?;
+    let candidates = snapshots
+        .iter()
+        .map(Snapshot::candidates)
         .collect::<Result<Vec<_>>>()?;
-    Ok(sources.into_iter().flatten().collect())
+    let candidates: Vec<&[Candidate]> = candidates.iter().map(Vec::as_slice).collect();
+    let chosen = resolve::resolve(&candidates, &targets, arch::version::vercmp)?;
+    eprintln!(
+        "resolved {} packages ({} given by name)",
+        chosen.len(),
+        targets.len()
+    );
+    for (r, i) in chosen {
+        let snapshot = &snapshots[r];
+        let entry = &snapshot.entries[i];
+        ensure!(
+            entry.arch == arch::repo::ARCH || entry.arch == "any",
+            "package {}/{} is for {}, not {}",
+            snapshot.repo,
+            entry.name,
+            entry.arch,
+            arch::repo::ARCH
+        );
+        sources.push(Source::Repo {
+            repo: snapshot.repo.clone(),
+            url: snapshot.config.package_url(&entry.filename)?,
+            entry: Box::new(entry.clone()),
+        });
+    }
+    Ok(sources)
 }
 
 /// The latest snapshot of each of `repos`.

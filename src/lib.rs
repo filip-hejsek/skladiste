@@ -8,6 +8,7 @@ pub mod install;
 pub mod jobs;
 pub mod manifest;
 pub mod repo;
+pub mod resolve;
 mod sandbox;
 pub mod store;
 pub mod worker;

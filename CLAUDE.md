@@ -39,17 +39,21 @@ packages (downloaded from an Arch mirror). Use a directory on btrfs;
 
 ```sh
 dir=tmp  # any directory on btrfs
-# Prints the packages and their dependencies (43 packages).
-pkgs=$(scripts/fetch-arch-packages.sh $dir/pkgs filesystem bash coreutils)
-export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # archlinux-keyring
-SKL_STORE=$dir/store cargo run --release -- build -o $dir/img $pkgs
+export SKL_STORE=$dir/store SKL_KEYRING=/usr/share/pacman/keyrings/archlinux
+skl() { cargo run -q --release -- "$@"; }
+mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+skl repo add core "$mirror" && skl repo add extra "$mirror"  # once
+skl sync
+# 42 packages with dependencies, downloaded into the store's downloads/.
+skl build --repo core --repo extra -o $dir/img filesystem bash coreutils
 unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img
 ```
 
-For changes to downloading, pass `--urls` to the script: it then prints
-the packages' URLs, and `skl build` downloads them into the store's
-`downloads/`.
+For package files given as paths, `scripts/fetch-arch-packages.sh
+$dir/pkgs filesystem bash coreutils` downloads the packages and their
+dependencies (ignoring versions) and prints their paths; with `--urls`
+it prints their URLs instead.
 
 Without root, chown to other users fails; `skl build` reports how many
 entries kept the wrong owner. This is expected. If you have subordinate
