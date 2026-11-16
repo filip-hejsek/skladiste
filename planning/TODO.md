@@ -74,6 +74,37 @@ Next priorities: dependency resolution, then install scripts and hooks.
     usually slower, which gives largest import first. Sizes are known
     beforehand from the repo database (`%CSIZE%`, `%ISIZE%`).
   - Fall back to the next mirror when a download fails.
+  - One download worker per mirror (origin: scheme, host, port), with
+    one keep-alive connection, replacing one worker per file.
+    Parallelism comes from downloading from several mirrors at once,
+    not from several connections to one host.
+  - Isolation per origin is enough: the worker parses only TLS and
+    response heads, never bodies, so only the server (or a network
+    attacker before the certificate is checked) can attack it, and a
+    compromised worker can do only what that server could already do.
+    Repos sharing a host (e.g. a CDN) control only bodies, so they can
+    share its worker. Different origins don't share a worker, which
+    matters because databases are unsigned.
+  - Protocol: the worker gets a list of paths and streams each body as
+    start, chunks, end, tagged with its position in the list. It waits
+    for each response before the next request; this round trip is with
+    the server, not between processes. No pipelining: some servers and
+    CDNs handle it badly.
+  - Reconnecting: in the first implementation, when the server closes
+    the connection (keep-alive request limits, timeouts), the
+    supervisor restarts the worker and submits the items it hasn't
+    finished again. Later the worker asks the supervisor for a new
+    socket instead.
+  - `skl` gets a download stage that hands each verified file to the
+    import jobs, instead of each job downloading its own package; this
+    is where download order matters. `skl sync` can use the same
+    workers for databases.
+  - Saves a TLS handshake and a worker start per file and is gentler
+    on mirrors. The measured run was bandwidth-bound at `-j8`, so the
+    gain shows mainly on high-latency links or with many small
+    packages.
+  - Quick win before this: fetch the `.sig` and the archive over one
+    connection, halving the handshakes.
 - Mirror trust: packages are signed, but Arch's repo databases aren't,
   so a malicious mirror (or anyone impersonating one; TLS stops only
   that) can't be fully defended against. It can:
