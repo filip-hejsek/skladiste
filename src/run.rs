@@ -82,6 +82,9 @@ pub struct Captured {
     pub changes: Vec<Change>,
     /// New file contents added to the store.
     pub stats: ImportStats,
+    /// How the snapshot was removed: entry by entry is slow for large
+    /// images, and suggests mounting with [`btrfs::USER_RM_OPTION`].
+    pub snapshot_removal: btrfs::Removal,
 }
 
 /// [`run`] the program in `image`, which must be the root of a btrfs
@@ -107,11 +110,12 @@ pub fn run_captured(
     let (changes, stats) = workers
         .diff(store, snapshot.dir(), image)
         .context("finding changes")?;
-    snapshot.remove()?;
+    let snapshot_removal = snapshot.remove()?;
     Ok(Captured {
         status,
         changes,
         stats,
+        snapshot_removal,
     })
 }
 
@@ -165,18 +169,19 @@ impl Snapshot {
         self.dir.as_ref().expect("snapshot not removed").as_fd()
     }
 
-    fn remove(mut self) -> Result<()> {
-        self.remove_now()
+    fn remove(mut self) -> Result<btrfs::Removal> {
+        Ok(self.remove_now()?.expect("not removed before"))
     }
 
-    /// Remove the snapshot, unless that was done before.
-    fn remove_now(&mut self) -> Result<()> {
+    /// Remove the snapshot, unless that was done before (`None`).
+    fn remove_now(&mut self) -> Result<Option<btrfs::Removal>> {
         if self.name.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.dir = None;
         let name = std::mem::take(&mut self.name);
         btrfs::remove_subvolume_at(self.tmp.as_fd(), OsStr::new(&name))
+            .map(Some)
             .with_context(|| format!("removing snapshot tmp/{name} from the store"))
     }
 }

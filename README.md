@@ -70,7 +70,12 @@ HTTPS servers are checked against the Mozilla root certificates built
 into skl; `--ca-certs FILE` (`SKL_CA_CERTS`) uses the certificates in a
 PEM file instead, e.g. behind a TLS-intercepting proxy.
 
-An image is a btrfs subvolume. Unprivileged users can remove it with `rm -rf`.
+An image is a btrfs subvolume. Unprivileged users can remove it with
+`rm -rf`, or with `btrfs subvolume delete`, which is much faster, if the
+filesystem is mounted with `user_subvol_rm_allowed`. skl uses the same
+for the snapshots `skl run` takes, and suggests the option when it's
+missing; note that it lets any user remove a subvolume whose root
+directory they can write to, with all its contents.
 
 ## Store layout
 

@@ -144,3 +144,21 @@ fn captures_changes() {
     );
     assert!(!Path::new(&image).join("tmp/not-kept").exists());
 }
+
+#[test]
+fn removes_subvolumes() {
+    let Some(dir) = btrfs_tempdir() else { return };
+    let sub = dir.path().join("sub");
+    skladiste::btrfs::create_subvolume(&sub).unwrap();
+    fs::create_dir_all(sub.join("a/b")).unwrap();
+    fs::write(sub.join("a/b/f"), "x").unwrap();
+    fs::set_permissions(sub.join("a"), PermissionsExt::from_mode(0o555)).unwrap();
+    let outside = dir.path().join("outside");
+    fs::write(&outside, "kept").unwrap();
+    std::os::unix::fs::symlink(&outside, sub.join("link")).unwrap();
+    let parent = File::open(dir.path()).unwrap();
+    let removal = skladiste::btrfs::remove_subvolume_at(parent.as_fd(), OsStr::new("sub")).unwrap();
+    eprintln!("removed: {removal:?}");
+    assert!(!sub.exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"kept");
+}

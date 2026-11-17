@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use skladiste::arch;
 use skladiste::arch::repo::{DbEntry, Snapshot};
 use skladiste::arch::signature::{self, Keyring};
+use skladiste::btrfs;
 use skladiste::diff::Change;
 use skladiste::http::{RootCerts, Url};
 use skladiste::install;
@@ -352,6 +353,16 @@ fn run_in_image(
         stats.new_objects,
         mib(stats.new_bytes)
     );
+    if captured.snapshot_removal == btrfs::Removal::EntryByEntry {
+        eprintln!(
+            "hint: without root, skl had to remove the snapshot it took entry by entry, which is \
+             slow for large images; mounting the filesystem with {0} (e.g. `mount -o \
+             remount,{0} MOUNTPOINT`) lets it remove the snapshot at once. Note that the option \
+             lets any user remove a subvolume whose root directory they can write to, with all \
+             its contents.",
+            btrfs::USER_RM_OPTION
+        );
+    }
     let status = captured.status;
     let code = status
         .code()

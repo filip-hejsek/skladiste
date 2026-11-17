@@ -453,11 +453,15 @@ are in BUGS.md.
   supervisor validates the changes (normal paths, each once, hard links
   only to a file changed earlier). New contents become store objects,
   not yet referenced by any manifest.
-- The snapshot is removed with `BTRFS_IOC_SNAP_DESTROY` (2 ms; needs
-  `CAP_SYS_ADMIN` or `user_subvol_rm_allowed`), otherwise by removing its
-  entries (0.84 s with `rm -rf` for 20,000 entries). `skl run` of a small
-  script on an image of 20,000 entries took 0.23 s in all as root and
-  0.39 s as an unprivileged user.
+- The snapshot is removed with `BTRFS_IOC_SNAP_DESTROY` (2 ms), which
+  needs `CAP_SYS_ADMIN` or, for a user who can write to the subvolume's
+  root, the mount option `user_subvol_rm_allowed`. Otherwise (`EPERM`) its
+  entries are removed one by one (0.84 s with `rm -rf` for 20,000
+  entries), and `skl run` suggests the mount option, saying that it lets
+  any user remove a subvolume they can write to with all its contents.
+  The `EPERM` tells, so mount options aren't read. `skl run` of a small
+  script on an image of 20,000 entries took 0.23 s in all as root, and as
+  an unprivileged user 0.42 s without the option and 0.15 s with it.
 
 ## Sandboxing
 

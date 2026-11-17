@@ -61,21 +61,39 @@ pub fn snapshot_at(source: BorrowedFd, parent: BorrowedFd, name: &OsStr) -> Resu
     vol_ioctl::<SNAP_CREATE>(parent, source.as_raw_fd().into(), name)
 }
 
+/// How [`remove_subvolume_at`] removed a subvolume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// With `BTRFS_IOC_SNAP_DESTROY`, in a few ms.
+    Destroyed,
+    /// Entry by entry, since the ioctl was not allowed: without
+    /// `CAP_SYS_ADMIN`, it needs the filesystem mounted with
+    /// `user_subvol_rm_allowed`.
+    EntryByEntry,
+}
+
+/// Mount option that lets users destroy subvolumes they could otherwise
+/// only empty; see [`Removal`].
+pub const USER_RM_OPTION: &str = "user_subvol_rm_allowed";
+
 /// Remove the subvolume `name` in `parent` with all its contents: with
-/// `BTRFS_IOC_SNAP_DESTROY` where allowed (with `CAP_SYS_ADMIN`, or by the
-/// owner on a filesystem mounted with `user_subvol_rm_allowed`), otherwise
-/// by removing every entry and then the empty subvolume (0.84 s for 20,000
-/// entries; the ioctl takes 2 ms). Symlinks aren't followed.
-pub fn remove_subvolume_at(parent: BorrowedFd, name: &OsStr) -> Result<()> {
+/// `BTRFS_IOC_SNAP_DESTROY` where allowed (with `CAP_SYS_ADMIN`, or by a
+/// user who can write to the subvolume's root on a filesystem mounted with
+/// [`USER_RM_OPTION`]), otherwise by removing every entry and then the
+/// empty subvolume (0.84 s for 20,000 entries; the ioctl takes 2 ms).
+/// Symlinks aren't followed.
+pub fn remove_subvolume_at(parent: BorrowedFd, name: &OsStr) -> Result<Removal> {
+    // EPERM: neither CAP_SYS_ADMIN nor the mount option.
     match vol_ioctl::<SNAP_DESTROY>(parent, 0, name) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(Removal::Destroyed),
         Err(e) if e.downcast_ref::<Errno>() == Some(&Errno::PERM) => {}
         Err(e) => return Err(e),
     }
     let dir = open_dir(parent, name)?;
     remove_contents(&dir)?;
     drop(dir);
-    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).context("removing subvolume")
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).context("removing subvolume")?;
+    Ok(Removal::EntryByEntry)
 }
 
 fn open_dir(parent: BorrowedFd, name: &OsStr) -> Result<OwnedFd> {
