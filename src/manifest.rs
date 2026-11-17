@@ -97,29 +97,7 @@ impl Package<ObjectId> {
         let entries = self
             .entries
             .into_iter()
-            .map(|e| {
-                let kind = match e.kind {
-                    EntryKind::File(ObjectId { object }) => EntryKind::File(
-                        usize::try_from(object)
-                            .ok()
-                            .and_then(|i| objects.get(i))
-                            .copied()
-                            .with_context(|| format!("/{}: no object {object}", e.path))?,
-                    ),
-                    EntryKind::Dir => EntryKind::Dir,
-                    EntryKind::Symlink { target } => EntryKind::Symlink { target },
-                    EntryKind::Hardlink { target } => EntryKind::Hardlink { target },
-                };
-                Ok(Entry {
-                    path: e.path,
-                    kind,
-                    mode: e.mode,
-                    uid: e.uid,
-                    gid: e.gid,
-                    mtime: e.mtime,
-                    xattrs: e.xattrs,
-                })
-            })
+            .map(|e| e.resolve(objects))
             .collect::<anyhow::Result<_>>()?;
         Ok(Package {
             name: self.name,
@@ -132,32 +110,69 @@ impl Package<ObjectId> {
     }
 }
 
+impl Entry<ObjectId> {
+    /// Replace the object id of a file with its content, as
+    /// [`Package::resolve`] does.
+    pub fn resolve(self, objects: &[Content]) -> anyhow::Result<Entry> {
+        let kind = match self.kind {
+            EntryKind::File(ObjectId { object }) => EntryKind::File(
+                usize::try_from(object)
+                    .ok()
+                    .and_then(|i| objects.get(i))
+                    .copied()
+                    .with_context(|| format!("/{}: no object {object}", self.path))?,
+            ),
+            EntryKind::Dir => EntryKind::Dir,
+            EntryKind::Symlink { target } => EntryKind::Symlink { target },
+            EntryKind::Hardlink { target } => EntryKind::Hardlink { target },
+        };
+        Ok(Entry {
+            path: self.path,
+            kind,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            mtime: self.mtime,
+            xattrs: self.xattrs,
+        })
+    }
+}
+
 impl<F> Package<F> {
     /// Check the invariants the rest of the core relies on.
     ///
     /// Frontends parse untrusted archives and may run in a sandboxed process,
     /// so their output is checked again by the code that stores it.
     pub fn validate(&self) -> anyhow::Result<()> {
-        for entry in &self.entries {
-            let path = &entry.path;
+        self.entries.iter().try_for_each(Entry::validate)
+    }
+}
+
+impl<F> Entry<F> {
+    /// Check the path, mode and hard link target, as
+    /// [`Package::validate`] does for each entry.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let path = &self.path;
+        anyhow::ensure!(is_normal_path(path)?, "invalid path: {path:?}");
+        anyhow::ensure!(
+            self.mode & !0o7777 == 0,
+            "/{path}: invalid mode {:o}",
+            self.mode
+        );
+        if let EntryKind::Hardlink { target } = &self.kind {
             anyhow::ensure!(
-                !path.is_empty() && normalize_path(path)? == *path,
-                "invalid path: {path:?}"
+                is_normal_path(target)?,
+                "/{path}: invalid hard link target {target:?}"
             );
-            anyhow::ensure!(
-                entry.mode & !0o7777 == 0,
-                "/{path}: invalid mode {:o}",
-                entry.mode
-            );
-            if let EntryKind::Hardlink { target } = &entry.kind {
-                anyhow::ensure!(
-                    !target.is_empty() && normalize_path(target)? == *target,
-                    "/{path}: invalid hard link target {target:?}"
-                );
-            }
         }
         Ok(())
     }
+}
+
+/// Whether `path` is non-empty and already normalized (see
+/// [`normalize_path`]); an error if it contains `..`.
+pub fn is_normal_path(path: &str) -> anyhow::Result<bool> {
+    Ok(!path.is_empty() && normalize_path(path)? == path)
 }
 
 /// One filesystem entry. `path` is relative to the image root, without a

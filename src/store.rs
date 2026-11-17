@@ -210,11 +210,23 @@ impl Store {
 
     /// A name in `tmp/` unique among all processes using the store.
     fn tmp_name(&self) -> String {
+        format!("tmp/{}", self.unique_name())
+    }
+
+    /// A name unique among all processes using the store, for an entry in
+    /// [`Store::tmp_dir`].
+    pub(crate) fn unique_name(&self) -> String {
         format!(
-            "tmp/{}-{}",
+            "{}-{}",
             std::process::id(),
             self.tmp_counter.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// The `tmp/` directory, for entries named by [`Store::unique_name`].
+    pub(crate) fn tmp_dir(&self) -> Result<OwnedFd> {
+        self.openat("tmp", OFlags::RDONLY | OFlags::DIRECTORY, 0)
+            .context("opening tmp")
     }
 
     /// Read a whole file, if it exists.

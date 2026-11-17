@@ -416,6 +416,49 @@ are in BUGS.md.
   subvolume can be removed with `rmdir`); `btrfs subvolume delete`
   needs privileges.
 
+## Changes by package code
+
+- `run::run_captured` (used by `skl run`) finds what a program changed in
+  an image: it takes a writable btrfs snapshot of the image in the
+  store's `tmp/` (12 ms), runs the program, compares the image with the
+  snapshot in a worker, and removes the snapshot. A snapshot keeps inode
+  numbers and ctimes, and a sandboxed program can't set a ctime, so an
+  entry is unchanged if inode number, type and ctime (with ns) equal the
+  snapshot's at the same path. Only directories whose ctime changed are
+  listed in the snapshot to find removed entries. No file is read unless
+  it changed. Rejected: overlayfs (bwrap `--overlay`), whose upper
+  directory holds the changes, but with whiteouts and opaque directories,
+  xattrs and inode numbers to handle and a merge back; `btrfs send` or
+  generation searches (`BTRFS_IOC_TREE_SEARCH`), which need
+  `CAP_SYS_ADMIN`; hashing every file.
+- Before the program starts, skl waits until `CLOCK_REALTIME_COARSE`
+  (which sets ctimes) is past the fine-grained time after the snapshot,
+  at most one tick. Otherwise an inode created and changed within the
+  same tick would keep its ctime. Accepted: setting the clock back during
+  a run could, very unlikely, give a changed inode its old ctime.
+- Changes are `diff::Change`: `Added` or `Modified` with the new entry,
+  which replaces what was at its path (a directory's contents are entries
+  of their own), or `Removed` with everything beneath; in path order, the
+  removals in a directory after its other changes. A file with several
+  links is a file entry at its first path and hard links at the others
+  (adding a link changes the inode's ctime, so all its paths are
+  reported). The image root itself isn't reported: manifest paths aren't
+  empty. Devices, FIFOs, sockets, non-UTF-8 names and mount points or
+  nested subvolumes make the comparison fail.
+- The diff worker gets both trees bound read-only, Landlock read access
+  and `CAP_DAC_READ_SEARCH`, to read files of any mode: as root in the
+  supervisor's user namespace (as the install worker), otherwise in its
+  new user namespace, where it covers only files whose owner and group
+  are skl's. It streams contents as the import worker does; the
+  supervisor validates the changes (normal paths, each once, hard links
+  only to a file changed earlier). New contents become store objects,
+  not yet referenced by any manifest.
+- The snapshot is removed with `BTRFS_IOC_SNAP_DESTROY` (2 ms; needs
+  `CAP_SYS_ADMIN` or `user_subvol_rm_allowed`), otherwise by removing its
+  entries (0.84 s with `rm -rf` for 20,000 entries). `skl run` of a small
+  script on an image of 20,000 entries took 0.23 s in all as root and
+  0.39 s as an unprivileged user.
+
 ## Sandboxing
 
 - Goal: every part of skl runs with only the access it needs, using
@@ -472,8 +515,10 @@ are in BUGS.md.
   `CAP_SETFCAP`, so owners apply in a user namespace with a range of ids
   mapped. bwrap can map only one id in a new user namespace without
   setuid. Otherwise (import worker, or skl not root) a worker gets a new
-  user namespace mapping only skl's uid and gid, with no capabilities and
-  `--disable-userns`. Xattrs that need `CAP_SYS_ADMIN` (`trusted.*`,
+  user namespace mapping only skl's uid and gid, with
+  `--disable-userns` and no capabilities, except those a worker asks to
+  keep there (only the diff worker does), which apply to files of skl's
+  uid and gid. Xattrs that need `CAP_SYS_ADMIN` (`trusted.*`,
   `security.*` other than `security.capability`) are counted as failures.
 - Workers confine themselves (`src/sandbox.rs`): `no_new_privs`, then
   Landlock (all filesystem access handled, plus TCP and the abstract

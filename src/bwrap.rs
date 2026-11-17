@@ -65,8 +65,11 @@ pub(crate) struct Namespaces<'a> {
     /// keeping only these capabilities, so that file owners mean the same
     /// inside and outside (needed to apply owners in a user namespace with a
     /// range of ids mapped). `None`: always use a new user namespace, which
-    /// maps only the supervisor's own uid and gid, with no capabilities.
+    /// maps only the supervisor's own uid and gid.
     pub(crate) root_caps: Option<&'a [&'a str]>,
+    /// Capabilities to keep in a new user namespace, where they apply only
+    /// to files whose owner and group are skl's.
+    pub(crate) userns_caps: &'a [&'a str],
 }
 
 /// Find `bwrap` in the supervisor's `PATH`.
@@ -105,6 +108,9 @@ pub(crate) fn command(
             cmd.args(["--unshare-user", "--disable-userns"]);
             if root {
                 cmd.args(["--cap-drop", "ALL"]);
+            }
+            for cap in ns.userns_caps {
+                cmd.args(["--cap-add", cap]);
             }
         }
     }
@@ -282,6 +288,7 @@ mod tests {
                 },
             ],
             root_caps: None,
+            userns_caps: &[],
         };
         let (mut cmd, fds) = command(&bwrap, exe.as_fd(), &ns).unwrap();
         cmd.args([

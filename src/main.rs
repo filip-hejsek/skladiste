@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use skladiste::arch;
 use skladiste::arch::repo::{DbEntry, Snapshot};
 use skladiste::arch::signature::{self, Keyring};
+use skladiste::diff::Change;
 use skladiste::http::{RootCerts, Url};
 use skladiste::install;
 use skladiste::jobs::{both, default_jobs, par_map, par_map_iter};
@@ -122,10 +123,16 @@ enum Command {
     /// program keeps only the capabilities to change files' owners and
     /// permissions; otherwise it runs in a new user namespace that maps
     /// skl's uid and gid to root, and changing owners to other ids fails.
-    /// The environment holds only PATH and PWD. skl exits with the
+    /// The environment holds only PATH and PWD.
+    ///
+    /// Afterwards, prints what the program changed in the image (A added,
+    /// M modified, D removed), found by comparing it with a snapshot taken
+    /// before, and adds new file contents to the store. Changes to the
+    /// image's root directory itself aren't shown. skl exits with the
     /// program's exit code.
     Run {
-        /// Root directory of the image.
+        /// The image: a subvolume made by `skl build`, on the same btrfs
+        /// filesystem as the store.
         image: PathBuf,
         /// Program to run, searched in the image's PATH unless it contains
         /// a slash.
@@ -179,25 +186,6 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    if let Command::Run {
-        image,
-        program,
-        args,
-    } = &cli.command
-    {
-        let dir = File::open(image).with_context(|| format!("opening {}", image.display()))?;
-        ensure!(
-            dir.metadata()?.is_dir(),
-            "{} is not a directory",
-            image.display()
-        );
-        let status = skladiste::run::run(dir.as_fd(), program, args)?;
-        let code = status
-            .code()
-            .or_else(|| status.signal().map(|s| 128 + s))
-            .unwrap_or(1);
-        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
-    }
     let mut workers = Workers::new("/proc/self/exe");
     #[cfg(feature = "insecure")]
     {
@@ -315,9 +303,61 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Sync { repos } => sync(&workers, &store, repos, jobs)?,
-        Command::Run { .. } => unreachable!("handled above"),
+        Command::Run {
+            image,
+            program,
+            args,
+        } => return run_in_image(&workers, &store, &image, &program, &args),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `skl run`: run the program, then print what it changed.
+fn run_in_image(
+    workers: &Workers,
+    store: &Store,
+    image: &Path,
+    program: &OsString,
+    args: &[OsString],
+) -> Result<ExitCode> {
+    let dir = File::open(image).with_context(|| format!("opening {}", image.display()))?;
+    ensure!(
+        dir.metadata()?.is_dir(),
+        "{} is not a directory",
+        image.display()
+    );
+    let captured = skladiste::run::run_captured(workers, store, dir.as_fd(), program, args)?;
+    let (mut added, mut modified, mut removed) = (0, 0, 0);
+    for change in &captured.changes {
+        let letter = match change {
+            Change::Added(_) => {
+                added += 1;
+                'A'
+            }
+            Change::Modified(_) => {
+                modified += 1;
+                'M'
+            }
+            Change::Removed(_) => {
+                removed += 1;
+                'D'
+            }
+        };
+        // Paths come from the image: escape control characters.
+        eprintln!("{letter} /{}", change.path().escape_debug());
+    }
+    let stats = &captured.stats;
+    eprintln!(
+        "{added} added, {modified} modified, {removed} removed; {} new objects ({:.1} MiB)",
+        stats.new_objects,
+        mib(stats.new_bytes)
+    );
+    let status = captured.status;
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|s| 128 + s))
+        .unwrap_or(1);
+    Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
 }
 
 /// Download the databases of `repos` (all if empty), and record the new

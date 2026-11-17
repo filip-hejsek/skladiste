@@ -66,8 +66,9 @@ Next priorities: install scripts and hooks.
   the system's CA certificates by default (now only with `--ca-certs`),
   support HTTP proxies.
 - Run `.INSTALL` scriptlets and alpm hooks inside the image, with
-  `skl::run` (see Sandboxing in DECISIONS.md). Next: capture the changes
-  a script made to the image. Output of package code should go to the
+  `run::run_captured`, which also finds what they changed (see Changes by
+  package code in DECISIONS.md). Next: run them in `skl build` and record
+  their changes with the image (see Images). Output of package code should go to the
   user escaped, as workers' stderr does; `skl run` passes the terminal
   through.
 - Device nodes and FIFOs in packages are rejected; support them if a
@@ -75,7 +76,8 @@ Next priorities: install scripts and hooks.
 
 ## Images
 
-- Open question: where to record what an image contains (needed for
+- Open question: where to record what an image contains, including the
+  changes install scripts and hooks made, (needed for
   upgrade and verify), including the snapshot used per repo (for
   upgrades, and to refuse versions older than those already used).
   Inside the image (e.g. `/var/lib/skl`), or alongside it outside the

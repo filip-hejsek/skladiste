@@ -442,7 +442,7 @@ impl Workers {
         if custom.is_some() {
             args.push("custom-roots");
         }
-        let worker = self.spawn("download", conn.into(), theirs, &[], None, &args)?;
+        let worker = self.spawn("download", conn.into(), theirs, &[], super::NO_CAPS, &args)?;
         let sock = File::from(ours);
         // The worker reads all certificates before it writes anything but
         // an error, which then explains a failure to send them.

@@ -10,16 +10,25 @@
 //! change files' owners, modes and xattrs: when skl runs as root, in skl's
 //! user namespace, so that owners mean the same inside; otherwise in a new
 //! user namespace that maps skl's uid and gid to 0.
+//!
+//! [`run_captured`] also finds what the program changed, by comparing the
+//! image with a snapshot taken before (see [`crate::diff`]).
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rustix::fs::{Mode, OFlags};
 
+use crate::btrfs;
 use crate::bwrap;
+use crate::diff::Change;
 use crate::sandbox;
+use crate::store::Store;
+use crate::worker::{ImportStats, Workers};
 
 /// Capabilities the program keeps: to change owners, modes, times and
 /// xattrs (including `security.capability`) of any file in the image, and
@@ -64,6 +73,122 @@ pub fn run(image: BorrowedFd, program: &OsStr, args: &[OsString]) -> Result<Exit
     Ok(status)
 }
 
+/// What [`run_captured`] found.
+#[derive(Debug)]
+pub struct Captured {
+    /// See [`run`].
+    pub status: ExitStatus,
+    /// What the program changed in the image, in path order.
+    pub changes: Vec<Change>,
+    /// New file contents added to the store.
+    pub stats: ImportStats,
+}
+
+/// [`run`] the program in `image`, which must be the root of a btrfs
+/// subvolume on the same filesystem as `store`, and find what it changed,
+/// whether it succeeded or not. New file contents are added to `store`.
+///
+/// Before the program starts, the image is snapshotted into the store's
+/// `tmp/`, and the snapshot is compared with the image afterwards in a
+/// worker (see [`crate::diff`]); it's removed after that. Taking the
+/// snapshot waits until the coarse clock, which sets ctimes, has passed the
+/// time of the snapshot (a few ms at most), so that a change can't leave a
+/// ctime as it was before.
+pub fn run_captured(
+    workers: &Workers,
+    store: &Store,
+    image: BorrowedFd,
+    program: &OsStr,
+    args: &[OsString],
+) -> Result<Captured> {
+    let snapshot = Snapshot::new(store, image)?;
+    wait_for_coarse_clock();
+    let status = run(image, program, args)?;
+    let (changes, stats) = workers
+        .diff(store, snapshot.dir(), image)
+        .context("finding changes")?;
+    snapshot.remove()?;
+    Ok(Captured {
+        status,
+        changes,
+        stats,
+    })
+}
+
+/// Wait until `CLOCK_REALTIME_COARSE`, which the kernel uses for most
+/// timestamps, is past the current fine-grained time. Afterwards, any
+/// change to an inode gives it a ctime later than any it had before (unless
+/// the clock is set back meanwhile).
+fn wait_for_coarse_clock() {
+    let now = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        (ts.tv_sec, ts.tv_nsec)
+    };
+    let fine = now(libc::CLOCK_REALTIME);
+    while now(libc::CLOCK_REALTIME_COARSE) <= fine {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A snapshot in the store's `tmp/`, removed when dropped.
+struct Snapshot {
+    tmp: OwnedFd,
+    name: String,
+    /// Open until the snapshot is removed.
+    dir: Option<OwnedFd>,
+}
+
+impl Snapshot {
+    fn new(store: &Store, image: BorrowedFd) -> Result<Snapshot> {
+        let tmp = store.tmp_dir()?;
+        let name = format!("snapshot-{}", store.unique_name());
+        btrfs::snapshot_at(image, tmp.as_fd(), OsStr::new(&name))
+            .context("taking a snapshot of the image")?;
+        let mut snapshot = Snapshot {
+            tmp,
+            name,
+            dir: None,
+        };
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let dir = rustix::fs::openat(&snapshot.tmp, snapshot.name.as_str(), flags, Mode::empty())
+            .context("opening snapshot")?;
+        snapshot.dir = Some(dir);
+        Ok(snapshot)
+    }
+
+    fn dir(&self) -> BorrowedFd<'_> {
+        self.dir.as_ref().expect("snapshot not removed").as_fd()
+    }
+
+    fn remove(mut self) -> Result<()> {
+        self.remove_now()
+    }
+
+    /// Remove the snapshot, unless that was done before.
+    fn remove_now(&mut self) -> Result<()> {
+        if self.name.is_empty() {
+            return Ok(());
+        }
+        self.dir = None;
+        let name = std::mem::take(&mut self.name);
+        btrfs::remove_subvolume_at(self.tmp.as_fd(), OsStr::new(&name))
+            .with_context(|| format!("removing snapshot tmp/{name} from the store"))
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if let Err(e) = self.remove_now() {
+            eprintln!("warning: {e:#}");
+        }
+    }
+}
+
 /// A pipe that holds `data`, with the write end closed. `data` must fit in
 /// the pipe's buffer (64 KiB by default).
 fn pipe_holding(data: &[u8]) -> Result<OwnedFd> {
@@ -76,82 +201,33 @@ fn pipe_holding(data: &[u8]) -> Result<OwnedFd> {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/minimal_image.rs"]
+mod minimal_image;
+
+#[cfg(test)]
 mod tests {
     use std::fs::File;
     use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::*;
 
-    /// Where the test binary is copied in the image.
-    const CHILD: &str = "/child";
-
-    /// Runs this test binary in a minimal image (the binary, its dynamic
-    /// loader, the libraries it has mapped, and the host's `/lib*` symlinks
-    /// and `ld.so.cache`)
-    /// and checks what the program can do there.
+    /// Runs this test binary in a minimal image and checks what it can do
+    /// there.
     #[test]
     fn program_sees_only_the_image() {
-        if std::env::current_exe().unwrap() == Path::new(CHILD) {
+        if minimal_image::is_child() {
             return check_inside();
         }
         let image = tempfile::tempdir().unwrap();
         let root = image.path();
-        let copy = |from: &Path, to: &str| {
-            let dest = root.join(to.trim_start_matches('/'));
-            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-            std::fs::copy(from, dest).unwrap();
-        };
-        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        std::fs::write(root.join(&CHILD[1..]), &exe).unwrap();
-        std::fs::set_permissions(root.join(&CHILD[1..]), PermissionsExt::from_mode(0o755)).unwrap();
-        let interp = interpreter(&exe);
-        copy(Path::new(interp), interp);
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        let libs = maps
-            .lines()
-            .filter_map(|l| l.split_whitespace().nth(5))
-            .filter(|p| p.starts_with("/usr/") || p.starts_with("/lib"));
-        for lib in libs {
-            copy(Path::new(lib), lib);
-        }
-        if Path::new("/etc/ld.so.cache").exists() {
-            copy(Path::new("/etc/ld.so.cache"), "/etc/ld.so.cache");
-        }
-        for dir in ["/lib", "/lib32", "/lib64", "/libx32"] {
-            if let Ok(target) = std::fs::read_link(dir) {
-                let dest = root.join(&dir[1..]);
-                if !dest.exists() {
-                    std::os::unix::fs::symlink(target, dest).unwrap();
-                }
-            }
-        }
+        minimal_image::populate(root);
         let dir = File::open(root).unwrap();
-        let args: Vec<OsString> = ["--exact", "run::tests::program_sees_only_the_image"]
-            .iter()
-            .map(OsString::from)
-            .chain([OsString::from("--nocapture")])
-            .collect();
-        let status = run(dir.as_fd(), OsStr::new(CHILD), &args).unwrap();
+        let args = minimal_image::child_args("run::tests::program_sees_only_the_image");
+        let status = run(dir.as_fd(), OsStr::new(minimal_image::CHILD), &args).unwrap();
         assert!(status.success(), "child {status}");
         assert_eq!(std::fs::read(root.join("kept")).unwrap(), b"x");
         assert!(root.join("tmp").read_dir().unwrap().next().is_none());
-    }
-
-    /// The `PT_INTERP` path of a 64-bit ELF executable.
-    fn interpreter(elf: &[u8]) -> &str {
-        let u16_at = |o: usize| u16::from_ne_bytes(elf[o..o + 2].try_into().unwrap()) as usize;
-        let u64_at = |o: usize| u64::from_ne_bytes(elf[o..o + 8].try_into().unwrap()) as usize;
-        let (phoff, phentsize, phnum) = (u64_at(0x20), u16_at(0x36), u16_at(0x38));
-        for ph in (0..phnum).map(|i| phoff + i * phentsize) {
-            if u32::from_ne_bytes(elf[ph..ph + 4].try_into().unwrap()) == 3 {
-                let (off, len) = (u64_at(ph + 8), u64_at(ph + 32));
-                let path = &elf[off..off + len];
-                return std::str::from_utf8(path.strip_suffix(b"\0").unwrap()).unwrap();
-            }
-        }
-        panic!("no PT_INTERP");
     }
 
     fn check_inside() {

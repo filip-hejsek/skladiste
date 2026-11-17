@@ -22,7 +22,7 @@ formats can be added as frontends.
 - Resolves dependencies pacman-style (versioned dependencies, provides,
   conflicts)
 - No install scripts or hooks yet; `skl run` runs a program in an image,
-  sandboxed with bubblewrap
+  sandboxed with bubblewrap, and lists what it changed
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
 - Archives and repo databases are parsed and images filled by worker
@@ -48,7 +48,8 @@ skl run image bash
 
 `skl run` runs the program as root in the image, without network or a
 view of the host. When skl isn't root, changing owners to other ids fails
-there.
+there. Afterwards it lists what the program added, modified and removed,
+found by comparing the image with a snapshot taken before.
 
 `build` takes package names (`NAME`, or `REPO/NAME` for a package from
 one repo) and uses the repos given with `--repo`, in priority order. It

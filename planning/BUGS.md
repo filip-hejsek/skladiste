@@ -10,7 +10,8 @@ are in TODO.md.
   fsync (or syncfs once per import) before publishing objects and
   manifests.
 - A manifest being saved is left in `tmp/` if the process is killed
-  before it's renamed into place; nothing cleans it up.
+  before it's renamed into place; nothing cleans it up. The same goes for
+  the snapshot `skl run` takes (`tmp/snapshot-*`).
 
 ## Arch frontend
 
@@ -25,6 +26,12 @@ are in TODO.md.
 - Sub-second mtimes from PAX headers are dropped.
 
 ## Installation
+
+- `skl run` doesn't report changes to the image's root directory itself
+  (its mode, owner or xattrs).
+- Without root, finding changes fails on a changed file that skl can't
+  read and whose owner or group isn't skl's (e.g. in an image built as
+  root).
 
 - A failed build leaves a partial image subvolume behind; the user has
   to remove it.

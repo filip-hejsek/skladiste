@@ -33,6 +33,11 @@
 //!   worker reads it with [`arch::repo::read_db`] and sends the entries in
 //!   `DONE`; the supervisor validates them. No filesystem access, no
 //!   ioctls.
+//! - `diff`: fd 0 is unused, fd 1 a socket, and the tree before (a
+//!   snapshot) and after are bound read-only at `/old` and `/new`. The
+//!   worker compares them with [`diff::diff`] and streams the new
+//!   contents like `import-arch`; `DONE` holds the changes, which refer to
+//!   objects by position. Read access to both trees, no ioctls.
 //! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
 //!   and the store directory and image root are bound at `/store`
 //!   (read-only) and `/image` in the worker's mount namespace. The worker
@@ -46,7 +51,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, ExitStatus};
@@ -57,6 +62,7 @@ use landlock::AccessFs;
 
 use crate::arch;
 use crate::bwrap::{self, Mount, Namespaces};
+use crate::diff::{self, Change};
 use crate::http::RootCerts;
 use crate::install::{self, Report};
 use crate::manifest::{Content, Entry, ObjectId, Package};
@@ -89,6 +95,8 @@ const BUF_SIZE: usize = CHUNK_SIZE;
 /// MiB; zstd's default limit on the decoding window is 128 MiB, and very
 /// large packages have manifests of tens of MiB.
 const IMPORT_MAX_MEMORY: u64 = 1 << 30;
+/// Address space limit of the diff worker, which holds the changes.
+const DIFF_MAX_MEMORY: u64 = 1 << 30;
 /// Address space limit of the install worker, which holds the whole plan
 /// (about 40 MiB were enough for an image of 17,000 entries).
 const INSTALL_MAX_MEMORY: u64 = 4 << 30;
@@ -100,13 +108,39 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// owners, then modes (including setuid and setgid bits), times and xattrs
 /// (including `security.capability`) of entries it no longer owns, and to
 /// create entries in directories whose permissions don't allow it.
-const INSTALL_CAPS: &[&str] = &[
-    "CAP_CHOWN",
-    "CAP_DAC_OVERRIDE",
-    "CAP_FOWNER",
-    "CAP_FSETID",
-    "CAP_SETFCAP",
-];
+const INSTALL_CAPS: Caps = Caps {
+    root: Some(&[
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_SETFCAP",
+    ]),
+    userns: &[],
+};
+
+/// Capabilities of the diff worker: to read every file and directory
+/// regardless of permissions (in a new user namespace, those owned by
+/// skl's uid and gid).
+const DIFF_CAPS: Caps = Caps {
+    root: Some(&["CAP_DAC_READ_SEARCH"]),
+    userns: &["CAP_DAC_READ_SEARCH"],
+};
+
+/// Capabilities a worker keeps; see [`Namespaces`].
+#[derive(Clone, Copy)]
+struct Caps {
+    /// [`Namespaces::root_caps`]
+    root: Option<&'static [&'static str]>,
+    /// [`Namespaces::userns_caps`]
+    userns: &'static [&'static str],
+}
+
+/// A worker that runs in a new user namespace without capabilities.
+const NO_CAPS: Caps = Caps {
+    root: None,
+    userns: &[],
+};
 
 /// Statistics about an import, counted by the supervisor.
 #[derive(Debug, Default)]
@@ -178,9 +212,55 @@ impl Workers {
             None,
         )
         .context("creating socket")?;
-        let worker = self.spawn("import-arch", archive.into(), theirs, &[], None, &[])?;
+        let worker = self.spawn("import-arch", archive.into(), theirs, &[], NO_CAPS, &[])?;
         let mut conn = receiver(ours)?;
         let result = receive_import(store, &mut conn);
+        drop(conn);
+        worker.finish(result)
+    }
+
+    /// Compare the tree `new` with `old` (see [`diff::diff`]) in a worker
+    /// that can only read both, adding new file contents to `store`. The
+    /// returned changes are checked.
+    pub fn diff(
+        &self,
+        store: &Store,
+        old: BorrowedFd,
+        new: BorrowedFd,
+    ) -> Result<(Vec<Change>, ImportStats)> {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .context("creating socket")?;
+        let dirs = [
+            Mount {
+                fd: old,
+                dest: "/old",
+                writable: false,
+            },
+            Mount {
+                fd: new,
+                dest: "/new",
+                writable: false,
+            },
+        ];
+        let null = File::open("/dev/null").context("opening /dev/null")?;
+        let worker = self.spawn("diff", null.into(), theirs, &dirs, DIFF_CAPS, &[])?;
+        let mut conn = receiver(ours)?;
+        let result = receive_objects(store, &mut conn).and_then(|(objects, json, stats)| {
+            let changes: Vec<Change<ObjectId>> =
+                serde_json::from_slice(&json).context("parsing changes from worker")?;
+            let changes = changes
+                .into_iter()
+                .map(|c| c.resolve(&objects))
+                .collect::<Result<Vec<_>>>()?;
+            diff::validate(&changes)?;
+            Ok((changes, stats))
+        });
         drop(conn);
         worker.finish(result)
     }
@@ -189,7 +269,7 @@ impl Workers {
     pub fn read_arch_db(&self, db: File) -> Result<Vec<arch::repo::DbEntry>> {
         use rustix::pipe::{PipeFlags, pipe_with};
         let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-        let worker = self.spawn("read-arch-db", db.into(), result_w, &[], None, &[])?;
+        let worker = self.spawn("read-arch-db", db.into(), result_w, &[], NO_CAPS, &[])?;
         let result = read_result(&mut BufReader::new(File::from(result_r))).and_then(|json| {
             let entries: Vec<arch::repo::DbEntry> =
                 serde_json::from_slice(&json).context("parsing result from worker")?;
@@ -219,7 +299,7 @@ impl Workers {
                 writable: true,
             },
         ];
-        let worker = self.spawn("install", plan_r, result_w, &dirs, Some(INSTALL_CAPS), &[])?;
+        let worker = self.spawn("install", plan_r, result_w, &dirs, INSTALL_CAPS, &[])?;
         // The worker reads the whole plan before it writes a result, unless
         // it fails; then its error message explains the broken pipe.
         let sent = send_json(plan_w, plan);
@@ -233,8 +313,8 @@ impl Workers {
     /// Start worker `kind` with `stdin` and `stdout` as fds 0 and 1, and
     /// `dirs` bound in its mount namespace, their paths passed as arguments.
     /// Without namespaces, the fds of `dirs` are inherited under their
-    /// current numbers instead, and the numbers passed. `root_caps`: see
-    /// [`Namespaces::root_caps`]. `args` are passed last, after `--`.
+    /// current numbers instead, and the numbers passed. `caps`: see
+    /// [`Caps`]. `args` are passed last, after `--`.
     /// Stderr is a pipe; see [`Worker::finish`].
     fn spawn(
         &self,
@@ -242,7 +322,7 @@ impl Workers {
         stdin: OwnedFd,
         stdout: OwnedFd,
         dirs: &[Mount],
-        root_caps: Option<&[&str]>,
+        caps: Caps,
         args: &[&str],
     ) -> Result<Worker> {
         let exe_fd: OwnedFd;
@@ -253,7 +333,8 @@ impl Workers {
                 .with_context(|| format!("opening {}", self.exe.display()))?;
             let ns = Namespaces {
                 mounts: dirs,
-                root_caps,
+                root_caps: caps.root,
+                userns_caps: caps.userns,
             };
             let (mut cmd, raw) = bwrap::command(&bwrap, exe_fd.as_fd(), &ns)?;
             cmd.arg(SUBCOMMAND).arg(kind);
@@ -461,6 +542,21 @@ fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
 
 /// Supervisor side of `import-arch`.
 fn receive_import(store: &Store, conn: &mut BufReader<File>) -> Result<(Package, ImportStats)> {
+    let (objects, json, stats) = receive_objects(store, conn)?;
+    let pkg: Package<ObjectId> =
+        serde_json::from_slice(&json).context("parsing manifest from worker")?;
+    let pkg = pkg.resolve(&objects)?;
+    pkg.validate()?;
+    Ok((pkg, stats))
+}
+
+/// Add the objects a worker streams to `store` until its `DONE`. Returns
+/// the content of each object in the order received, the payload of
+/// `DONE`, and statistics.
+fn receive_objects(
+    store: &Store,
+    conn: &mut BufReader<File>,
+) -> Result<(Vec<Content>, Vec<u8>, ImportStats)> {
     let mut stats = ImportStats::default();
     // Content of each object, in the order received.
     let mut objects: Vec<Content> = Vec::new();
@@ -493,11 +589,7 @@ fn receive_import(store: &Store, conn: &mut BufReader<File>) -> Result<(Package,
             }
             DONE => {
                 let json = read_payload(&mut *conn, len, MAX_DONE)?;
-                let pkg: Package<ObjectId> =
-                    serde_json::from_slice(&json).context("parsing manifest from worker")?;
-                let pkg = pkg.resolve(&objects)?;
-                pkg.validate()?;
-                return Ok((pkg, stats));
+                return Ok((objects, json, stats));
             }
             ERROR => return Err(read_error(conn, len)),
             _ => bail!("unexpected message {tag} from worker"),
@@ -622,6 +714,11 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
             download::worker(layers, origin, true, out)
         }
         ("read-arch-db", []) if dirs.is_empty() => read_db_worker(layers),
+        ("diff", []) => {
+            let [old, new] = <[OwnedFd; 2]>::try_from(dirs)
+                .map_err(|_| anyhow::anyhow!("diff worker needs two directories"))?;
+            diff_worker(layers, old, new, out)
+        }
         ("install", []) => {
             let [store, root] = <[OwnedFd; 2]>::try_from(dirs)
                 .map_err(|_| anyhow::anyhow!("install worker needs two directories"))?;
@@ -721,6 +818,47 @@ impl ObjectSink for RemoteSink<'_> {
         self.next += 1;
         Ok(id)
     }
+}
+
+/// System calls the diff worker makes besides [`sandbox`]'s basic set.
+const DIFF_SYSCALLS: &[i64] = &[
+    libc::SYS_openat,
+    libc::SYS_getdents64,
+    libc::SYS_newfstatat,
+    libc::SYS_fstat,
+    libc::SYS_statx,
+    libc::SYS_readlinkat,
+    libc::SYS_flistxattr,
+    libc::SYS_fgetxattr,
+];
+
+fn diff_worker(
+    layers: Layers,
+    old: OwnedFd,
+    new: OwnedFd,
+    out: &mut BufWriter<File>,
+) -> Result<Vec<u8>> {
+    let read = AccessFs::ReadFile | AccessFs::ReadDir;
+    let policy = Policy {
+        paths: vec![(old.as_fd(), read), (new.as_fd(), read)],
+        syscalls: DIFF_SYSCALLS,
+        max_memory: Some(DIFF_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(layers, &policy)?;
+    // The directories were opened with O_PATH; reading them needs real fds.
+    let reopen = |fd: OwnedFd| {
+        use rustix::fs::{Mode, OFlags};
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        rustix::fs::openat(&fd, ".", flags, Mode::empty()).context("opening directory")
+    };
+    let mut sink = RemoteSink {
+        conn: out,
+        buf: vec![0; CHUNK_SIZE],
+        next: 0,
+    };
+    let changes = diff::diff(reopen(old)?, reopen(new)?, &mut sink)?;
+    Ok(serde_json::to_vec(&changes)?)
 }
 
 /// System calls the installer makes besides [`sandbox`]'s basic set.
