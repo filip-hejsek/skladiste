@@ -19,6 +19,33 @@ use anyhow::{Result, bail};
 /// Where the `skl` binary is bound inside the sandbox.
 pub(crate) const EXE: &str = "/skl";
 
+/// Paths in `/proc` that [`image_command`] hides, because they show
+/// host-wide information (other processes, kernel memory, hardware): the
+/// default masked paths of runc, and files readable by root without
+/// capabilities. Files are covered with the host's `/dev/null`, bound
+/// `nodev`, so opening them fails with `EACCES`; directories with an empty
+/// read-only tmpfs.
+pub(crate) const MASKED_PROC: &[&str] = &[
+    // runc's defaults.
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    // Mode 0400, no capability needed.
+    "/proc/kpagecgroup",
+    "/proc/kpagecount",
+    "/proc/kpageflags",
+    "/proc/pagetypeinfo",
+    "/proc/slabinfo",
+    "/proc/vmallocinfo",
+];
+
 /// Host directories (or symlinks to them) the dynamic loader may need.
 const LIB_DIRS: &[&str] = &["/lib", "/lib32", "/lib64", "/libx32"];
 
@@ -123,7 +150,9 @@ pub(crate) fn command(
 /// to 0. `/proc` (for the new pid namespace) is read-only, since root in
 /// the host's user namespace can write sysctls in `/proc/sys`, and
 /// bwrap's cover over it is skipped for lack of write access to the
-/// directory. `/dev` has only the basic devices; `/tmp` and `/run` are
+/// directory. The paths in [`MASKED_PROC`] that exist in the host's
+/// `/proc` (the same kernel) are hidden; fails if the host has no `/proc`.
+/// `/dev` has only the basic devices; `/tmp` and `/run` are
 /// tmpfs, so their contents aren't kept in the image. Missing mount
 /// points are created in the image. No `/sys`.
 pub(crate) fn image_command(
@@ -131,7 +160,7 @@ pub(crate) fn image_command(
     image: BorrowedFd,
     caps: &[&str],
     filters: &[BorrowedFd],
-) -> Command {
+) -> Result<Command> {
     let mut cmd = new_namespaces(bwrap);
     if rustix::process::getuid().is_root() {
         cmd.args(["--cap-drop", "ALL"]);
@@ -152,10 +181,21 @@ pub(crate) fn image_command(
         cmd.arg("--add-seccomp-fd").arg(fd_arg(*fd));
     }
     cmd.arg("--bind-fd").arg(fd_arg(image));
+    cmd.args(["/", "--proc", "/proc"]);
+    if std::fs::symlink_metadata("/proc/self").is_err() {
+        bail!("/proc is not mounted; needed to know which of its paths to hide");
+    }
+    for path in MASKED_PROC {
+        // bwrap resolves the source in the host's root, so the image can't
+        // redirect it.
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() => cmd.args(["--tmpfs", path, "--remount-ro", path]),
+            Ok(_) => cmd.args(["--ro-bind", "/dev/null", path]),
+            Err(_) => continue,
+        };
+    }
+    // Doesn't reach the tmpfs masks, so they get their own.
     cmd.args([
-        "/",
-        "--proc",
-        "/proc",
         "--remount-ro",
         "/proc",
         "--dev",
@@ -168,7 +208,7 @@ pub(crate) fn image_command(
         "/",
         "--",
     ]);
-    cmd
+    Ok(cmd)
 }
 
 /// Make the child of `cmd` inherit `fds` under their numbers, by clearing

@@ -3,7 +3,8 @@
 //!
 //! The program runs under bubblewrap with the image as its root,
 //! read-write: it sees nothing of the host's filesystem, processes or
-//! network, and can't reach the store. `/proc` is read-only, `/dev` holds
+//! network, and can't reach the store. `/proc` is read-only, with the parts
+//! that show host-wide information hidden, `/dev` holds
 //! only basic devices, `/tmp` and `/run` are tmpfs (not kept in the image)
 //! and there is no `/sys`. It runs as root with only the capabilities to
 //! change files' owners, modes and xattrs: when skl runs as root, in skl's
@@ -51,7 +52,7 @@ pub fn run(image: BorrowedFd, program: &OsStr, args: &[OsString]) -> Result<Exit
         .map(|program| pipe_holding(program))
         .collect::<Result<Vec<OwnedFd>>>()?;
     let filter_fds: Vec<BorrowedFd> = filters.iter().map(|f| f.as_fd()).collect();
-    let mut cmd = bwrap::image_command(&bwrap, image, CAPS, &filter_fds);
+    let mut cmd = bwrap::image_command(&bwrap, image, CAPS, &filter_fds)?;
     cmd.arg(program).args(args);
     let mut fds = vec![image.as_raw_fd()];
     fds.extend(filters.iter().map(|f| f.as_raw_fd()));
@@ -162,6 +163,22 @@ mod tests {
         std::fs::write("/tmp/gone", "x").unwrap();
         let err = std::fs::write("/proc/sys/vm/drop_caches", "3").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+        // Masked directories are empty and read-only, masked files can't be
+        // opened; at least `interrupts` exists on every kernel.
+        assert!(Path::new("/proc/interrupts").exists());
+        for path in bwrap::MASKED_PROC {
+            let Ok(m) = std::fs::metadata(path) else {
+                continue;
+            };
+            if m.is_dir() {
+                assert!(std::fs::read_dir(path).unwrap().next().is_none(), "{path}");
+                let err = std::fs::write(Path::new(path).join("x"), "").unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(libc::EROFS), "{path}");
+            } else {
+                let err = File::open(path).unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{path}");
+            }
+        }
         // No host processes: bwrap's init is pid 1.
         assert!(std::process::id() < 10, "pid {}", std::process::id());
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

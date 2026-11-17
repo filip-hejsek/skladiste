@@ -588,6 +588,17 @@ are in BUGS.md.
   `CLONE_NEWUSER` fail with `EPERM`, and `clone3` with `ENOSYS` (its
   flags are behind a pointer; libc falls back to `clone`); x32 numbers
   are listed too. Otherwise package code has no seccomp filter.
+- In that `/proc`, paths showing host-wide information are hidden
+  (`bwrap::MASKED_PROC`): runc's default masked paths, plus files of mode
+  0400 that root reads without capabilities (`kpage*`, `slabinfo`,
+  `vmallocinfo`, `pagetypeinfo`), since the program may be uid 0 of the
+  host. Files get the host's `/dev/null` bound `nodev` (opening fails
+  with `EACCES`; the source is resolved on the host, so the image can't
+  redirect it), directories a read-only tmpfs (bwrap's `--remount-ro
+  /proc` doesn't reach it). Which exist is read from skl's own `/proc`.
+  Rejected: making only some paths read-only as runc does (`/proc/sys`,
+  `/proc/sysrq-trigger`, …), a list that misses what it doesn't name;
+  package code has no need to write `/proc`. Workers get no `/proc`.
 - If a sandboxing layer is unavailable, skl refuses to run. The escape
   hatch is the `insecure` cargo feature (off by default), which adds
   `--insecure-no-namespaces` (workers run without bwrap and get their

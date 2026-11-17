@@ -115,7 +115,8 @@ enum Command {
     },
     /// Run a program in an image, as root, sandboxed with bubblewrap.
     ///
-    /// The program sees only the image, read-write, with a read-only /proc,
+    /// The program sees only the image, read-write, with a read-only /proc
+    /// (parts that show host-wide information hidden),
     /// basic devices in /dev, and empty tmpfs on /tmp and /run. It has no
     /// network and can't see host processes. When skl runs as root, the
     /// program keeps only the capabilities to change files' owners and
