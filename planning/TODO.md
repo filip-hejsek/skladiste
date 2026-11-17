@@ -65,8 +65,11 @@ Next priorities: install scripts and hooks.
   the result, and the supervisor pass it to that origin's worker), use
   the system's CA certificates by default (now only with `--ca-certs`),
   support HTTP proxies.
-- Run `.INSTALL` scriptlets and alpm hooks inside the image, in a
-  sandbox (see Sandboxing).
+- Run `.INSTALL` scriptlets and alpm hooks inside the image, with
+  `skl::run` (see Sandboxing in DECISIONS.md). Next: capture the changes
+  a script made to the image. Output of package code should go to the
+  user escaped, as workers' stderr does; `skl run` passes the terminal
+  through.
 - Device nodes and FIFOs in packages are rejected; support them if a
   package needs them.
 
@@ -105,9 +108,8 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 
 - Supervisor: confine `skl` itself after opening its paths (Landlock with
   the store, the package files and the image's parent directory).
-- Script runner: bubblewrap with user, mount, pid, net, ipc and uts
-  namespaces, root is the image, no access to the store (can build on
-  `src/bwrap.rs`).
+- Package code has no limits on memory, processes or disk use in the
+  image (it can fill the filesystem). Cgroups or btrfs qgroups would do.
 - Low priority: signature verification in a worker (one per import
   run, not per package). It runs in the supervisor now, so a parser
   exploit gets `skl`'s privileges, which may exceed the image's.

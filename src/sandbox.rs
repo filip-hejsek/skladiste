@@ -5,6 +5,9 @@
 //! the [`Policy`], denies TCP, and stops the process from signalling or
 //! connecting to abstract sockets outside its sandbox. Seccomp then allows
 //! only the system calls the worker needs and kills it on any other.
+//!
+//! Package code run in an image can't confine itself; bwrap loads the
+//! filters of [`no_userns_filters`] for it.
 
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -168,6 +171,70 @@ fn seccomp(policy: &Policy) -> Result<()> {
     let program: BpfProgram = filter.try_into()?;
     seccompiler::apply_filter(&program)?;
     Ok(())
+}
+
+/// Seccomp filters (raw BPF programs) that stop a process from creating
+/// user namespaces, for package code that bwrap runs in the supervisor's
+/// user namespace, where `--disable-userns` isn't available. `unshare` and
+/// `clone` with `CLONE_NEWUSER` fail with `EPERM`. `clone3` fails with
+/// `ENOSYS`, since its flags are behind a pointer; libc then falls back to
+/// `clone`. Everything else is allowed. A separate program per error,
+/// since a seccompiler filter has a single action on a match.
+pub(crate) fn no_userns_filters() -> Result<[Vec<u8>; 2]> {
+    let arch = TargetArch::try_from(std::env::consts::ARCH)?;
+    let newuser = || -> Result<Vec<SeccompRule>> {
+        let flag = libc::CLONE_NEWUSER as u64;
+        let cond = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(flag),
+            flag,
+        )?;
+        Ok(vec![SeccompRule::new(vec![cond])?])
+    };
+    let mut flagged = BTreeMap::new();
+    let mut whole = BTreeMap::new();
+    for nr in with_x32(libc::SYS_unshare).chain(with_x32(libc::SYS_clone)) {
+        flagged.insert(nr, newuser()?);
+    }
+    for nr in with_x32(libc::SYS_clone3) {
+        whole.insert(nr, Vec::new());
+    }
+    let compile = |rules, errno: i32| -> Result<Vec<u8>> {
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(errno as u32),
+            arch,
+        )?;
+        let program: BpfProgram = filter.try_into()?;
+        Ok(program
+            .iter()
+            .flat_map(|f| {
+                let mut b = [0; 8];
+                b[..2].copy_from_slice(&f.code.to_ne_bytes());
+                b[2] = f.jt;
+                b[3] = f.jf;
+                b[4..].copy_from_slice(&f.k.to_ne_bytes());
+                b
+            })
+            .collect())
+    };
+    Ok([
+        compile(flagged, libc::EPERM)?,
+        compile(whole, libc::ENOSYS)?,
+    ])
+}
+
+/// `nr`, and on x86_64 also its x32 number: x32 system calls pass a filter
+/// for `AUDIT_ARCH_X86_64` with this bit set, so a filter that allows
+/// everything else must name them too.
+fn with_x32(nr: i64) -> impl Iterator<Item = i64> {
+    #[cfg(target_arch = "x86_64")]
+    let x32 = Some(nr | 0x4000_0000);
+    #[cfg(not(target_arch = "x86_64"))]
+    let x32 = None;
+    std::iter::once(nr).chain(x32)
 }
 
 #[cfg(test)]

@@ -21,7 +21,8 @@ formats can be added as frontends.
   continues a file after a broken connection where the server allows
 - Resolves dependencies pacman-style (versioned dependencies, provides,
   conflicts)
-- No install scripts or hooks yet
+- No install scripts or hooks yet; `skl run` runs a program in an image,
+  sandboxed with bubblewrap
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
 - Archives and repo databases are parsed and images filled by worker
@@ -42,8 +43,12 @@ skl repo add core "$mirror"
 skl repo add extra "$mirror"
 skl sync
 skl build --fetch --repo core --repo extra -o image filesystem bash coreutils
-unshare -r chroot image /usr/bin/bash
+skl run image bash
 ```
+
+`skl run` runs the program as root in the image, without network or a
+view of the host. When skl isn't root, changing owners to other ids fails
+there.
 
 `build` takes package names (`NAME`, or `REPO/NAME` for a package from
 one repo) and uses the repos given with `--repo`, in priority order. It

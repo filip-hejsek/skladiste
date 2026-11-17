@@ -3,6 +3,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
+use std::os::fd::AsFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -30,7 +32,7 @@ use skladiste::worker::{self, Downloaded, Request, Sink, Workers};
 struct Cli {
     /// Store directory (must be on the same btrfs filesystem as images).
     #[arg(long, env = "SKL_STORE")]
-    store: PathBuf,
+    store: Option<PathBuf>,
 
     /// Arch keyring to verify package signatures with, as the path without
     /// suffix: PREFIX.gpg, PREFIX-trusted and PREFIX-revoked are read.
@@ -111,6 +113,26 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Run a program in an image, as root, sandboxed with bubblewrap.
+    ///
+    /// The program sees only the image, read-write, with a read-only /proc,
+    /// basic devices in /dev, and empty tmpfs on /tmp and /run. It has no
+    /// network and can't see host processes. When skl runs as root, the
+    /// program keeps only the capabilities to change files' owners and
+    /// permissions; otherwise it runs in a new user namespace that maps
+    /// skl's uid and gid to root, and changing owners to other ids fails.
+    /// The environment holds only PATH and PWD. skl exits with the
+    /// program's exit code.
+    Run {
+        /// Root directory of the image.
+        image: PathBuf,
+        /// Program to run, searched in the image's PATH unless it contains
+        /// a slash.
+        program: OsString,
+        /// Arguments of the program.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Download the databases of repos.
     ///
     /// Every version is kept; builds use the latest. Repos synced together
@@ -147,7 +169,7 @@ fn main() -> ExitCode {
         return worker::main(args);
     }
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:?}");
             ExitCode::FAILURE
@@ -155,7 +177,26 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
+    if let Command::Run {
+        image,
+        program,
+        args,
+    } = &cli.command
+    {
+        let dir = File::open(image).with_context(|| format!("opening {}", image.display()))?;
+        ensure!(
+            dir.metadata()?.is_dir(),
+            "{} is not a directory",
+            image.display()
+        );
+        let status = skladiste::run::run(dir.as_fd(), program, args)?;
+        let code = status
+            .code()
+            .or_else(|| status.signal().map(|s| 128 + s))
+            .unwrap_or(1);
+        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+    }
     let mut workers = Workers::new("/proc/self/exe");
     #[cfg(feature = "insecure")]
     {
@@ -175,7 +216,11 @@ fn run(cli: Cli) -> Result<()> {
             .with_context(|| format!("loading root certificates from {}", path.display()))?;
         workers.set_root_certs(roots);
     }
-    let store = Store::open(&cli.store)?;
+    let store = cli
+        .store
+        .as_deref()
+        .context("no store given (--store or SKL_STORE)")?;
+    let store = Store::open(store)?;
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
     let keyring = || -> Result<Keyring> {
         let prefix = cli
@@ -269,8 +314,9 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Sync { repos } => sync(&workers, &store, repos, jobs)?,
+        Command::Run { .. } => unreachable!("handled above"),
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Download the databases of `repos` (all if empty), and record the new

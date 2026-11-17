@@ -572,6 +572,22 @@ are in BUGS.md.
   setting up namespaces ourselves; no clear benefit for more code. Workers
   running skl's own code also start under bubblewrap and add Landlock and
   seccomp themselves.
+- Package code runs with `skl::run` (`skl run IMAGE PROGRAM...`): bwrap
+  with the image fd bound read-write as `/`, new pid, net, ipc, uts and
+  cgroup namespaces, a read-only `/proc`, bwrap's minimal `/dev`, tmpfs on
+  `/tmp` and `/run` (not kept in the image), no `/sys`, the environment
+  only `PATH` (and `PWD`, set by bwrap). It runs as root with the install
+  worker's capabilities: when skl is root, in the supervisor's user
+  namespace (owners mean the same as outside); otherwise in a new user
+  namespace mapping skl's ids to 0. `/proc` is read-only because uid 0
+  of the host's user namespace can write sysctls without capabilities,
+  and bwrap doesn't cover `/proc/sys` (it checks `access(W_OK)`, which
+  fails on the 0555 directory without `CAP_DAC_OVERRIDE`). bwrap's
+  `--disable-userns` needs a new user namespace, so a seccomp filter
+  given to bwrap (`--add-seccomp-fd`) makes `unshare` and `clone` with
+  `CLONE_NEWUSER` fail with `EPERM`, and `clone3` with `ENOSYS` (its
+  flags are behind a pointer; libc falls back to `clone`); x32 numbers
+  are listed too. Otherwise package code has no seccomp filter.
 - If a sandboxing layer is unavailable, skl refuses to run. The escape
   hatch is the `insecure` cargo feature (off by default), which adds
   `--insecure-no-namespaces` (workers run without bwrap and get their

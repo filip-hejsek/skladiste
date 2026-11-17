@@ -46,8 +46,8 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, ExitStatus};
 use std::time::Duration;
@@ -288,19 +288,7 @@ impl Workers {
             .stdin(stdin)
             .stdout(stdout)
             .stderr(stderr_w);
-        // SAFETY: fcntl is async-signal-safe, and only the child's fd table
-        // is changed.
-        unsafe {
-            cmd.pre_exec(move || {
-                for &fd in &raw {
-                    rustix::io::fcntl_setfd(
-                        BorrowedFd::borrow_raw(fd),
-                        rustix::io::FdFlags::empty(),
-                    )?;
-                }
-                Ok(())
-            });
-        }
+        bwrap::inherit(&mut cmd, raw);
         let child = cmd
             .spawn()
             .with_context(|| format!("starting {kind} worker ({})", self.exe.display()))?;

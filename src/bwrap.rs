@@ -6,8 +6,11 @@
 //! in [`Namespaces`], bound from fds. It gets new pid, network, ipc, uts and
 //! cgroup namespaces, and a new user namespace unless it must keep the
 //! supervisor's ids (see [`Namespaces::root_caps`]).
+//!
+//! [`image_command`] runs package code instead: the root is an image.
 
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,17 +64,8 @@ pub(crate) fn command(
     exe: BorrowedFd,
     ns: &Namespaces,
 ) -> Result<(Command, Vec<RawFd>)> {
-    let mut cmd = Command::new(bwrap);
+    let mut cmd = new_namespaces(bwrap);
     let mut fds = vec![exe.as_raw_fd()];
-    cmd.args([
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup-try",
-        "--die-with-parent",
-        "--new-session",
-    ]);
     let root = rustix::process::getuid().is_root();
     match ns.root_caps {
         Some(caps) if root => {
@@ -116,6 +110,97 @@ pub(crate) fn command(
     Ok((cmd, fds))
 }
 
+/// A command that runs `bwrap` with the directory `image` (an fd) as the
+/// root, read-write, and executes the arguments appended to it there
+/// (searched in the `PATH` given to bwrap). `filters` are seccomp programs
+/// for the process to load (fds of a file or pipe holding raw BPF). The
+/// child must inherit `image` and `filters` (see [`inherit`]).
+///
+/// New pid, net, ipc, uts and cgroup namespaces, as for workers. The
+/// process runs as root with only `caps`: when skl runs as root, in the
+/// supervisor's user namespace, so that the image's owners mean the same
+/// inside; otherwise in a new user namespace that maps skl's uid and gid
+/// to 0. `/proc` (for the new pid namespace) is read-only, since root in
+/// the host's user namespace can write sysctls in `/proc/sys`, and
+/// bwrap's cover over it is skipped for lack of write access to the
+/// directory. `/dev` has only the basic devices; `/tmp` and `/run` are
+/// tmpfs, so their contents aren't kept in the image. Missing mount
+/// points are created in the image. No `/sys`.
+pub(crate) fn image_command(
+    bwrap: &Path,
+    image: BorrowedFd,
+    caps: &[&str],
+    filters: &[BorrowedFd],
+) -> Command {
+    let mut cmd = new_namespaces(bwrap);
+    if rustix::process::getuid().is_root() {
+        cmd.args(["--cap-drop", "ALL"]);
+    } else {
+        cmd.args([
+            "--unshare-user",
+            "--disable-userns",
+            "--uid",
+            "0",
+            "--gid",
+            "0",
+        ]);
+    }
+    for cap in caps {
+        cmd.args(["--cap-add", cap]);
+    }
+    for fd in filters {
+        cmd.arg("--add-seccomp-fd").arg(fd_arg(*fd));
+    }
+    cmd.arg("--bind-fd").arg(fd_arg(image));
+    cmd.args([
+        "/",
+        "--proc",
+        "/proc",
+        "--remount-ro",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/run",
+        "--chdir",
+        "/",
+        "--",
+    ]);
+    cmd
+}
+
+/// Make the child of `cmd` inherit `fds` under their numbers, by clearing
+/// CLOEXEC on them between fork and exec.
+pub(crate) fn inherit(cmd: &mut Command, fds: Vec<RawFd>) {
+    // SAFETY: fcntl is async-signal-safe, and only the child's fd table is
+    // changed.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &fds {
+                rustix::io::fcntl_setfd(BorrowedFd::borrow_raw(fd), rustix::io::FdFlags::empty())?;
+            }
+            Ok(())
+        });
+    }
+}
+
+/// `bwrap` with new namespaces other than the user namespace.
+fn new_namespaces(bwrap: &Path) -> Command {
+    let mut cmd = Command::new(bwrap);
+    cmd.args([
+        "--unshare-pid",
+        "--unshare-net",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--die-with-parent",
+        "--new-session",
+    ]);
+    cmd
+}
+
 fn fd_arg(fd: BorrowedFd) -> String {
     fd.as_raw_fd().to_string()
 }
@@ -124,7 +209,6 @@ fn fd_arg(fd: BorrowedFd) -> String {
 mod tests {
     use std::fs::File;
     use std::os::fd::AsFd;
-    use std::os::unix::process::CommandExt;
 
     use super::*;
 
@@ -168,18 +252,7 @@ mod tests {
         ])
         .env_clear()
         .env(CHILD_VAR, "1");
-        // SAFETY: fcntl is async-signal-safe.
-        unsafe {
-            cmd.pre_exec(move || {
-                for &fd in &fds {
-                    rustix::io::fcntl_setfd(
-                        BorrowedFd::borrow_raw(fd),
-                        rustix::io::FdFlags::empty(),
-                    )?;
-                }
-                Ok(())
-            });
-        }
+        inherit(&mut cmd, fds);
         let status = cmd.status().unwrap();
         assert!(status.success(), "child {status}");
         assert_eq!(std::fs::read(rw.path().join("new")).unwrap(), b"y");
