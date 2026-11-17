@@ -6,12 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry as MapEntry;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::BufReader;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::path::Path;
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use landlock::AccessFs;
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, ResolveFlags, Timespec, Timestamps, Uid, XattrFlags};
 use rustix::io::Errno;
@@ -87,23 +88,29 @@ pub struct Report {
     pub xattr_failures: u64,
 }
 
-/// Create a new subvolume at `target` and install `packages` into it. The
-/// files are installed by a worker that can access only the store and the
-/// new subvolume.
+/// Create a new subvolume named `name` in the directory `parent` and
+/// install `packages` into it. The files are installed by a worker that
+/// can access only the store and the new subvolume.
 pub fn build(
     workers: &Workers,
     store: &Store,
     packages: &[Package],
-    target: &Path,
+    parent: BorrowedFd,
+    name: &OsStr,
 ) -> Result<Report> {
+    ensure!(
+        !name.is_empty() && name != "." && name != ".." && !name.as_bytes().contains(&b'/'),
+        "bad subvolume name {name:?}"
+    );
     let plan: Vec<&Entry> = merge(packages)?.into_values().collect();
-    btrfs::create_subvolume(target)?;
-    let root = rustix::fs::open(
-        target,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+    btrfs::create_subvolume_at(parent, name).context("creating subvolume")?;
+    let root = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .with_context(|| format!("opening {}", target.display()))?;
+    .context("opening the new subvolume")?;
     populate_in_worker(workers, store, &plan, &root)
 }
 

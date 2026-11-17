@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroUsize;
 use std::os::fd::FromRawFd;
 use std::time::SystemTime;
 
@@ -94,6 +95,81 @@ impl Config {
     pub fn package_url(&self, file_name: &str) -> Result<Url> {
         Url::parse(&format!("{}/{file_name}", self.base()))
     }
+}
+
+/// Add the Arch repo `name` with `server` (see [`Config::server`]) and the
+/// database `db` (see [`Config::db`]; `name` if `None`).
+pub fn add(store: &Store, name: &str, server: &str, db: Option<&str>) -> Result<()> {
+    repo::check_name(name)?;
+    let config = Config::new(server, db.unwrap_or(name))?;
+    store.add_repo(&repo_id(name)?, &config)
+}
+
+/// The ids of the configured Arch repos, sorted.
+pub fn list(store: &Store) -> Result<Vec<String>> {
+    let mut ids = store.repos()?;
+    ids.retain(|id| repo::split_id(id).is_ok_and(|(f, _)| f == FORMAT));
+    Ok(ids)
+}
+
+/// A repo's new version, recorded by [`sync`].
+pub struct Synced {
+    /// The repo's id.
+    pub repo: String,
+    pub record: SyncRecord,
+    /// Number of packages in the database.
+    pub packages: usize,
+}
+
+/// Download the databases of the repos with ids `repos` (all Arch repos if
+/// empty), up to `jobs` at once, and record the new versions once all of
+/// them were downloaded and read. Returns them in the order of `repos`.
+pub fn sync(
+    workers: &Workers,
+    store: &Store,
+    repos: Vec<String>,
+    jobs: NonZeroUsize,
+) -> Result<Vec<Synced>> {
+    let repos = if repos.is_empty() {
+        list(store)?
+    } else {
+        repos
+    };
+    if repos.is_empty() {
+        bail!("no repos (add one with `skl arch repo add`)");
+    }
+    let configs = repos
+        .iter()
+        .map(|name| store.repo_config(name))
+        .collect::<Result<Vec<Config>>>()?;
+    let requests = configs.iter().map(db_request).collect::<Result<Vec<_>>>()?;
+    let urls: Vec<Url> = requests.iter().map(|r| r.url.clone()).collect();
+    let mut synced = download::fetch_and_run(
+        workers,
+        jobs,
+        Vec::new(),
+        requests,
+        |i, data, downloaded| {
+            let record = db_record(store, &urls[i], &data, downloaded)?;
+            Ok(Some((i, record)))
+        },
+        |(i, record)| {
+            let entries = load_db(workers, store, &record)?;
+            Ok((i, record, entries.len()))
+        },
+    )?;
+    synced.sort_by_key(|&(i, ..)| i);
+    synced
+        .into_iter()
+        .map(|(i, record, packages)| {
+            store.save_sync(&repos[i], &record)?;
+            Ok(Synced {
+                repo: repos[i].clone(),
+                record,
+                packages,
+            })
+        })
+        .collect()
 }
 
 /// A repo's latest snapshot: its database as last synced.

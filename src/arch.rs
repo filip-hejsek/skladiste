@@ -19,6 +19,7 @@ use crate::sandbox::{self, Policy};
 use crate::store::{ObjectSink, Store};
 use crate::worker::{self, Args, ImportStats, Kind, NO_CAPS, RemoteSink, Workers};
 
+pub mod packages;
 pub mod repo;
 pub mod signature;
 pub mod verify;

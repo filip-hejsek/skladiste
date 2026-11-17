@@ -46,7 +46,8 @@ pub fn create_subvolume(path: &Path) -> Result<()> {
         .with_context(|| format!("creating subvolume {}", path.display()))
 }
 
-fn create_subvolume_at(parent: impl AsFd, name: &OsStr) -> Result<()> {
+/// Create a new subvolume named `name` in the directory `parent`.
+pub fn create_subvolume_at(parent: impl AsFd, name: &OsStr) -> Result<()> {
     vol_ioctl::<SUBVOL_CREATE>(parent.as_fd(), 0, name)
 }
 

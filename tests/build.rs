@@ -2,6 +2,7 @@
 //! Skipped when the cargo target directory is not on btrfs.
 
 use std::fs::{self, File};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -86,6 +87,13 @@ fn workers() -> Workers {
     Workers::new(env!("CARGO_BIN_EXE_skl"))
 }
 
+/// Build the image `img`, whose parent directory exists.
+fn build(store: &Store, pkgs: &[Package], img: &Path) -> anyhow::Result<install::Report> {
+    let parent = File::open(img.parent().unwrap()).unwrap();
+    let name = img.file_name().unwrap();
+    install::build(&workers(), store, pkgs, parent.as_fd(), name)
+}
+
 fn import(store: &Store, path: &Path) -> Package {
     arch::import_in_worker(&workers(), store, File::open(path).unwrap())
         .unwrap()
@@ -132,7 +140,7 @@ fn build_image() {
     assert_eq!(stats.new_objects, 3, "identical files share one object");
 
     let img = tmp.path().join("img");
-    let report = install::build(&workers(), &store, &[base, tools], &img).unwrap();
+    let report = build(&store, &[base, tools], &img).unwrap();
     assert_eq!(report.files, 4);
     assert_eq!(report.hardlinks, 1);
     assert_eq!(report.xattr_failures, 0);
@@ -165,7 +173,7 @@ fn conflicting_files_are_rejected() {
     let a = make_package(tmp.path(), "a", &[Item::File("f", 0o644, b"a")]);
     let b = make_package(tmp.path(), "b", &[Item::File("f", 0o644, b"b")]);
     let pkgs = [import(&store, &a), import(&store, &b)];
-    let err = install::build(&workers(), &store, &pkgs, &tmp.path().join("img")).unwrap_err();
+    let err = build(&store, &pkgs, &tmp.path().join("img")).unwrap_err();
     assert!(err.to_string().contains("conflict: /f"), "{err}");
 }
 

@@ -31,7 +31,13 @@ are in BUGS.md.
 - Code: `src/main.rs` has the global options and core commands,
   `src/cli.rs` helpers shared by commands, `src/cli/<frontend>.rs` a
   frontend's commands (under `cli/`, since `mod arch` in `main.rs` would
-  be the library's `src/arch.rs`).
+  be the library's `src/arch.rs`). The CLI parses arguments, opens paths
+  and prints; what the commands do is in the library (e.g.
+  `arch::packages`, `arch::repo`), which reports progress through a
+  callback (`arch::packages::Event`) rather than printing. Package files
+  given by path reach the library as a function that opens them, so that
+  only those being imported are open (one fd each would exceed the
+  usual limit of 1024 for large imports).
 
 ## Store
 
@@ -287,8 +293,8 @@ are in BUGS.md.
   between) the download fails. A read or write that times out counts
   as a connection that ended. A connection that can't be opened fails
   the download at once, as before. Other limits are open (WORKERS.md).
-- The download stage runs next to the import jobs (`fetch_and_run` in
-  `src/main.rs`) instead of within them. The thread of an origin checks
+- The download stage runs next to the import jobs
+  (`download::fetch_and_run`) instead of within them. The thread of an origin checks
   each finished file (size and SHA-256 from the database, then the
   signature), keeps it in the store's downloads and hands the open file
   to the jobs, which take finished downloads before archives that were
