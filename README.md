@@ -15,8 +15,9 @@ formats can be added as frontends.
   each package's signature (`.sig` next to it) against the Arch keyring:
   the signing key must be certified by at least 3 of the master keys
 - Builds a new image subvolume from a list of package names, looked up
-  in repos and among package files imported before (`skl import`)
-- Keeps Arch repo databases (`skl repo add`, `skl sync`), every version
+  in repos and among package files imported before (`skl arch import`)
+- Keeps Arch repo databases (`skl arch repo add`, `skl arch sync`), every
+  version
 - Downloads over one connection per server, kept open between files, and
   continues a file after a broken connection where the server allows
 - Resolves dependencies pacman-style (versioned dependencies, provides,
@@ -39,10 +40,10 @@ The store and images must be on the same btrfs filesystem.
 export SKL_STORE=/path/on/btrfs/store
 export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
-skl repo add core "$mirror"
-skl repo add extra "$mirror"
-skl sync
-skl build --fetch --repo core --repo extra -o image filesystem bash coreutils
+skl arch repo add core "$mirror"
+skl arch repo add extra "$mirror"
+skl arch sync
+skl arch build --fetch --repo core --repo extra -o image filesystem bash coreutils
 skl run image bash
 ```
 
@@ -51,19 +52,22 @@ view of the host. When skl isn't root, changing owners to other ids fails
 there. Afterwards it lists what the program added, modified and removed,
 found by comparing the image with a snapshot taken before.
 
-`build` takes package names (`NAME`, or `REPO/NAME` for a package from
+Commands for Arch packages are under `skl arch`; `skl run` and the
+store work for images of any format.
+
+`skl arch build` takes package names (`NAME`, or `REPO/NAME` for a package from
 one repo) and uses the repos given with `--repo`, in priority order. It
 uses the network only when asked: `--sync` downloads the repos'
-databases first (as `skl sync`), and `--fetch` downloads packages that
-aren't in the store yet.
+databases first (as `skl arch sync`), and `--fetch` downloads packages
+that aren't in the store yet.
 
 Package files and URLs (with their signatures as `.sig` next to them)
 are imported in a step of their own, and are then available to builds as
 the repo `@local`:
 
 ```sh
-skl import ./mypkg-1.0-1-x86_64.pkg.tar.zst
-skl build --fetch --repo @local --repo core --repo extra -o image mypkg
+skl arch import ./mypkg-1.0-1-x86_64.pkg.tar.zst
+skl arch build --fetch --repo @local --repo core --repo extra -o image mypkg
 ```
 
 HTTPS servers are checked against the Mozilla root certificates built

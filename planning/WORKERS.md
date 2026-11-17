@@ -87,7 +87,7 @@ needed so far: the status mailbox.
     the bytes it had. The flag comes with the download: a file whose
     content is known beforehand (a package, by the hash in its repo's
     database) fails, as another version can't be the one wanted;
-    databases and URLs given to `skl import` start again. A server
+    databases and URLs given to `skl arch import` start again. A server
     that can't continue downloads looks the same and gets the same.
   - Without a validator, or when resuming fails (a `416`, or a `206`
     that doesn't fit), the file is fetched again from the beginning,

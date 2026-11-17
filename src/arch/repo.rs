@@ -90,9 +90,9 @@ impl Snapshot {
     /// Load the latest snapshot of `repo`, which must have been synced.
     pub fn load(workers: &Workers, store: &Store, repo: &str) -> Result<Snapshot> {
         let config: Config = store.repo_config(repo)?;
-        let record = store
-            .latest_sync(repo)?
-            .with_context(|| format!("repo {repo} was never synced (run `skl sync {repo}`)"))?;
+        let record = store.latest_sync(repo)?.with_context(|| {
+            format!("repo {repo} was never synced (run `skl arch sync {repo}`)")
+        })?;
         let entries = load_db(workers, store, &record)?;
         Ok(Snapshot {
             repo: repo.to_owned(),

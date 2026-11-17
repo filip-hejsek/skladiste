@@ -19,6 +19,20 @@ are in BUGS.md.
   frontends (`src/arch.rs`) that produce a `manifest::Package`.
 - Written in Rust.
 
+## CLI
+
+- Commands of a package format are under a subcommand named for its
+  frontend (`skl arch import|build|repo|sync`); format-independent ones
+  (`skl run`) are at the top level. Options only a frontend uses
+  (`--keyring`) are its subcommand's. Rejected: flat commands (`skl
+  build`), which give the generic verbs to Arch; core verbs that
+  dispatch to a frontend by the repo's format, premature with one
+  frontend (and a build can't mix formats).
+- Code: `src/main.rs` has the global options and core commands,
+  `src/cli.rs` helpers shared by commands, `src/cli/<frontend>.rs` a
+  frontend's commands (under `cli/`, since `mod arch` in `main.rs` would
+  be the library's `src/arch.rs`).
+
 ## Store
 
 - Objects are addressed by the BLAKE3 hash of their content: a modern
@@ -71,12 +85,12 @@ are in BUGS.md.
   letters, digits and `._+-`; names starting with `@` are kept for
   pseudo-repos.
 - Configuration is in the store, `repos/<name>/config.json`, written by
-  `skl repo add NAME SERVER [--db DB]`. For Arch: a URL template in the
+  `skl arch repo add NAME SERVER [--db DB]`. For Arch: a URL template in the
   format of pacman's `Server` (`…/$repo/os/$arch`, `$arch` is always
   `x86_64`) and the remote database name (`core` for `core.db`; default
   the repo's name). The store doesn't interpret it; frontend-specific
   configuration may move out of the store later.
-- `skl sync` downloads each repo's database with the download stage
+- `skl arch sync` downloads each repo's database with the download stage
   (see Downloads; at most 64 MiB, held in memory) and keeps every
   version: the database
   as a store object, and a record `repos/<repo>/syncs/<time>.json` with
@@ -102,7 +116,7 @@ are in BUGS.md.
   version character sets, the entry's directory is `NAME-VERSION`, no
   duplicate names, `FILENAME` a plain file name, the hash 64 hex digits,
   the signature at most `MAX_SIGNATURE_SIZE`, dependencies printable
-  ASCII. `skl sync` reads each database before recording it.
+  ASCII. `skl arch sync` reads each database before recording it.
 - gzip with `flate2` and its default pure-Rust backend (`miniz_oxide`);
   5 crates added to `Cargo.lock`.
 - Databases are parsed on every use, not cached. `extra.db` (15,279
@@ -125,7 +139,7 @@ are in BUGS.md.
   install any file, so limiting which names a repo may provide would
   protect nothing. A package named twice is taken once.
 - `build` uses the network only when asked: `--sync` syncs the `--repo`
-  repos first (as `skl sync` with those repos), `--fetch` downloads
+  repos first (as `skl arch sync` with those repos), `--fetch` downloads
   packages that aren't in the store's downloads; without it, a missing
   package is an error.
 - Package files and URLs are imported in a step of their own (`skl
@@ -194,7 +208,7 @@ are in BUGS.md.
 
 ## Downloads
 
-- `skl import` takes `http` or `https` URLs as well as files; the
+- `skl arch import` takes `http` or `https` URLs as well as files; the
   signature is the same URL with `.sig` appended.
 - The supervisor resolves the host (`getaddrinfo`, not sandboxed, like
   any program's name lookup) and opens the TCP connection; the download
@@ -253,7 +267,7 @@ are in BUGS.md.
   opaque to it (at most 256 printable ASCII characters). If the server
   has another version by then (it answers `200`), packages from a
   repo's snapshot fail, as the database says by SHA-256 what the file
-  is; databases and URLs given to `skl import` are downloaded again
+  is; databases and URLs given to `skl arch import` are downloaded again
   from the beginning. Details and reasons are in WORKERS.md.
 - Limits: a connection that neither completes a file nor gets the file
   under way further than any connection before is a strike. The next
@@ -270,7 +284,7 @@ are in BUGS.md.
   there already. At most 64 files wait for a job (each is an open fd);
   then the thread blocks and its worker stalls, which is the wanted
   back-pressure. A download's file is created when its body starts, so
-  queued downloads hold no fd. `skl sync` uses the same stage: the
+  queued downloads hold no fd. `skl arch sync` uses the same stage: the
   jobs read the databases.
 - After a failure anywhere, no new download or import starts. A
   download whose body has started is finished and kept; then its worker

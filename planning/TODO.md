@@ -10,14 +10,14 @@ Next priorities: install scripts and hooks.
 - `@local` can't be managed: no command lists or removes imported
   packages, and a build can't choose an older version of a name except
   through a versioned dependency.
-- `skl import` doesn't check a package's architecture (`arch` in
+- `skl arch import` doesn't check a package's architecture (`arch` in
   `.PKGINFO`).
 - A command to download a build's packages without building.
 - The resolver doesn't search: like pacman, it takes the first package
   that fits each dependency and reports a conflict rather than trying
   another choice.
 - `REPLACES` is read but not used; it matters for upgrades.
-- Conditional requests in `skl sync` (`If-None-Match` with the recorded
+- Conditional requests in `skl arch sync` (`If-None-Match` with the recorded
   `ETag`, else `If-Modified-Since`; 304): each sync downloads the whole
   database now (`extra.db` is 8.7 MiB).
 - Manage the keyring in skl (from the `archlinux-keyring` package,
@@ -67,7 +67,7 @@ Next priorities: install scripts and hooks.
   support HTTP proxies.
 - Run `.INSTALL` scriptlets and alpm hooks inside the image, with
   `run::run_captured`, which also finds what they changed (see Changes by
-  package code in DECISIONS.md). Next: run them in `skl build` and record
+  package code in DECISIONS.md). Next: run them in `skl arch build` and record
   their changes with the image (see Images). Output of package code should go to the
   user escaped, as workers' stderr does; `skl run` passes the terminal
   through.
@@ -88,6 +88,10 @@ Next priorities: install scripts and hooks.
   full uid range in a user namespace (needs uids and capabilities
   granted to the container), or record ownership in the manifest only
   and apply it on export.
+- Split building into a frontend step that works out what an image
+  contains (a spec: the packages' manifests, later what install scripts
+  need) and a format-independent step that builds an image from a spec.
+  `build` may then become a core verb (see CLI in DECISIONS.md).
 - Export to OCI images, or use podman's btrfs storage driver directly.
 - Upgrades and generations using subvolume snapshots, with rollback.
 

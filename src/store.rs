@@ -324,7 +324,7 @@ impl Store {
     pub fn repo_config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
         repo::check_name(name)?;
         self.read_json(&format!("repos/{name}/config.json"))?
-            .with_context(|| format!("no repo {name} (add it with `skl repo add`)"))
+            .with_context(|| format!("no repo {name} (add it with `skl arch repo add`)"))
     }
 
     /// Names of the configured repos, sorted.

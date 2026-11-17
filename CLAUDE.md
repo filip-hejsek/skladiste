@@ -42,22 +42,22 @@ dir=tmp  # any directory on btrfs
 export SKL_STORE=$dir/store SKL_KEYRING=/usr/share/pacman/keyrings/archlinux
 skl() { cargo run -q --release -- "$@"; }
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
-skl repo add core "$mirror" && skl repo add extra "$mirror"  # once
+skl arch repo add core "$mirror" && skl arch repo add extra "$mirror"  # once
 # 42 packages with dependencies, downloaded into the store's downloads/.
-skl build --sync --fetch --repo core --repo extra -o $dir/img filesystem bash coreutils
+skl arch build --sync --fetch --repo core --repo extra -o $dir/img filesystem bash coreutils
 unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img
 ```
 
-For importing package files (`skl import FILE...`, then `skl build
+For importing package files (`skl arch import FILE...`, then `skl arch build
 --repo @local`), `scripts/fetch-arch-packages.sh $dir/pkgs filesystem
 bash coreutils` downloads the packages and their dependencies (ignoring
 versions) and prints their paths; with `--urls` it prints their URLs
 instead.
 
-Without root, chown to other users fails; `skl build` reports how many
+Without root, chown to other users fails; `skl arch build` reports how many
 entries kept the wrong owner. This is expected. If you have subordinate
-uids and gids (`/etc/subuid`, `/etc/subgid`), run `skl build` under
+uids and gids (`/etc/subuid`, `/etc/subgid`), run `skl arch build` under
 `unshare --map-auto --map-root-user` so owners are applied; the image then
 contains files owned by those ids, so remove it the same way
 (`unshare --map-auto --map-root-user rm -rf $dir/img`).
