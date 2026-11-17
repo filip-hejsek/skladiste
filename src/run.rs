@@ -25,7 +25,7 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::btrfs;
 use crate::bwrap;
-use crate::diff::Change;
+use crate::diff::{self, Change};
 use crate::sandbox;
 use crate::store::Store;
 use crate::worker::{ImportStats, Workers};
@@ -107,9 +107,8 @@ pub fn run_captured(
     let snapshot = Snapshot::new(store, image)?;
     wait_for_coarse_clock();
     let status = run(image, program, args)?;
-    let (changes, stats) = workers
-        .diff(store, snapshot.dir(), image)
-        .context("finding changes")?;
+    let (changes, stats) =
+        diff::diff_in_worker(workers, store, snapshot.dir(), image).context("finding changes")?;
     let snapshot_removal = snapshot.remove()?;
     Ok(Captured {
         status,

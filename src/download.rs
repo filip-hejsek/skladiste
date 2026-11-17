@@ -1,5 +1,5 @@
-//! The download worker, and the download stage that runs one worker per
-//! origin.
+//! Downloads, and the worker that does them: [`download_all`] runs one
+//! worker per origin.
 //!
 //! A download worker serves one origin (scheme, host and port) over one
 //! connection, which the supervisor opened: fd 0 is that TCP connection,
@@ -39,13 +39,13 @@ use rustls::pki_types::CertificateDer;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::{
-    BUF_SIZE, CHUNK, DONE, ERROR, MAX_CHUNK, MAX_ERROR, WorkerError, Workers, read_error,
-    read_header, read_payload, sanitize, write_frame,
-};
 use crate::http::{self, Connection, End, Event, Origin, Resume, RootCerts, Start, Url};
 use crate::jobs::par_map_iter;
-use crate::sandbox::{self, Layers, Policy};
+use crate::sandbox::{self, Policy};
+use crate::worker::{
+    self, Args, BUF_SIZE, CHUNK, DONE, ERROR, Kind, MAX_CHUNK, MAX_ERROR, NO_CAPS, WorkerError,
+    Workers, read_error, read_header, read_payload, sanitize, write_frame,
+};
 
 const CERT: u8 = 5;
 const ITEM: u8 = 6;
@@ -77,6 +77,14 @@ const MAX_STRIKES: u32 = 3;
 
 /// Longest `Last-Modified` value kept from a worker.
 const MAX_LAST_MODIFIED: usize = 100;
+/// The worker; see the module documentation.
+pub(crate) const DOWNLOAD_WORKER: Kind = Kind {
+    name: "download",
+    dirs: &[],
+    caps: NO_CAPS,
+    main: worker,
+};
+
 /// Longest `ETag` value kept from a worker.
 const MAX_ETAG: usize = 256;
 
@@ -311,160 +319,157 @@ fn gone(e: io::Error) -> anyhow::Error {
     anyhow::Error::new(e).context(Gone)
 }
 
-impl Workers {
-    /// Download `requests` in workers, and call `done` with each one's
-    /// index, sink and result when it is complete.
-    ///
-    /// Files of one origin (scheme, host and port) are downloaded one
-    /// after another, in the order given, over one connection, by one
-    /// worker; up to `jobs` origins at once. The connections are opened
-    /// here and handed to the workers, which have no network access of
-    /// their own. When a connection ends before its files are done, a new
-    /// one continues, also in the middle of a file where the server
-    /// allows; an origin whose connections keep ending without progress
-    /// is given up. Redirects are not followed.
-    ///
-    /// `done` runs on the thread that serves the file's origin, which
-    /// downloads nothing meanwhile.
-    ///
-    /// `failed` is shared with whatever else works on the same task: once
-    /// it is set, here or elsewhere, no more downloads start, and the
-    /// ones under way are finished. This returns an error only for
-    /// failures of its own.
-    pub fn download_all<S: Sink>(
-        &self,
-        requests: Vec<Request<S>>,
-        jobs: NonZeroUsize,
-        failed: &AtomicBool,
-        done: impl Fn(usize, S, Downloaded) -> Result<()> + Sync,
-    ) -> Result<()> {
-        let mut origins: Vec<(Origin, VecDeque<Job<S>>)> = Vec::new();
-        for (index, request) in requests.into_iter().enumerate() {
-            let origin = &request.url.origin;
-            let queue = match origins.iter().position(|(o, _)| o == origin) {
-                Some(i) => &mut origins[i].1,
-                None => {
-                    origins.push((origin.clone(), VecDeque::new()));
-                    &mut origins.last_mut().unwrap().1
-                }
-            };
-            queue.push_back(Job::new(index, request));
-        }
-        par_map_iter(origins.into_iter(), jobs, failed, |(origin, queue)| {
-            self.download_from(&origin, queue, failed, &done)
-        })?;
-        Ok(())
-    }
-
-    /// Download `url` in a worker into `sink`, failing if it is longer
-    /// than `max_size`. See [`Workers::download_all`].
-    pub fn download<S: Sink>(&self, url: &Url, sink: S, max_size: u64) -> Result<(S, Downloaded)> {
-        let request = Request {
-            url: url.clone(),
-            max_size,
-            restart_if_changed: true,
-            sink,
+/// Download `requests` in workers, and call `done` with each one's
+/// index, sink and result when it is complete.
+///
+/// Files of one origin (scheme, host and port) are downloaded one
+/// after another, in the order given, over one connection, by one
+/// worker; up to `jobs` origins at once. The connections are opened
+/// here and handed to the workers, which have no network access of
+/// their own. When a connection ends before its files are done, a new
+/// one continues, also in the middle of a file where the server
+/// allows; an origin whose connections keep ending without progress
+/// is given up. Redirects are not followed.
+///
+/// `done` runs on the thread that serves the file's origin, which
+/// downloads nothing meanwhile.
+///
+/// `failed` is shared with whatever else works on the same task: once
+/// it is set, here or elsewhere, no more downloads start, and the
+/// ones under way are finished. This returns an error only for
+/// failures of its own.
+pub fn download_all<S: Sink>(
+    workers: &Workers,
+    requests: Vec<Request<S>>,
+    jobs: NonZeroUsize,
+    failed: &AtomicBool,
+    done: impl Fn(usize, S, Downloaded) -> Result<()> + Sync,
+) -> Result<()> {
+    let mut origins: Vec<(Origin, VecDeque<Job<S>>)> = Vec::new();
+    for (index, request) in requests.into_iter().enumerate() {
+        let origin = &request.url.origin;
+        let queue = match origins.iter().position(|(o, _)| o == origin) {
+            Some(i) => &mut origins[i].1,
+            None => {
+                origins.push((origin.clone(), VecDeque::new()));
+                &mut origins.last_mut().unwrap().1
+            }
         };
-        let result = Mutex::new(None);
-        let failed = AtomicBool::new(false);
-        self.download_all(
-            vec![request],
-            NonZeroUsize::MIN,
-            &failed,
-            |_, sink, downloaded| {
-                *result.lock().unwrap() = Some((sink, downloaded));
-                Ok(())
-            },
-        )?;
-        let result = result.into_inner().unwrap();
-        result.with_context(|| format!("downloading {url} didn't finish"))
+        queue.push_back(Job::new(index, request));
     }
+    par_map_iter(origins.into_iter(), jobs, failed, |(origin, queue)| {
+        download_from(workers, &origin, queue, failed, &done)
+    })?;
+    Ok(())
+}
 
-    /// Download the files in `queue`, all from `origin`, in order: over
-    /// one connection, and over further ones while they make progress.
-    fn download_from<S: Sink>(
-        &self,
-        origin: &Origin,
-        mut queue: VecDeque<Job<S>>,
-        failed: &AtomicBool,
-        done: &impl Fn(usize, S, Downloaded) -> Result<()>,
-    ) -> Result<()> {
-        let mut strikes = 0;
-        while !failed.load(Ordering::Relaxed) {
-            match self.connection(origin, &mut queue, failed, done)? {
-                Ended::Finished | Ended::Stopped => break,
-                Ended::Closed { progress: true, .. } => {}
-                Ended::Closed {
-                    progress: false,
-                    reason,
-                } => {
-                    // Not reset by the connections that get somewhere
-                    // in between.
-                    strikes += 1;
-                    if strikes == MAX_STRIKES {
-                        let url = &queue.front().context("no file is left")?.url;
-                        bail!(
-                            "downloading {url}: {reason} (giving up on {origin} \
-                             after {MAX_STRIKES} connections that got nothing)"
-                        );
-                    }
-                    std::thread::sleep(self.retry_delay * (1 << (strikes - 1)));
+/// Download `url` in a worker into `sink`, failing if it is longer
+/// than `max_size`. See [`download_all`].
+pub fn download<S: Sink>(
+    workers: &Workers,
+    url: &Url,
+    sink: S,
+    max_size: u64,
+) -> Result<(S, Downloaded)> {
+    let request = Request {
+        url: url.clone(),
+        max_size,
+        restart_if_changed: true,
+        sink,
+    };
+    let result = Mutex::new(None);
+    let failed = AtomicBool::new(false);
+    download_all(
+        workers,
+        vec![request],
+        NonZeroUsize::MIN,
+        &failed,
+        |_, sink, downloaded| {
+            *result.lock().unwrap() = Some((sink, downloaded));
+            Ok(())
+        },
+    )?;
+    let result = result.into_inner().unwrap();
+    result.with_context(|| format!("downloading {url} didn't finish"))
+}
+
+/// Download the files in `queue`, all from `origin`, in order: over
+/// one connection, and over further ones while they make progress.
+fn download_from<S: Sink>(
+    workers: &Workers,
+    origin: &Origin,
+    mut queue: VecDeque<Job<S>>,
+    failed: &AtomicBool,
+    done: &impl Fn(usize, S, Downloaded) -> Result<()>,
+) -> Result<()> {
+    let mut strikes = 0;
+    while !failed.load(Ordering::Relaxed) {
+        match connection(workers, origin, &mut queue, failed, done)? {
+            Ended::Finished | Ended::Stopped => break,
+            Ended::Closed { progress: true, .. } => {}
+            Ended::Closed {
+                progress: false,
+                reason,
+            } => {
+                // Not reset by the connections that get somewhere
+                // in between.
+                strikes += 1;
+                if strikes == MAX_STRIKES {
+                    let url = &queue.front().context("no file is left")?.url;
+                    bail!(
+                        "downloading {url}: {reason} (giving up on {origin} \
+                         after {MAX_STRIKES} connections that got nothing)"
+                    );
                 }
+                std::thread::sleep(workers.retry_delay() * (1 << (strikes - 1)));
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Open a connection to `origin` and run a worker on it for the files
-    /// in `queue`, until they are done or the connection ends. Files left
-    /// are back in `queue` then.
-    fn connection<S: Sink>(
-        &self,
-        origin: &Origin,
-        queue: &mut VecDeque<Job<S>>,
-        failed: &AtomicBool,
-        done: &impl Fn(usize, S, Downloaded) -> Result<()>,
-    ) -> Result<Ended> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-        let first = queue.front().context("no file to download")?;
-        let conn =
-            http::connect(origin, TIMEOUT).with_context(|| format!("downloading {}", first.url))?;
-        let (ours, theirs) = socketpair(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC,
-            None,
-        )
-        .context("creating socket")?;
-        let custom = self.roots.custom().filter(|_| origin.tls);
-        let name = origin.to_string();
-        let mut args = vec![&*name];
-        if custom.is_some() {
-            args.push("custom-roots");
-        }
-        let worker = self.spawn("download", conn.into(), theirs, &[], super::NO_CAPS, &args)?;
-        let sock = File::from(ours);
-        // The worker reads all certificates before it writes anything but
-        // an error, which then explains a failure to send them.
-        let sent = custom.map_or(Ok(()), |certs| send_certs(&sock, certs));
-        let mut window = VecDeque::new();
-        let result = serve(&sock, queue, &mut window, failed, done).and_then(|ended| {
-            sent?;
-            Ok(ended)
-        });
-        // Files that got no result are requested again, in their order.
-        while let Some(job) = window.pop_back() {
-            queue.push_front(job);
-        }
-        match result {
-            // Dropped, which kills it: it may be in the middle of a file.
-            Ok(Ended::Stopped) => Ok(Ended::Stopped),
-            Ok(ended) => worker.finish(Ok(ended)),
-            Err(e) if e.is::<Gone>() || e.is::<WorkerError>() => worker
-                .finish(Err(e))
-                .with_context(|| format!("downloading from {origin}")),
-            Err(e) => Err(e),
-        }
+/// Open a connection to `origin` and run a worker on it for the files
+/// in `queue`, until they are done or the connection ends. Files left
+/// are back in `queue` then.
+fn connection<S: Sink>(
+    workers: &Workers,
+    origin: &Origin,
+    queue: &mut VecDeque<Job<S>>,
+    failed: &AtomicBool,
+    done: &impl Fn(usize, S, Downloaded) -> Result<()>,
+) -> Result<Ended> {
+    let first = queue.front().context("no file to download")?;
+    let conn =
+        http::connect(origin, TIMEOUT).with_context(|| format!("downloading {}", first.url))?;
+    let (ours, theirs) = worker::stream_socket()?;
+    let custom = workers.root_certs().custom().filter(|_| origin.tls);
+    let name = origin.to_string();
+    let mut args = vec![&*name];
+    if custom.is_some() {
+        args.push("custom-roots");
+    }
+    let worker = workers.spawn(&DOWNLOAD_WORKER, conn.into(), theirs, &[], &args)?;
+    let sock = File::from(ours);
+    // The worker reads all certificates before it writes anything but
+    // an error, which then explains a failure to send them.
+    let sent = custom.map_or(Ok(()), |certs| send_certs(&sock, certs));
+    let mut window = VecDeque::new();
+    let result = serve(&sock, queue, &mut window, failed, done).and_then(|ended| {
+        sent?;
+        Ok(ended)
+    });
+    // Files that got no result are requested again, in their order.
+    while let Some(job) = window.pop_back() {
+        queue.push_front(job);
+    }
+    match result {
+        // Dropped, which kills it: it may be in the middle of a file.
+        Ok(Ended::Stopped) => Ok(Ended::Stopped),
+        Ok(ended) => worker.finish(Ok(ended)),
+        Err(e) if e.is::<Gone>() || e.is::<WorkerError>() => worker
+            .finish(Err(e))
+            .with_context(|| format!("downloading from {origin}")),
+        Err(e) => Err(e),
     }
 }
 
@@ -621,15 +626,17 @@ fn receive_certs(mut input: impl Read) -> Result<RootCerts> {
     }
 }
 
-/// The worker: `origin` is what fd 0 is connected to; with `custom_roots`
-/// the root certificates come first on the socket, fd 1 (`out`).
-pub(super) fn worker(
-    layers: Layers,
-    origin: &str,
-    custom_roots: bool,
-    out: &mut BufWriter<File>,
-) -> Result<Vec<u8>> {
+/// The worker: the origin that fd 0 is connected to is its argument; with
+/// a second argument `custom-roots`, the root certificates come first on
+/// the socket, fd 1.
+fn worker(args: Args) -> Result<Vec<u8>> {
+    let (origin, custom_roots) = match &args.extra[..] {
+        [origin] => (origin, false),
+        [origin, roots] if roots == "custom-roots" => (origin, true),
+        _ => bail!("unexpected arguments {:?}", args.extra),
+    };
     let origin = Origin::parse(origin)?;
+    let out = args.out;
     // SAFETY: the supervisor passes the connection as fd 0.
     let net = unsafe { File::from_raw_fd(0) };
     // Items come over the socket that results go to. The fd is duplicated
@@ -639,7 +646,7 @@ pub(super) fn worker(
         max_memory: Some(MAX_MEMORY),
         ..Policy::default()
     };
-    sandbox::confine(layers, &policy)?;
+    sandbox::confine(args.layers, &policy)?;
     // One reader for all input, so nothing is lost in a buffer.
     let mut input = BufReader::new(input);
     let roots = if custom_roots {

@@ -14,7 +14,8 @@ use sequoia_openpgp::packet::signature::SignatureBuilder;
 use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::MarshalInto;
 use sequoia_openpgp::types::SignatureType;
-use skladiste::worker::{KeyringError, KeyringFiles, Workers};
+use skladiste::arch::verify::{KeyringError, KeyringFiles, with_verifier};
+use skladiste::worker::Workers;
 
 static POLICY: StandardPolicy = StandardPolicy::new();
 
@@ -145,33 +146,32 @@ fn verifies_in_worker() {
         &data,
         SystemTime::now() + Duration::from_secs(3600),
     );
-    workers()
-        .with_verifier(keyring(dir.path()), 2, |v| {
-            v.verify(&good, &file)?;
-            // A bad verdict doesn't end the worker; the next one is good.
-            let err = |sig: &[u8]| format!("{:#}", v.verify(sig, &file).unwrap_err());
-            let e = err(&unknown);
-            assert!(e.contains("not in the keyring"), "{e}");
-            let e = err(&modified);
-            assert!(e.contains("bad signature"), "{e}");
-            // The message has a time in it, formatted with glibc's strftime,
-            // which loads the time zone on first use.
-            let e = err(&future);
-            assert!(e.contains("not alive"), "{e}");
-            let e = err(b"garbage");
-            assert!(e.contains("reading signature"), "{e}");
-            let e = err(&vec![0; 1 << 20]);
-            assert!(e.contains("too large"), "{e}");
-            v.verify(&good, &file)?;
-            // The file's own offset is left alone.
-            assert_eq!(
-                (&file).stream_position()?,
-                data.len() as u64,
-                "offset changed"
-            );
-            Ok(())
-        })
-        .unwrap();
+    with_verifier(&workers(), keyring(dir.path()), 2, |v| {
+        v.verify(&good, &file)?;
+        // A bad verdict doesn't end the worker; the next one is good.
+        let err = |sig: &[u8]| format!("{:#}", v.verify(sig, &file).unwrap_err());
+        let e = err(&unknown);
+        assert!(e.contains("not in the keyring"), "{e}");
+        let e = err(&modified);
+        assert!(e.contains("bad signature"), "{e}");
+        // The message has a time in it, formatted with glibc's strftime,
+        // which loads the time zone on first use.
+        let e = err(&future);
+        assert!(e.contains("not alive"), "{e}");
+        let e = err(b"garbage");
+        assert!(e.contains("reading signature"), "{e}");
+        let e = err(&vec![0; 1 << 20]);
+        assert!(e.contains("too large"), "{e}");
+        v.verify(&good, &file)?;
+        // The file's own offset is left alone.
+        assert_eq!(
+            (&file).stream_position()?,
+            data.len() as u64,
+            "offset changed"
+        );
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -185,23 +185,22 @@ fn verifies_from_many_threads() {
             (sign(&s.packager, &data), file)
         })
         .collect();
-    workers()
-        .with_verifier(keyring(dir.path()), 3, |v| {
-            // Threads that start workers end before others use them.
-            for chunk in files.chunks(4) {
-                std::thread::scope(|scope| {
-                    let threads: Vec<_> = chunk
-                        .iter()
-                        .map(|(sig, file)| scope.spawn(|| v.verify(sig, file)))
-                        .collect();
-                    for t in threads {
-                        t.join().unwrap().unwrap();
-                    }
-                });
-            }
-            Ok(())
-        })
-        .unwrap();
+    with_verifier(&workers(), keyring(dir.path()), 3, |v| {
+        // Threads that start workers end before others use them.
+        for chunk in files.chunks(4) {
+            std::thread::scope(|scope| {
+                let threads: Vec<_> = chunk
+                    .iter()
+                    .map(|(sig, file)| scope.spawn(|| v.verify(sig, file)))
+                    .collect();
+                for t in threads {
+                    t.join().unwrap().unwrap();
+                }
+            });
+        }
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -210,12 +209,11 @@ fn bad_keyring_fails_first() {
     setup(dir.path());
     std::fs::write(dir.path().join("keyring-trusted"), "nothex:4:\n").unwrap();
     let mut ran = false;
-    let e = workers()
-        .with_verifier(keyring(dir.path()), 1, |_| {
-            ran = true;
-            Ok(())
-        })
-        .unwrap_err();
+    let e = with_verifier(&workers(), keyring(dir.path()), 1, |_| {
+        ran = true;
+        Ok(())
+    })
+    .unwrap_err();
     assert!(!ran);
     assert!(e.is::<KeyringError>(), "{e:#}");
     assert!(format!("{e:#}").contains("master key list"), "{e:#}");

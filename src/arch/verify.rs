@@ -2,7 +2,7 @@
 //! package signatures for the supervisor.
 //!
 //! A worker checks Arch package signatures with
-//! [`arch::signature::Keyring`]: fd 0 is a `SOCK_SEQPACKET` socket for its
+//! [`Keyring`]: fd 0 is a `SOCK_SEQPACKET` socket for its
 //! input, fd 1 a pipe for its results. Each input message is a tag byte and
 //! a payload, with fds attached (`SCM_RIGHTS`):
 //!
@@ -15,7 +15,7 @@
 //!   input ends.
 //!
 //! The supervisor gives the worker its own read-only open file of each file
-//! (see [`reopen_read_only`]), so the worker can't change an archive after
+//! (see `reopen_read_only`), so the worker can't change an archive after
 //! it was checked, and its reads don't move the supervisor's file offset.
 //! No filesystem access, no ioctls.
 //!
@@ -25,11 +25,10 @@
 //! and its certification checks cached, so it serves a whole run.
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, IoSlice, IoSliceMut, Read, Write};
-use std::marker::PhantomData;
+use std::io::{self, BufReader, IoSlice, IoSliceMut, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::{Condvar, Mutex, mpsc};
+use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result, bail, ensure};
 use rustix::net::{
@@ -37,12 +36,12 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 
-use super::{
-    DONE, ERROR, MAX_ERROR, NO_CAPS, Worker, Workers, read_error, read_header, read_payload,
-    read_result, sanitize, write_frame,
-};
 use crate::arch::signature::{Keyring, MAX_SIGNATURE_SIZE};
-use crate::sandbox::{self, Layers, Policy};
+use crate::sandbox::{self, Policy};
+use crate::worker::{
+    Args, DONE, ERROR, Kind, MAX_ERROR, NO_CAPS, Shared, Spawner, Worker, Workers, read_error,
+    read_header, read_payload, read_result, sanitize, write_frame,
+};
 
 const KEYRING: u8 = 1;
 const ITEM: u8 = 2;
@@ -57,6 +56,14 @@ const MAX_MEMORY: u64 = 256 << 20;
 /// System calls the worker makes besides [`sandbox`]'s basic set.
 const SYSCALLS: &[i64] = &[libc::SYS_recvmsg];
 
+/// The worker; see the module documentation.
+pub(crate) const VERIFY_WORKER: Kind = Kind {
+    name: "verify-arch",
+    dirs: &[],
+    caps: NO_CAPS,
+    main: worker,
+};
+
 /// The files of an Arch keyring, as in `/usr/share/pacman/keyrings/`.
 pub struct KeyringFiles {
     /// OpenPGP certificates (`archlinux.gpg`).
@@ -68,95 +75,58 @@ pub struct KeyringFiles {
 }
 
 /// Checks package signatures in workers; see the module documentation and
-/// [`Workers::with_verifier`]. Calls from several threads are served by up
-/// to the given number of workers at once, each started when first needed
-/// and kept until the verifier is dropped.
+/// [`with_verifier`]. Calls from several threads are served by up to the
+/// given number of workers at once, each started when first needed and
+/// kept until the verifier is dropped. `'a` is the scope of its workers,
+/// which ends when [`with_verifier`] returns.
 pub struct Verifier<'a> {
     keyring: KeyringFiles,
     max: usize,
-    /// Asks the thread that starts workers for one.
-    spawner: Mutex<mpsc::Sender<mpsc::SyncSender<Result<VerifyWorker>>>>,
-    pool: Mutex<Pool>,
+    /// Starts the workers, which the threads that call the verifier share.
+    spawner: &'a Spawner<'a>,
+    pool: Mutex<Pool<'a>>,
     /// Signalled when a worker becomes idle or one fewer is running.
     changed: Condvar,
-    _workers: PhantomData<&'a Workers>,
 }
 
-struct Pool {
-    idle: Vec<VerifyWorker>,
+struct Pool<'a> {
+    idle: Vec<VerifyWorker<'a>>,
     /// Workers running or being started, idle or not.
     running: usize,
 }
 
-impl Workers {
-    /// Run `f` with a [`Verifier`] that checks signatures with `keyring`,
-    /// in up to `max` workers at once. One worker is started and loads the
-    /// keyring before `f` runs; if that fails, the error is returned as
-    /// a [`KeyringError`].
-    ///
-    /// Workers die with the thread that started them (bubblewrap's
-    /// `--die-with-parent`), and a verifier's workers are shared by the
-    /// threads that call it. So a thread of their own starts them all,
-    /// which lives until `f` has returned and the workers have ended.
-    pub fn with_verifier<T>(
-        &self,
-        keyring: KeyringFiles,
-        max: usize,
-        f: impl FnOnce(&Verifier) -> Result<T>,
-    ) -> Result<T> {
-        std::thread::scope(|scope| {
-            let (spawner, requests) = mpsc::channel::<mpsc::SyncSender<_>>();
-            std::thread::Builder::new()
-                .name("verify-spawner".into())
-                .spawn_scoped(scope, move || {
-                    for reply in requests {
-                        let _ = reply.send(self.spawn_verify());
-                    }
-                })
-                .context("starting thread")?;
-            let verifier = Verifier {
-                keyring,
-                max: max.max(1),
-                spawner: Mutex::new(spawner),
-                pool: Mutex::new(Pool {
-                    idle: Vec::new(),
-                    running: 1,
-                }),
-                changed: Condvar::new(),
-                _workers: PhantomData,
-            };
-            let worker = verifier
-                .start()
-                .map_err(|e| anyhow::Error::new(KeyringError(format!("{e:#}"))))?;
-            verifier.pool.lock().unwrap().idle.push(worker);
-            // Dropping the verifier ends its workers, and with that the
-            // request channel and the thread.
-            f(&verifier)
-        })
-    }
-
-    /// Start a verification worker.
-    fn spawn_verify(&self) -> Result<VerifyWorker> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-        use rustix::pipe::{PipeFlags, pipe_with};
-        let (input, theirs) = socketpair(
-            AddressFamily::UNIX,
-            SocketType::SEQPACKET,
-            SocketFlags::CLOEXEC,
-            None,
-        )
-        .context("creating socket")?;
-        let (results_r, results_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-        let worker = self.spawn("verify-arch", theirs, results_w, &[], NO_CAPS, &[])?;
-        Ok(VerifyWorker {
-            worker,
-            input,
-            results: BufReader::new(File::from(results_r)),
-        })
-    }
+/// Run `f` with a [`Verifier`] that checks signatures with `keyring`, in up
+/// to `max` workers at once. One worker is started and loads the keyring
+/// before `f` runs; if that fails, the error is returned as a
+/// [`KeyringError`].
+pub fn with_verifier<T>(
+    workers: &Workers,
+    keyring: KeyringFiles,
+    max: usize,
+    f: impl FnOnce(&Verifier) -> Result<T>,
+) -> Result<T> {
+    workers.with_spawner(|spawner| {
+        let verifier = Verifier {
+            keyring,
+            max: max.max(1),
+            spawner,
+            pool: Mutex::new(Pool {
+                idle: Vec::new(),
+                running: 1,
+            }),
+            changed: Condvar::new(),
+        };
+        let worker = verifier
+            .start()
+            .map_err(|e| anyhow::Error::new(KeyringError(format!("{e:#}"))))?;
+        verifier.pool.lock().unwrap().idle.push(worker);
+        // The verifier, and with it its workers, ends here, before the
+        // spawner's thread.
+        f(&verifier)
+    })
 }
 
-/// The keyring couldn't be loaded; see [`Workers::with_verifier`].
+/// The keyring couldn't be loaded; see [`with_verifier`].
 #[derive(Debug)]
 pub struct KeyringError(String);
 
@@ -168,7 +138,7 @@ impl std::fmt::Display for KeyringError {
 
 impl std::error::Error for KeyringError {}
 
-impl Verifier<'_> {
+impl<'a> Verifier<'a> {
     /// Check that `signature` (a `.sig` file's contents) is a valid
     /// signature of the whole of `archive` by a packager key. The archive
     /// is read from its start, from a new open file.
@@ -193,7 +163,7 @@ impl Verifier<'_> {
     }
 
     /// An idle worker, or a new one if fewer than `max` are running.
-    fn take(&self) -> Result<VerifyWorker> {
+    fn take(&self) -> Result<VerifyWorker<'a>> {
         let mut pool = self.pool.lock().unwrap();
         loop {
             if let Some(worker) = pool.idle.pop() {
@@ -215,15 +185,22 @@ impl Verifier<'_> {
     }
 
     /// Start a worker and have it load the keyring.
-    fn start(&self) -> Result<VerifyWorker> {
-        let gone = || anyhow::anyhow!("the thread that starts workers is gone");
-        let (reply, worker) = mpsc::sync_channel(1);
-        self.spawner
-            .lock()
-            .unwrap()
-            .send(reply)
-            .map_err(|_| gone())?;
-        let mut worker = worker.recv().map_err(|_| gone())??;
+    fn start(&self) -> Result<VerifyWorker<'a>> {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        use rustix::pipe::{PipeFlags, pipe_with};
+        let (input, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .context("creating socket")?;
+        let (results_r, results_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+        let mut worker = VerifyWorker {
+            worker: self.spawner.spawn(&VERIFY_WORKER, theirs, results_w)?,
+            input,
+            results: BufReader::new(File::from(results_r)),
+        };
         let k = &self.keyring;
         let loaded = (|| {
             let files = [&k.certs, &k.trusted, &k.revoked]
@@ -267,15 +244,15 @@ impl Drop for Verifier<'_> {
 }
 
 /// The supervisor's side of a worker.
-struct VerifyWorker {
-    worker: Worker,
+struct VerifyWorker<'a> {
+    worker: Worker<Shared<'a>>,
     /// The input socket.
     input: OwnedFd,
     /// The result pipe.
     results: BufReader<File>,
 }
 
-impl VerifyWorker {
+impl VerifyWorker<'_> {
     /// Have the worker check one signature. The outer result says whether
     /// the worker did its part; the inner one is its verdict.
     fn verify(&mut self, signature: &[u8], archive: BorrowedFd) -> Result<Result<()>> {
@@ -314,7 +291,7 @@ impl VerifyWorker {
 /// A new read-only open file of the regular file `file`, with its own file
 /// offset, through `/proc/self/fd`. (Not something else, which opening
 /// could block on or give the worker access to.)
-pub(super) fn reopen_read_only(file: &File) -> Result<File> {
+fn reopen_read_only(file: &File) -> Result<File> {
     use rustix::fs::{Mode, OFlags};
     let meta = file.metadata().context("checking file")?;
     ensure!(meta.is_file(), "not a regular file");
@@ -385,8 +362,10 @@ fn receive<'b>(
     Ok(Some((tag, payload, fds)))
 }
 
-/// Entry point of the `verify-arch` worker.
-pub(super) fn worker(layers: Layers, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
+/// Entry point of the worker.
+fn worker(args: Args) -> Result<Vec<u8>> {
+    args.no_extra()?;
+    let out = args.out;
     // SAFETY: the supervisor passes the input socket as fd 0.
     let input = unsafe { OwnedFd::from_raw_fd(0) };
     let policy = Policy {
@@ -394,7 +373,7 @@ pub(super) fn worker(layers: Layers, out: &mut BufWriter<File>) -> Result<Vec<u8
         max_memory: Some(MAX_MEMORY),
         ..Policy::default()
     };
-    sandbox::confine(layers, &policy)?;
+    sandbox::confine(args.layers, &policy)?;
     let mut buf = vec![0; MAX_SIGNATURE_SIZE as usize + 2];
     let keyring = match receive(input.as_fd(), &mut buf, 3)? {
         Some((KEYRING, [], fds)) => {

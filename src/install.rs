@@ -6,18 +6,74 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry as MapEntry;
-use std::os::fd::{AsFd, OwnedFd};
+use std::fs::File;
+use std::io::BufReader;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use landlock::AccessFs;
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, ResolveFlags, Timespec, Timestamps, Uid, XattrFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::btrfs;
 use crate::manifest::{Content, Entry, EntryKind, Package};
+use crate::sandbox::{self, Policy};
 use crate::store::Store;
-use crate::worker::Workers;
+use crate::worker::{self, Args, Caps, Kind, Workers};
+
+/// The worker that installs files: fd 0 is the plan (JSON entries), fd 1 a
+/// pipe for the result, and the store directory and image root are bound
+/// at `/store` (read-only) and `/image`. It installs the files with
+/// [`populate`], with read access to the store and write access to the
+/// image.
+pub(crate) const INSTALL_WORKER: Kind = Kind {
+    name: "install",
+    dirs: &[
+        worker::Dir {
+            path: "/store",
+            writable: false,
+        },
+        worker::Dir {
+            path: "/image",
+            writable: true,
+        },
+    ],
+    // When skl runs as root: to set owners, then modes (including setuid
+    // and setgid bits), times and xattrs (including `security.capability`)
+    // of entries it no longer owns, and to create entries in directories
+    // whose permissions don't allow it.
+    caps: Caps {
+        root: Some(&[
+            "CAP_CHOWN",
+            "CAP_DAC_OVERRIDE",
+            "CAP_FOWNER",
+            "CAP_FSETID",
+            "CAP_SETFCAP",
+        ]),
+        userns: &[],
+    },
+    main: install_main,
+};
+
+/// Address space limit of the install worker, which holds the whole plan
+/// (about 40 MiB were enough for an image of 17,000 entries).
+const INSTALL_MAX_MEMORY: u64 = 4 << 30;
+
+/// System calls the installer makes besides [`sandbox`]'s basic set.
+const INSTALL_SYSCALLS: &[i64] = &[
+    libc::SYS_openat,
+    libc::SYS_openat2,
+    libc::SYS_mkdirat,
+    libc::SYS_symlinkat,
+    libc::SYS_linkat,
+    libc::SYS_fchown,
+    libc::SYS_fchownat,
+    libc::SYS_fchmod,
+    libc::SYS_fsetxattr,
+    libc::SYS_utimensat,
+];
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Report {
@@ -48,13 +104,66 @@ pub fn build(
         Mode::empty(),
     )
     .with_context(|| format!("opening {}", target.display()))?;
-    workers.install(store, &plan, &root)
+    populate_in_worker(workers, store, &plan, &root)
+}
+
+/// Run [`populate`] in a worker that can read only the store and write
+/// only beneath `root`. The store is bound read-only, so the worker can't
+/// change metadata of its files either (Landlock doesn't restrict that).
+fn populate_in_worker(
+    workers: &Workers,
+    store: &Store,
+    plan: &[&Entry],
+    root: &OwnedFd,
+) -> Result<Report> {
+    use rustix::pipe::{PipeFlags, pipe_with};
+    let (plan_r, plan_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+    let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+    let dirs = [store.dir(), root.as_fd()];
+    let w = workers.spawn(&INSTALL_WORKER, plan_r, result_w, &dirs, &[])?;
+    // The worker reads the whole plan before it writes a result, unless
+    // it fails; then its error message explains the broken pipe.
+    let sent = worker::send_json(plan_w, plan);
+    let result = worker::read_result(&mut File::from(result_r)).and_then(|json| {
+        sent?;
+        Ok(serde_json::from_slice(&json)?)
+    });
+    w.finish(result)
+}
+
+fn install_main(mut args: Args) -> Result<Vec<u8>> {
+    args.no_extra()?;
+    let [store, root] = args.dirs()?;
+    let store = Store::from_dir(store);
+    let image = AccessFs::ReadDir
+        | AccessFs::WriteFile
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::MakeSym
+        | AccessFs::Refer;
+    let policy = Policy {
+        paths: vec![
+            (store.dir(), AccessFs::ReadFile.into()),
+            (root.as_fd(), image),
+        ],
+        syscalls: INSTALL_SYSCALLS,
+        // Landlock doesn't restrict ioctls on regular files, and btrfs has
+        // ioctls such as subvolume creation that work on any fd.
+        ioctls: &[libc::FICLONE],
+        max_memory: Some(INSTALL_MAX_MEMORY),
+    };
+    sandbox::confine(args.layers, &policy)?;
+    // SAFETY: the supervisor passes the plan as fd 0.
+    let plan = BufReader::new(unsafe { File::from_raw_fd(0) });
+    let entries: Vec<Entry> = serde_json::from_reader(plan).context("reading plan")?;
+    let report = populate(&store, entries.iter().collect(), root)?;
+    Ok(serde_json::to_vec(&report)?)
 }
 
 /// Install `plan` (sorted by path) into the empty directory `root`. Uses only
 /// the store's and the image's directory fds, so it runs in a worker
 /// confined to them.
-pub(crate) fn populate(store: &Store, plan: Vec<&Entry>, root: OwnedFd) -> Result<Report> {
+fn populate(store: &Store, plan: Vec<&Entry>, root: OwnedFd) -> Result<Report> {
     let mut inst = Installer {
         store,
         root,

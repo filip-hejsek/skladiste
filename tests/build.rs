@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use skladiste::{install, manifest::Package, store::Store, worker::Workers};
+use skladiste::{arch, install, manifest::Package, store::Store, worker::Workers};
 use tar::{EntryType, Header};
 
 const BTRFS_SUPER_MAGIC: i64 = 0x9123683e;
@@ -87,8 +87,7 @@ fn workers() -> Workers {
 }
 
 fn import(store: &Store, path: &Path) -> Package {
-    workers()
-        .import_arch(store, File::open(path).unwrap())
+    arch::import_in_worker(&workers(), store, File::open(path).unwrap())
         .unwrap()
         .0
 }
@@ -127,9 +126,8 @@ fn build_image() {
     );
 
     let base = import(&store, &base);
-    let (tools, stats) = workers()
-        .import_arch(&store, File::open(&tools).unwrap())
-        .unwrap();
+    let (tools, stats) =
+        arch::import_in_worker(&workers(), &store, File::open(&tools).unwrap()).unwrap();
     assert_eq!(stats.files, 4);
     assert_eq!(stats.new_objects, 3, "identical files share one object");
 
@@ -177,9 +175,7 @@ fn worker_errors_are_reported() {
     let store = Store::open(&tmp.path().join("store")).unwrap();
     let path = tmp.path().join("bad.pkg.tar.zst");
     fs::write(&path, "not an archive").unwrap();
-    let err = workers()
-        .import_arch(&store, File::open(&path).unwrap())
-        .unwrap_err();
+    let err = arch::import_in_worker(&workers(), &store, File::open(&path).unwrap()).unwrap_err();
     assert!(
         err.to_string().contains("unsupported compression"),
         "{err:#}"
@@ -205,7 +201,9 @@ fn concurrent_imports_share_objects() {
     let workers = workers();
     let results: Vec<_> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..4)
-            .map(|_| s.spawn(|| workers.import_arch(&store, File::open(&path).unwrap())))
+            .map(|_| {
+                s.spawn(|| arch::import_in_worker(&workers, &store, File::open(&path).unwrap()))
+            })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });

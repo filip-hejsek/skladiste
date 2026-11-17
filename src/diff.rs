@@ -14,8 +14,8 @@
 //!
 //! [`diff`] reads the image's contents, which are untrusted after package
 //! code ran there, so `skl` runs it in a worker that only reads both trees
-//! and streams new file contents to an [`ObjectSink`], like an import. The
-//! supervisor [validates](validate) the result.
+//! and streams new file contents to an [`ObjectSink`], like an import
+//! ([`diff_in_worker`]). The supervisor [validates](validate) the result.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -24,12 +24,103 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::{Context, Result, bail, ensure};
+use landlock::AccessFs;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Content, Entry, EntryKind, ObjectId, XattrValue, is_normal_path};
-use crate::store::ObjectSink;
+use crate::sandbox::{self, Policy};
+use crate::store::{ObjectSink, Store};
+use crate::worker::{self, Args, Caps, ImportStats, Kind, RemoteSink, Workers};
+
+/// The worker that compares trees: fd 0 is unused, fd 1 a socket, and the
+/// tree before (a snapshot) and after are bound read-only at `/old` and
+/// `/new`. It compares them with [`diff`] and streams the new contents to
+/// the supervisor like an import; `DONE` holds the changes, which refer to
+/// objects by position. Read access to both trees, no ioctls.
+pub(crate) const DIFF_WORKER: Kind = Kind {
+    name: "diff",
+    dirs: &[
+        worker::Dir {
+            path: "/old",
+            writable: false,
+        },
+        worker::Dir {
+            path: "/new",
+            writable: false,
+        },
+    ],
+    // To read every file and directory regardless of permissions (in a
+    // new user namespace, those owned by skl's uid and gid).
+    caps: Caps {
+        root: Some(&["CAP_DAC_READ_SEARCH"]),
+        userns: &["CAP_DAC_READ_SEARCH"],
+    },
+    main: diff_main,
+};
+
+/// Address space limit of the diff worker, which holds the changes.
+const DIFF_MAX_MEMORY: u64 = 1 << 30;
+
+/// System calls the diff worker makes besides [`sandbox`]'s basic set.
+const DIFF_SYSCALLS: &[i64] = &[
+    libc::SYS_openat,
+    libc::SYS_getdents64,
+    libc::SYS_newfstatat,
+    libc::SYS_fstat,
+    libc::SYS_statx,
+    libc::SYS_readlinkat,
+    libc::SYS_flistxattr,
+    libc::SYS_fgetxattr,
+];
+
+/// Compare the tree `new` with `old` (see [`diff`]) in a worker that can
+/// only read both, adding new file contents to `store`. The returned
+/// changes are checked.
+pub fn diff_in_worker(
+    workers: &Workers,
+    store: &Store,
+    old: BorrowedFd,
+    new: BorrowedFd,
+) -> Result<(Vec<Change>, ImportStats)> {
+    let (ours, theirs) = worker::stream_socket()?;
+    let null = File::open("/dev/null").context("opening /dev/null")?;
+    let w = workers.spawn(&DIFF_WORKER, null.into(), theirs, &[old, new], &[])?;
+    let mut conn = worker::receiver(ours)?;
+    let result = worker::receive_objects(store, &mut conn).and_then(|(objects, json, stats)| {
+        let changes: Vec<Change<ObjectId>> =
+            serde_json::from_slice(&json).context("parsing changes from worker")?;
+        let changes = changes
+            .into_iter()
+            .map(|c| c.resolve(&objects))
+            .collect::<Result<Vec<_>>>()?;
+        validate(&changes)?;
+        Ok((changes, stats))
+    });
+    drop(conn);
+    w.finish(result)
+}
+
+fn diff_main(mut args: Args) -> Result<Vec<u8>> {
+    args.no_extra()?;
+    let [old, new] = args.dirs()?;
+    let read = AccessFs::ReadFile | AccessFs::ReadDir;
+    let policy = Policy {
+        paths: vec![(old.as_fd(), read), (new.as_fd(), read)],
+        syscalls: DIFF_SYSCALLS,
+        max_memory: Some(DIFF_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(args.layers, &policy)?;
+    // The directories were opened with O_PATH; reading them needs real fds.
+    let reopen = |fd: OwnedFd| {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        rustix::fs::openat(&fd, ".", flags, Mode::empty()).context("opening directory")
+    };
+    let changes = diff(reopen(old)?, reopen(new)?, &mut RemoteSink::new(args.out))?;
+    Ok(serde_json::to_vec(&changes)?)
+}
 
 /// One change to an image. An added or modified entry replaces whatever was
 /// at its path before, including a directory's contents; its new contents

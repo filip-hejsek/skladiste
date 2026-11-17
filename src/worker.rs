@@ -13,140 +13,131 @@
 //! one `ERROR` frame (a message) to fd 1. Workers write fd 1 through a
 //! buffer, so many small messages cost one system call.
 //!
-//! - `import-arch`: fd 0 is the package archive, fd 1 a socket. The worker
-//!   parses the archive with [`arch::import`] and streams each file's content
-//!   (`BEGIN` with the size, then `CHUNK`s with exactly that many bytes). Data
-//!   flows only from the worker: it never waits for the supervisor, which
-//!   stores and hashes the objects as they arrive. The manifest in `DONE`
-//!   refers to objects by their position in the stream ([`ObjectId`]), and
-//!   the supervisor fills in the hashes, so a compromised parser can't put
-//!   content under the wrong hash. No filesystem access, no ioctls.
-//! - `download`: fd 0 is a TCP connection the supervisor opened to an
-//!   origin, fd 1 a socket. Unlike the others, this worker handles a queue:
-//!   the supervisor sends it the files to request over that connection, one
-//!   after another, and it streams each response body back, speaking TLS
-//!   for `https`. It can't reach any other host, and the supervisor writes
-//!   the files. No filesystem access, no ioctls. See the `download` module
-//!   here for the protocol, and [`Workers::download_all`] for the stage
-//!   that runs one such worker per origin.
-//! - `read-arch-db`: fd 0 is an Arch repo database, fd 1 a pipe. The
-//!   worker reads it with [`arch::repo::read_db`] and sends the entries in
-//!   `DONE`; the supervisor validates them. No filesystem access, no
-//!   ioctls.
-//! - `verify-arch`: fd 0 is a socket for input, fd 1 a pipe. A queue
-//!   worker that checks package signatures: the supervisor sends it the
-//!   keyring files, then signatures with the archive's fd, and it answers
-//!   each with a verdict. The supervisor can't check the verdict; the
-//!   worker keeps a parser exploit from getting `skl`'s privileges. No
-//!   filesystem access, no ioctls. See the `verify` module here, and
-//!   [`Verifier`] for the pool of such workers.
-//! - `diff`: fd 0 is unused, fd 1 a socket, and the tree before (a
-//!   snapshot) and after are bound read-only at `/old` and `/new`. The
-//!   worker compares them with [`diff::diff`] and streams the new
-//!   contents like `import-arch`; `DONE` holds the changes, which refer to
-//!   objects by position. Read access to both trees, no ioctls.
-//! - `install`: fd 0 is the plan (JSON entries), fd 1 a pipe for the result,
-//!   and the store directory and image root are bound at `/store`
-//!   (read-only) and `/image` in the worker's mount namespace. The worker
-//!   installs the files with read access to the store and write access to
-//!   the image.
+//! Each kind of worker is a `Kind`, defined next to the code it runs
+//! (e.g. the Arch package import in [`crate::arch`]), whose documentation
+//! says what the worker gets and what it sends. `KINDS` here lists them, and
+//! a worker can run only as one of those. The supervisor's side of each is a
+//! function there that takes [`Workers`].
 //!
-//! Directories are passed as paths inside the worker's mount namespace, or
-//! as inherited fd numbers when it runs without namespaces. Other arguments
-//! of a worker come last, after `--`.
+//! Directories (`Kind::dirs`) are passed as paths inside the worker's mount
+//! namespace, or as inherited fd numbers when it runs without namespaces.
+//! Other arguments of a worker come last, after `--`.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::marker::PhantomData;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use landlock::AccessFs;
+use anyhow::{Context, Result, bail, ensure};
 
-use crate::arch;
 use crate::bwrap::{self, Mount, Namespaces};
-use crate::diff::{self, Change};
 use crate::http::RootCerts;
-use crate::install::{self, Report};
-use crate::manifest::{Content, Entry, ObjectId, Package};
-use crate::sandbox::{self, Layers, Policy};
+use crate::manifest::{Content, ObjectId};
+use crate::sandbox::Layers;
 use crate::store::{ObjectSink, Store};
-
-mod download;
-mod verify;
-
-pub use download::{Downloaded, Request, Sink};
-pub use verify::{KeyringError, KeyringFiles, Verifier};
+use crate::{arch, diff, download, install};
 
 /// First argument that makes `skl` run as a worker. `main` must check for
 /// it before doing anything else.
 pub const SUBCOMMAND: &str = "__worker";
 
-const BEGIN: u8 = 1;
-const CHUNK: u8 = 2;
-const DONE: u8 = 3;
-const ERROR: u8 = 4;
+/// Every kind of worker there is.
+const KINDS: &[&Kind] = &[
+    &arch::IMPORT_WORKER,
+    &arch::repo::READ_DB_WORKER,
+    &arch::verify::VERIFY_WORKER,
+    &download::DOWNLOAD_WORKER,
+    &diff::DIFF_WORKER,
+    &install::INSTALL_WORKER,
+];
+
+pub(crate) const BEGIN: u8 = 1;
+pub(crate) const CHUNK: u8 = 2;
+pub(crate) const DONE: u8 = 3;
+pub(crate) const ERROR: u8 = 4;
 
 /// Chunk size the worker sends; the supervisor accepts up to [`MAX_CHUNK`].
 const CHUNK_SIZE: usize = 64 << 10;
-const MAX_CHUNK: usize = 1 << 20;
+pub(crate) const MAX_CHUNK: usize = 1 << 20;
 const MAX_DONE: usize = 256 << 20;
-const MAX_ERROR: usize = 64 << 10;
+pub(crate) const MAX_ERROR: usize = 64 << 10;
 /// Buffer size for writing and reading messages. Chunks at least this
 /// large bypass the buffer.
-const BUF_SIZE: usize = CHUNK_SIZE;
+pub(crate) const BUF_SIZE: usize = CHUNK_SIZE;
 
-/// Address space limit of the import worker. Real packages need tens of
-/// MiB; zstd's default limit on the decoding window is 128 MiB, and very
-/// large packages have manifests of tens of MiB.
-const IMPORT_MAX_MEMORY: u64 = 1 << 30;
-/// Address space limit of the diff worker, which holds the changes.
-const DIFF_MAX_MEMORY: u64 = 1 << 30;
-/// Address space limit of the install worker, which holds the whole plan
-/// (about 40 MiB were enough for an image of 17,000 entries).
-const INSTALL_MAX_MEMORY: u64 = 4 << 30;
 /// Delay before a download's next connection after the first one that got
 /// nothing; see [`Workers::set_retry_delay`].
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Capabilities the install worker keeps when skl runs as root: to set
-/// owners, then modes (including setuid and setgid bits), times and xattrs
-/// (including `security.capability`) of entries it no longer owns, and to
-/// create entries in directories whose permissions don't allow it.
-const INSTALL_CAPS: Caps = Caps {
-    root: Some(&[
-        "CAP_CHOWN",
-        "CAP_DAC_OVERRIDE",
-        "CAP_FOWNER",
-        "CAP_FSETID",
-        "CAP_SETFCAP",
-    ]),
-    userns: &[],
-};
+/// A kind of worker: how the supervisor starts it, and the code it runs.
+pub(crate) struct Kind {
+    /// The worker's name: its argument after [`SUBCOMMAND`], and what its
+    /// messages are prefixed with.
+    pub(crate) name: &'static str,
+    /// Directories the worker gets, in order (see [`Workers::spawn`]).
+    pub(crate) dirs: &'static [Dir],
+    pub(crate) caps: Caps,
+    /// The worker's code, after `main` has closed inherited fds other than
+    /// stdio and the directories. It must confine itself (with
+    /// [`crate::sandbox::confine`]) before it reads any input. It returns
+    /// the payload of `DONE`; an error is sent as `ERROR`.
+    pub(crate) main: fn(Args) -> Result<Vec<u8>>,
+}
 
-/// Capabilities of the diff worker: to read every file and directory
-/// regardless of permissions (in a new user namespace, those owned by
-/// skl's uid and gid).
-const DIFF_CAPS: Caps = Caps {
-    root: Some(&["CAP_DAC_READ_SEARCH"]),
-    userns: &["CAP_DAC_READ_SEARCH"],
-};
+/// A directory a worker gets, bound in its mount namespace.
+pub(crate) struct Dir {
+    /// Absolute path inside the mount namespace.
+    pub(crate) path: &'static str,
+    pub(crate) writable: bool,
+}
+
+/// What a worker's [`Kind::main`] gets.
+pub(crate) struct Args<'a> {
+    /// The sandboxing layers to confine itself with.
+    pub(crate) layers: Layers,
+    /// The directories of [`Kind::dirs`], one each, in order.
+    pub(crate) dirs: Vec<OwnedFd>,
+    /// The arguments after `--`.
+    pub(crate) extra: Vec<String>,
+    /// fd 1, buffered; `DONE` or `ERROR` is written to it after `main`.
+    pub(crate) out: &'a mut BufWriter<File>,
+}
+
+impl Args<'_> {
+    /// The directories, which are as many as [`Kind::dirs`] says.
+    pub(crate) fn dirs<const N: usize>(&mut self) -> Result<[OwnedFd; N]> {
+        <[OwnedFd; N]>::try_from(std::mem::take(&mut self.dirs))
+            .map_err(|d| anyhow::anyhow!("expected {N} directories, got {}", d.len()))
+    }
+
+    /// Fail if there are arguments after `--`.
+    pub(crate) fn no_extra(&self) -> Result<()> {
+        ensure!(
+            self.extra.is_empty(),
+            "unexpected arguments {:?}",
+            self.extra
+        );
+        Ok(())
+    }
+}
 
 /// Capabilities a worker keeps; see [`Namespaces`].
 #[derive(Clone, Copy)]
-struct Caps {
+pub(crate) struct Caps {
     /// [`Namespaces::root_caps`]
-    root: Option<&'static [&'static str]>,
+    pub(crate) root: Option<&'static [&'static str]>,
     /// [`Namespaces::userns_caps`]
-    userns: &'static [&'static str],
+    pub(crate) userns: &'static [&'static str],
 }
 
 /// A worker that runs in a new user namespace without capabilities.
-const NO_CAPS: Caps = Caps {
+pub(crate) const NO_CAPS: Caps = Caps {
     root: None,
     userns: &[],
 };
@@ -210,130 +201,91 @@ impl Workers {
         self.layers.seccomp = false;
     }
 
-    /// Parse an Arch package archive in a worker, adding its file contents
-    /// to `store`. The returned manifest is checked but not saved.
-    pub fn import_arch(&self, store: &Store, archive: File) -> Result<(Package, ImportStats)> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-        let (ours, theirs) = socketpair(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC,
-            None,
-        )
-        .context("creating socket")?;
-        let worker = self.spawn("import-arch", archive.into(), theirs, &[], NO_CAPS, &[])?;
-        let mut conn = receiver(ours)?;
-        let result = receive_import(store, &mut conn);
-        drop(conn);
-        worker.finish(result)
+    /// The root certificates downloads check servers against.
+    pub(crate) fn root_certs(&self) -> &RootCerts {
+        &self.roots
     }
 
-    /// Compare the tree `new` with `old` (see [`diff::diff`]) in a worker
-    /// that can only read both, adding new file contents to `store`. The
-    /// returned changes are checked.
-    pub fn diff(
-        &self,
-        store: &Store,
-        old: BorrowedFd,
-        new: BorrowedFd,
-    ) -> Result<(Vec<Change>, ImportStats)> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-        let (ours, theirs) = socketpair(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC,
-            None,
-        )
-        .context("creating socket")?;
-        let dirs = [
-            Mount {
-                fd: old,
-                dest: "/old",
-                writable: false,
-            },
-            Mount {
-                fd: new,
-                dest: "/new",
-                writable: false,
-            },
-        ];
-        let null = File::open("/dev/null").context("opening /dev/null")?;
-        let worker = self.spawn("diff", null.into(), theirs, &dirs, DIFF_CAPS, &[])?;
-        let mut conn = receiver(ours)?;
-        let result = receive_objects(store, &mut conn).and_then(|(objects, json, stats)| {
-            let changes: Vec<Change<ObjectId>> =
-                serde_json::from_slice(&json).context("parsing changes from worker")?;
-            let changes = changes
-                .into_iter()
-                .map(|c| c.resolve(&objects))
-                .collect::<Result<Vec<_>>>()?;
-            diff::validate(&changes)?;
-            Ok((changes, stats))
-        });
-        drop(conn);
-        worker.finish(result)
+    /// See [`Workers::set_retry_delay`].
+    pub(crate) fn retry_delay(&self) -> Duration {
+        self.retry_delay
     }
 
-    /// Read an Arch repo database in a worker, and validate the entries.
-    pub fn read_arch_db(&self, db: File) -> Result<Vec<arch::repo::DbEntry>> {
-        use rustix::pipe::{PipeFlags, pipe_with};
-        let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-        let worker = self.spawn("read-arch-db", db.into(), result_w, &[], NO_CAPS, &[])?;
-        let result = read_result(&mut BufReader::new(File::from(result_r))).and_then(|json| {
-            let entries: Vec<arch::repo::DbEntry> =
-                serde_json::from_slice(&json).context("parsing result from worker")?;
-            arch::repo::validate(&entries)?;
-            Ok(entries)
-        });
-        worker.finish(result)
-    }
-
-    /// Run [`install::populate`] in a worker that can read only the store
-    /// and write only beneath `root`. The store is bound read-only, so the
-    /// worker can't change metadata of its files either (Landlock doesn't
-    /// restrict that).
-    pub(crate) fn install(&self, store: &Store, plan: &[&Entry], root: &OwnedFd) -> Result<Report> {
-        use rustix::pipe::{PipeFlags, pipe_with};
-        let (plan_r, plan_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-        let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-        let dirs = [
-            Mount {
-                fd: store.dir(),
-                dest: "/store",
-                writable: false,
-            },
-            Mount {
-                fd: root.as_fd(),
-                dest: "/image",
-                writable: true,
-            },
-        ];
-        let worker = self.spawn("install", plan_r, result_w, &dirs, INSTALL_CAPS, &[])?;
-        // The worker reads the whole plan before it writes a result, unless
-        // it fails; then its error message explains the broken pipe.
-        let sent = send_json(plan_w, plan);
-        let result = read_result(&mut File::from(result_r)).and_then(|json| {
-            sent?;
-            Ok(serde_json::from_slice(&json)?)
-        });
-        worker.finish(result)
-    }
-
-    /// Start worker `kind` with `stdin` and `stdout` as fds 0 and 1, and
-    /// `dirs` bound in its mount namespace, their paths passed as arguments.
-    /// Without namespaces, the fds of `dirs` are inherited under their
-    /// current numbers instead, and the numbers passed. `caps`: see
-    /// [`Caps`]. `args` are passed last, after `--`.
+    /// Start a worker of `kind` with `stdin` and `stdout` as fds 0 and 1,
+    /// and `dirs`, one for each of [`Kind::dirs`], bound in its mount
+    /// namespace, their paths passed as arguments. Without namespaces, the
+    /// fds of `dirs` are inherited under their current numbers instead, and
+    /// the numbers passed. `args` are passed last, after `--`.
     /// Stderr is a pipe; see [`Worker::finish`].
-    fn spawn(
+    ///
+    /// The worker dies with this thread, so it stays on it; see
+    /// [`Workers::with_spawner`] for workers that threads share.
+    pub(crate) fn spawn(
         &self,
-        kind: &'static str,
+        kind: &'static Kind,
         stdin: OwnedFd,
         stdout: OwnedFd,
-        dirs: &[Mount],
-        caps: Caps,
+        dirs: &[BorrowedFd],
         args: &[&str],
     ) -> Result<Worker> {
+        self.start(kind, stdin, stdout, dirs, args)
+    }
+
+    /// Run `f` with a [`Spawner`], which starts workers on a thread of its
+    /// own that lives until `f` has returned, so the workers can move
+    /// between threads. They can't outlive `f`.
+    ///
+    /// Workers die with the thread that started them (bubblewrap's
+    /// `--die-with-parent`, which sets `PR_SET_PDEATHSIG`): a worker started
+    /// by a thread that ends before the worker is done is killed.
+    pub(crate) fn with_spawner<T>(
+        &self,
+        f: impl for<'s> FnOnce(&'s Spawner<'s>) -> Result<T>,
+    ) -> Result<T> {
+        std::thread::scope(|scope| {
+            let (requests, received) = mpsc::channel::<SpawnRequest>();
+            std::thread::Builder::new()
+                .name("worker-spawner".into())
+                .spawn_scoped(scope, move || {
+                    for r in received {
+                        let _ = r
+                            .reply
+                            .send(self.start(r.kind, r.stdin, r.stdout, &[], &[]));
+                    }
+                })
+                .context("starting thread")?;
+            // Dropping the spawner when `f` is done ends the thread.
+            f(&Spawner {
+                requests: Mutex::new(requests),
+                _scope: PhantomData,
+            })
+        })
+    }
+
+    /// See [`Workers::spawn`]; `T` says on which threads the worker may be.
+    fn start<T>(
+        &self,
+        kind: &'static Kind,
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        dirs: &[BorrowedFd],
+        args: &[&str],
+    ) -> Result<Worker<T>> {
+        ensure!(
+            dirs.len() == kind.dirs.len(),
+            "{} worker needs {} directories",
+            kind.name,
+            kind.dirs.len()
+        );
+        let dirs: Vec<Mount> = (kind.dirs.iter().zip(dirs))
+            .map(|(dir, &fd)| Mount {
+                fd,
+                dest: dir.path,
+                writable: dir.writable,
+            })
+            .collect();
+        let caps = kind.caps;
+        let kind = kind.name;
         let exe_fd: OwnedFd;
         let (mut cmd, raw) = if self.layers.namespaces {
             let bwrap = bwrap::find()?;
@@ -341,7 +293,7 @@ impl Workers {
             exe_fd = rustix::fs::open(&self.exe, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
                 .with_context(|| format!("opening {}", self.exe.display()))?;
             let ns = Namespaces {
-                mounts: dirs,
+                mounts: &dirs,
                 root_caps: caps.root,
                 userns_caps: caps.userns,
             };
@@ -386,18 +338,71 @@ impl Workers {
             kind,
             child: Some(child),
             stderr: File::from(stderr_r),
+            _thread: PhantomData,
         })
     }
 }
 
-/// A running worker; killed if dropped before [`Worker::finish`].
-struct Worker {
+/// Starts workers on a thread of its own; see [`Workers::with_spawner`].
+/// `'s` is the scope in which its workers live.
+pub(crate) struct Spawner<'s> {
+    requests: Mutex<mpsc::Sender<SpawnRequest>>,
+    _scope: PhantomData<fn(&'s ()) -> &'s ()>,
+}
+
+struct SpawnRequest {
+    kind: &'static Kind,
+    stdin: OwnedFd,
+    stdout: OwnedFd,
+    /// Gets the worker, which lives during the spawner's scope; only the
+    /// spawner's thread makes `Shared<'static>` workers, and
+    /// [`Spawner::spawn`] narrows that.
+    reply: mpsc::SyncSender<Result<Worker<Shared<'static>>>>,
+}
+
+impl<'s> Spawner<'s> {
+    /// Start a worker of `kind`, which takes no directories or arguments
+    /// (see [`Workers::spawn`]).
+    pub(crate) fn spawn(
+        &self,
+        kind: &'static Kind,
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+    ) -> Result<Worker<Shared<'s>>> {
+        let gone = || anyhow::anyhow!("the thread that starts workers is gone");
+        let (reply, worker) = mpsc::sync_channel(1);
+        let request = SpawnRequest {
+            kind,
+            stdin,
+            stdout,
+            reply,
+        };
+        self.requests
+            .lock()
+            .unwrap()
+            .send(request)
+            .map_err(|_| gone())?;
+        worker.recv().map_err(|_| gone())?
+    }
+}
+
+/// A [`Worker`] that must stay on the thread that started it, as it dies
+/// with that thread.
+pub(crate) struct ThreadBound(PhantomData<*const ()>);
+
+/// A [`Worker`] that a [`Spawner`]'s thread started, which lives during `'s`.
+pub(crate) struct Shared<'s>(PhantomData<&'s ()>);
+
+/// A running worker; killed if dropped before [`Worker::finish`]. `T` is
+/// [`ThreadBound`] or [`Shared`].
+pub(crate) struct Worker<T = ThreadBound> {
     kind: &'static str,
     child: Option<Child>,
     stderr: File,
+    _thread: PhantomData<T>,
 }
 
-impl Worker {
+impl<T> Worker<T> {
     /// Wait for the worker to exit and combine its exit status with the
     /// result received from it. An error the worker reported explains a
     /// failure best; otherwise an abnormal exit explains a broken connection.
@@ -406,7 +411,7 @@ impl Worker {
     /// control characters escaped and each line prefixed with the worker's
     /// name, so it can't pass for the supervisor's output or control the
     /// terminal. Only what fit in the pipe is kept.
-    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+    pub(crate) fn finish<R>(mut self, result: Result<R>) -> Result<R> {
         let status = self.child.take().unwrap().wait();
         let status = status.with_context(|| format!("waiting for {} worker", self.kind))?;
         // The worker has exited, so this can't block: no one else has the
@@ -430,7 +435,7 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
+impl<T> Drop for Worker<T> {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -449,7 +454,7 @@ fn print_worker_output(kind: &str, output: &[u8]) {
 }
 
 /// Escape control characters, other than newline and tab if `lines`.
-fn sanitize(s: &str, lines: bool) -> String {
+pub(crate) fn sanitize(s: &str, lines: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_control() && !(lines && (c == '\n' || c == '\t')) {
@@ -482,7 +487,7 @@ fn describe(status: ExitStatus) -> String {
 
 /// An error message a worker sent.
 #[derive(Debug)]
-struct WorkerError(String);
+pub(crate) struct WorkerError(String);
 
 impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -492,7 +497,7 @@ impl std::fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
-fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
+pub(crate) fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len()).map_err(io::Error::other)?;
     let mut header = [tag, 0, 0, 0, 0];
     header[1..].copy_from_slice(&len.to_le_bytes());
@@ -500,14 +505,14 @@ fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
     w.write_all(payload)
 }
 
-fn read_header(mut r: impl Read) -> io::Result<(u8, usize)> {
+pub(crate) fn read_header(mut r: impl Read) -> io::Result<(u8, usize)> {
     let mut h = [0u8; 5];
     r.read_exact(&mut h)?;
     let len = u32::from_le_bytes([h[1], h[2], h[3], h[4]]);
     Ok((h[0], len as usize))
 }
 
-fn read_payload(mut r: impl Read, len: usize, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_payload(mut r: impl Read, len: usize, max: usize) -> Result<Vec<u8>> {
     if len > max {
         bail!("worker sent a message of {len} bytes (limit {max})");
     }
@@ -518,7 +523,7 @@ fn read_payload(mut r: impl Read, len: usize, max: usize) -> Result<Vec<u8>> {
 
 /// Read an error message, escaping control characters: it may contain
 /// text from untrusted input, such as a server's reason phrase.
-fn read_error(r: impl Read, len: usize) -> anyhow::Error {
+pub(crate) fn read_error(r: impl Read, len: usize) -> anyhow::Error {
     match read_payload(r, len, MAX_ERROR) {
         Ok(msg) => WorkerError(sanitize(&String::from_utf8_lossy(&msg), false)).into(),
         Err(e) => e.context("reading error message from worker"),
@@ -526,7 +531,7 @@ fn read_error(r: impl Read, len: usize) -> anyhow::Error {
 }
 
 /// Read a worker's final `DONE` or `ERROR` frame.
-fn read_result(mut r: impl Read) -> Result<Vec<u8>> {
+pub(crate) fn read_result(mut r: impl Read) -> Result<Vec<u8>> {
     let (tag, len) = read_header(&mut r).context("reading result from worker")?;
     match tag {
         DONE => read_payload(r, len, MAX_DONE),
@@ -535,34 +540,37 @@ fn read_result(mut r: impl Read) -> Result<Vec<u8>> {
     }
 }
 
-fn send_json(fd: OwnedFd, value: &(impl serde::Serialize + ?Sized)) -> Result<()> {
+pub(crate) fn send_json(fd: OwnedFd, value: &(impl serde::Serialize + ?Sized)) -> Result<()> {
     let mut w = BufWriter::new(File::from(fd));
     serde_json::to_writer(&mut w, value)?;
     w.flush().context("sending to worker")
 }
 
+/// A pair of connected stream sockets: the supervisor's end, the worker's.
+pub(crate) fn stream_socket() -> Result<(OwnedFd, OwnedFd)> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+    socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .context("creating socket")
+}
+
 /// The supervisor's end of a socket that only the worker writes to (any
 /// input for the worker was sent before).
-fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
+pub(crate) fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
     // Nothing more is sent to the worker.
     rustix::net::shutdown(&ours, rustix::net::Shutdown::Write).context("shutting down socket")?;
     Ok(BufReader::with_capacity(BUF_SIZE, File::from(ours)))
 }
 
-/// Supervisor side of `import-arch`.
-fn receive_import(store: &Store, conn: &mut BufReader<File>) -> Result<(Package, ImportStats)> {
-    let (objects, json, stats) = receive_objects(store, conn)?;
-    let pkg: Package<ObjectId> =
-        serde_json::from_slice(&json).context("parsing manifest from worker")?;
-    let pkg = pkg.resolve(&objects)?;
-    pkg.validate()?;
-    Ok((pkg, stats))
-}
-
-/// Add the objects a worker streams to `store` until its `DONE`. Returns
+/// Supervisor side of a [`RemoteSink`]: add the objects a worker streams
+/// to `store` until its `DONE`. Returns
 /// the content of each object in the order received, the payload of
 /// `DONE`, and statistics.
-fn receive_objects(
+pub(crate) fn receive_objects(
     store: &Store,
     conn: &mut BufReader<File>,
 ) -> Result<(Vec<Content>, Vec<u8>, ImportStats)> {
@@ -716,26 +724,22 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
             Err(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
         })
         .collect::<Result<Vec<OwnedFd>>>()?;
-    match (kind.as_str(), &extra[..]) {
-        ("import-arch", []) if dirs.is_empty() => import_worker(layers, out),
-        ("download", [origin]) if dirs.is_empty() => download::worker(layers, origin, false, out),
-        ("download", [origin, roots]) if dirs.is_empty() && roots == "custom-roots" => {
-            download::worker(layers, origin, true, out)
-        }
-        ("read-arch-db", []) if dirs.is_empty() => read_db_worker(layers),
-        ("verify-arch", []) if dirs.is_empty() => verify::worker(layers, out),
-        ("diff", []) => {
-            let [old, new] = <[OwnedFd; 2]>::try_from(dirs)
-                .map_err(|_| anyhow::anyhow!("diff worker needs two directories"))?;
-            diff_worker(layers, old, new, out)
-        }
-        ("install", []) => {
-            let [store, root] = <[OwnedFd; 2]>::try_from(dirs)
-                .map_err(|_| anyhow::anyhow!("install worker needs two directories"))?;
-            install_worker(layers, store, root)
-        }
-        (kind, _) => bail!("unknown worker {kind:?} or wrong arguments or directories"),
-    }
+    let kind = KINDS
+        .iter()
+        .find(|k| k.name == kind)
+        .with_context(|| format!("unknown worker {kind:?}"))?;
+    ensure!(
+        dirs.len() == kind.dirs.len(),
+        "{} worker needs {} directories",
+        kind.name,
+        kind.dirs.len()
+    );
+    (kind.main)(Args {
+        layers,
+        dirs,
+        extra,
+        out,
+    })
 }
 
 /// Value of a layer that an option turns off, if this build allows it.
@@ -771,40 +775,27 @@ fn close_other_fds(keep: &[RawFd]) -> Result<()> {
     close(first, u32::MAX)
 }
 
-fn import_worker(layers: Layers, out: &mut BufWriter<File>) -> Result<Vec<u8>> {
-    // SAFETY: the supervisor passes the archive as fd 0.
-    let archive = unsafe { File::from_raw_fd(0) };
-    let policy = Policy {
-        max_memory: Some(IMPORT_MAX_MEMORY),
-        ..Policy::default()
-    };
-    sandbox::confine(layers, &policy)?;
-    let sink = RemoteSink {
-        conn: out,
-        buf: vec![0; CHUNK_SIZE],
-        next: 0,
-    };
-    let pkg = arch::import(archive, sink)?;
-    Ok(serde_json::to_vec(&pkg)?)
-}
-
-fn read_db_worker(layers: Layers) -> Result<Vec<u8>> {
-    // SAFETY: the supervisor passes the database as fd 0.
-    let db = unsafe { File::from_raw_fd(0) };
-    let policy = Policy {
-        max_memory: Some(IMPORT_MAX_MEMORY),
-        ..Policy::default()
-    };
-    sandbox::confine(layers, &policy)?;
-    Ok(serde_json::to_vec(&arch::repo::read_db(db)?)?)
-}
-
-/// Worker side of `import-arch`: sends contents to the supervisor.
-struct RemoteSink<'a> {
+/// Worker side of streaming objects: sends contents to the supervisor
+/// (`BEGIN` with the size, then `CHUNK`s with exactly that many bytes), which
+/// stores and hashes them as they arrive ([`receive_objects`]). Results
+/// refer to objects by their position in the stream ([`ObjectId`]), and the
+/// supervisor fills in the hashes, so a compromised worker can't put content
+/// under the wrong hash.
+pub(crate) struct RemoteSink<'a> {
     conn: &'a mut BufWriter<File>,
     buf: Vec<u8>,
     /// Id of the next object.
     next: u64,
+}
+
+impl<'a> RemoteSink<'a> {
+    pub(crate) fn new(conn: &'a mut BufWriter<File>) -> Self {
+        RemoteSink {
+            conn,
+            buf: vec![0; CHUNK_SIZE],
+            next: 0,
+        }
+    }
 }
 
 impl ObjectSink for RemoteSink<'_> {
@@ -828,88 +819,6 @@ impl ObjectSink for RemoteSink<'_> {
         self.next += 1;
         Ok(id)
     }
-}
-
-/// System calls the diff worker makes besides [`sandbox`]'s basic set.
-const DIFF_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_getdents64,
-    libc::SYS_newfstatat,
-    libc::SYS_fstat,
-    libc::SYS_statx,
-    libc::SYS_readlinkat,
-    libc::SYS_flistxattr,
-    libc::SYS_fgetxattr,
-];
-
-fn diff_worker(
-    layers: Layers,
-    old: OwnedFd,
-    new: OwnedFd,
-    out: &mut BufWriter<File>,
-) -> Result<Vec<u8>> {
-    let read = AccessFs::ReadFile | AccessFs::ReadDir;
-    let policy = Policy {
-        paths: vec![(old.as_fd(), read), (new.as_fd(), read)],
-        syscalls: DIFF_SYSCALLS,
-        max_memory: Some(DIFF_MAX_MEMORY),
-        ..Policy::default()
-    };
-    sandbox::confine(layers, &policy)?;
-    // The directories were opened with O_PATH; reading them needs real fds.
-    let reopen = |fd: OwnedFd| {
-        use rustix::fs::{Mode, OFlags};
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        rustix::fs::openat(&fd, ".", flags, Mode::empty()).context("opening directory")
-    };
-    let mut sink = RemoteSink {
-        conn: out,
-        buf: vec![0; CHUNK_SIZE],
-        next: 0,
-    };
-    let changes = diff::diff(reopen(old)?, reopen(new)?, &mut sink)?;
-    Ok(serde_json::to_vec(&changes)?)
-}
-
-/// System calls the installer makes besides [`sandbox`]'s basic set.
-const INSTALL_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_openat2,
-    libc::SYS_mkdirat,
-    libc::SYS_symlinkat,
-    libc::SYS_linkat,
-    libc::SYS_fchown,
-    libc::SYS_fchownat,
-    libc::SYS_fchmod,
-    libc::SYS_fsetxattr,
-    libc::SYS_utimensat,
-];
-
-fn install_worker(layers: Layers, store: OwnedFd, root: OwnedFd) -> Result<Vec<u8>> {
-    let store = Store::from_dir(store);
-    let image = AccessFs::ReadDir
-        | AccessFs::WriteFile
-        | AccessFs::MakeDir
-        | AccessFs::MakeReg
-        | AccessFs::MakeSym
-        | AccessFs::Refer;
-    let policy = Policy {
-        paths: vec![
-            (store.dir(), AccessFs::ReadFile.into()),
-            (root.as_fd(), image),
-        ],
-        syscalls: INSTALL_SYSCALLS,
-        // Landlock doesn't restrict ioctls on regular files, and btrfs has
-        // ioctls such as subvolume creation that work on any fd.
-        ioctls: &[libc::FICLONE],
-        max_memory: Some(INSTALL_MAX_MEMORY),
-    };
-    sandbox::confine(layers, &policy)?;
-    // SAFETY: the supervisor passes the plan as fd 0.
-    let plan = BufReader::new(unsafe { File::from_raw_fd(0) });
-    let entries: Vec<Entry> = serde_json::from_reader(plan).context("reading plan")?;
-    let report = install::populate(&store, entries.iter().collect(), root)?;
-    Ok(serde_json::to_vec(&report)?)
 }
 
 #[cfg(test)]

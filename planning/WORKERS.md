@@ -2,7 +2,7 @@
 
 Design for workers that process a queue of items instead of one input.
 The download worker, one per origin, is the only one so far
-(`src/worker/download.rs`; what was decided for it is under Downloads
+(`src/download.rs`; what was decided for it is under Downloads
 in DECISIONS.md). The signature verification workers also serve many
 items, but one at a time, as each caller waits for its verdict (see
 Package signatures in DECISIONS.md).

@@ -7,8 +7,9 @@ use std::sync::mpsc::{Receiver, sync_channel};
 
 use anyhow::Result;
 
+use skladiste::download::{self, Downloaded, Request, Sink};
 use skladiste::jobs::{both, par_map_iter};
-use skladiste::worker::{Downloaded, Request, Sink, Workers};
+use skladiste::worker::Workers;
 
 pub(crate) mod arch;
 
@@ -22,7 +23,7 @@ const MAX_WAITING: usize = 64;
 /// `job` in no particular order.
 ///
 /// Downloads go one after another per server, in the order of `requests`
-/// (see [`Workers::download_all`]). `downloaded` is called with the index
+/// (see [`download::download_all`]). `downloaded` is called with the index
 /// of the request, on the thread that downloads from its server, so the
 /// next download from there waits for it. Finished downloads are taken
 /// before items of `ready`, so that the download stage isn't held up.
@@ -47,7 +48,7 @@ pub(crate) fn fetch_and_run<S: Sink, T: Send, R: Send>(
     let (downloads, results) = std::thread::scope(|s| {
         // Owns the sender, so the jobs end when the downloads have.
         let stage = s.spawn(move || {
-            workers.download_all(requests, jobs, failed, |i, sink, download| {
+            download::download_all(workers, requests, jobs, failed, |i, sink, download| {
                 if let Some(item) = downloaded(i, sink, download)? {
                     // Fails only once the jobs have stopped for a failure.
                     let _ = tx.send(item);

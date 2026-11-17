@@ -248,7 +248,7 @@ are in BUGS.md.
   Repos sharing a host (e.g. a CDN) control only bodies, so they share
   its worker. Different origins don't share a worker, which matters
   because databases are unsigned.
-- The worker handles a queue of files (`src/worker/download.rs`; the
+- The worker handles a queue of files (`src/download.rs`; the
   design is in WORKERS.md). The supervisor sends items (a path, and
   what continues a file), keeping at most two unanswered, so the worker
   has the next file at hand without a round trip and sending never
@@ -376,12 +376,12 @@ are in BUGS.md.
   to 65 s. Rejected: GnuPG/gpgme as pacman uses (C, and the web of trust
   below); rPGP (also pure Rust, but lower level, leaving more of
   certificate validity to us).
-- Verification runs in `verify-arch` workers (`src/worker/verify.rs`),
+- Verification runs in `verify-arch` workers (`src/arch/verify.rs`),
   so an exploit of the OpenPGP parser doesn't get `skl`'s privileges,
   which may exceed the image's. The supervisor can't check a verdict, so
   a compromised verifier is as bad as a forged signature: the worker
   protects the host, not the result.
-  - A pool (`Workers::with_verifier`): up to `--jobs` workers, started
+  - A pool (`arch::verify::with_verifier`): up to `--jobs` workers, started
     as callers need them, so verification stays parallel. Each loads the
     keyring once and keeps its certification cache for the run. Rejected:
     a worker per package (a start and a keyring load each); a single
@@ -526,6 +526,17 @@ are in BUGS.md.
   exec is unsafe in a multithreaded process. Both ends are the same
   binary, so the protocol needs no stability. The environment is cleared
   and the working directory is `/`.
+- Each kind of worker is a `worker::Kind` (name, directories,
+  capabilities, entry point) defined with the code it runs: the Arch
+  ones in `arch`, the others in `download`, `diff` and `install`. Their
+  supervisor sides are functions there that take `&Workers`, which only
+  starts workers and holds settings. `worker::KINDS` lists every kind
+  (the only place the generic module names them);
+  `__worker` runs only those, with the directories the kind declares.
+  Rejected: a method on `Workers` per kind (the generic module grows
+  with every frontend, against keeping the core format-agnostic); a
+  trait per kind (the supervisor sides differ too much: one result, a
+  stream, a pool, a queue).
 - Fds for a worker (and for bwrap to bind) are inherited at their own
   numbers (CLOEXEC cleared in the child before exec), and the numbers
   passed as arguments. Rejected:
@@ -554,8 +565,12 @@ are in BUGS.md.
   worker opens before confining itself. New pid, net, ipc, uts and cgroup
   namespaces; `--die-with-parent` and `--new-session`. That kills a
   worker when the *thread* that started it ends (`PR_SET_PDEATHSIG`), so
-  workers shared between threads are started by a thread that outlives
-  them (see Package signatures). bwrap exits with
+  a `Worker` from `Workers::spawn` is `!Send`. Workers shared between
+  threads (see Package signatures) come from `Workers::with_spawner`: a
+  scoped thread of its own starts them, and a lifetime brand keeps them
+  from outliving it. Rejected: one thread that starts every worker (all
+  starts would go through it, while only the verifier's workers are
+  shared; not measured). bwrap exits with
   128 + the signal that killed the worker, which is reported like the
   signal itself. Namespaces add what Landlock lacks: a read-only store
   (Landlock doesn't restrict metadata changes), no view of host processes

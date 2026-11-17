@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use skladiste::download::{self, Request, Sink};
 use skladiste::http::{RootCerts, Url};
-use skladiste::worker::{Request, Sink, Workers};
+use skladiste::worker::Workers;
 
 fn workers() -> Workers {
     let mut workers = Workers::new(env!("CARGO_BIN_EXE_skl"));
@@ -212,7 +213,7 @@ fn download(url: &str, max_size: u64) -> anyhow::Result<Vec<u8>> {
 }
 
 fn download_with(workers: &Workers, url: &str, max_size: u64) -> anyhow::Result<Vec<u8>> {
-    let (out, d) = workers.download(&Url::parse(url)?, Vec::new(), max_size)?;
+    let (out, d) = download::download(workers, &Url::parse(url)?, Vec::new(), max_size)?;
     assert_eq!(d.size, out.len() as u64);
     Ok(out)
 }
@@ -237,7 +238,7 @@ impl Sink for Body {
     }
 }
 
-/// Download `urls` with [`Workers::download_all`]; returns each body, in
+/// Download `urls` with [`download::download_all`]; returns each body, in
 /// their order.
 fn download_all(urls: &[String], restart_if_changed: bool) -> anyhow::Result<Vec<Body>> {
     let requests = urls
@@ -252,7 +253,7 @@ fn download_all(urls: &[String], restart_if_changed: bool) -> anyhow::Result<Vec
     let bodies: Vec<Mutex<Option<Body>>> = urls.iter().map(|_| Mutex::default()).collect();
     let failed = AtomicBool::new(false);
     let jobs = NonZeroUsize::new(4).unwrap();
-    workers().download_all(requests, jobs, &failed, |i, body, d| {
+    download::download_all(&workers(), requests, jobs, &failed, |i, body, d| {
         assert_eq!(d.size, body.data.len() as u64);
         assert!(bodies[i].lock().unwrap().replace(body).is_none());
         Ok(())
@@ -345,18 +346,18 @@ fn https_with_custom_roots() {
         .collect();
     let done = AtomicUsize::new(0);
     let before = connections.load(Ordering::Relaxed);
-    custom
-        .download_all(
-            requests,
-            NonZeroUsize::MIN,
-            &AtomicBool::new(false),
-            |_, body, _| {
-                assert_eq!(body, b"secret");
-                done.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            },
-        )
-        .unwrap();
+    download::download_all(
+        &custom,
+        requests,
+        NonZeroUsize::MIN,
+        &AtomicBool::new(false),
+        |_, body, _| {
+            assert_eq!(body, b"secret");
+            done.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    )
+    .unwrap();
     assert_eq!(done.into_inner(), 3);
     assert_eq!(connections.load(Ordering::Relaxed) - before, 1);
 
@@ -406,14 +407,14 @@ fn downloads_body() {
     assert!(download(&server.url("/chunked.zst"), 3 << 20).unwrap() == expected);
 
     let url = Url::parse(&server.url("/big.zst")).unwrap();
-    let (_, d) = workers().download(&url, Vec::new(), u64::MAX).unwrap();
+    let (_, d) = download::download(&workers(), &url, Vec::new(), u64::MAX).unwrap();
     assert_eq!(
         d.last_modified.as_deref(),
         Some("Mon, 16 Nov 2026 08:00:00 GMT")
     );
     assert_eq!(d.etag.as_deref(), Some("\"6919-abc\""));
     let url = Url::parse(&server.url("/chunked.zst")).unwrap();
-    let (_, d) = workers().download(&url, Vec::new(), u64::MAX).unwrap();
+    let (_, d) = download::download(&workers(), &url, Vec::new(), u64::MAX).unwrap();
     assert_eq!((d.last_modified, d.etag), (None, None));
 }
 
@@ -677,14 +678,14 @@ fn stops_after_a_failure() {
         sink: Vec::new(),
     };
     let failed = AtomicBool::new(true);
-    workers()
-        .download_all(
-            vec![request("/small/a")],
-            NonZeroUsize::MIN,
-            &failed,
-            |_, _, _| panic!("downloaded after a failure"),
-        )
-        .unwrap();
+    download::download_all(
+        &workers(),
+        vec![request("/small/a")],
+        NonZeroUsize::MIN,
+        &failed,
+        |_, _, _| panic!("downloaded after a failure"),
+    )
+    .unwrap();
     assert_eq!(server.connections(), 0);
 
     // A failure of what is done with a download fails the stage, which
@@ -692,13 +693,18 @@ fn stops_after_a_failure() {
     let failed = AtomicBool::new(false);
     let requests = (0..10).map(|i| request(&format!("/small/{i}"))).collect();
     let done = AtomicUsize::new(0);
-    let err = workers()
-        .download_all(requests, NonZeroUsize::MIN, &failed, |i, _, _| {
+    let err = download::download_all(
+        &workers(),
+        requests,
+        NonZeroUsize::MIN,
+        &failed,
+        |i, _, _| {
             done.fetch_add(1, Ordering::Relaxed);
             anyhow::ensure!(i != 2, "file {i} is no good");
             Ok(())
-        })
-        .unwrap_err();
+        },
+    )
+    .unwrap_err();
     assert_eq!(err.to_string(), "file 2 is no good");
     assert!(failed.into_inner());
     assert_eq!(done.into_inner(), 3);

@@ -15,13 +15,15 @@ use sha2::{Digest, Sha256};
 use skladiste::arch;
 use skladiste::arch::repo::{DbEntry, LOCAL_REPO as LOCAL, Snapshot, repo_id};
 use skladiste::arch::signature;
+use skladiste::arch::verify::{self, KeyringError, KeyringFiles, Verifier};
+use skladiste::download::{Request, Sink};
 use skladiste::http::Url;
 use skladiste::install;
 use skladiste::jobs::par_map;
 use skladiste::manifest::Package;
 use skladiste::resolve::{self, Candidate, Target};
 use skladiste::store::{Store, TmpFile, hash_reader};
-use skladiste::worker::{KeyringError, KeyringFiles, Request, Sink, Verifier, Workers};
+use skladiste::worker::Workers;
 
 use super::{fetch_and_run, mib};
 
@@ -279,10 +281,11 @@ fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize
     Ok(())
 }
 
-struct Ctx<'a> {
+/// `'v`: the verifier's (see [`Verifier`]).
+struct Ctx<'a, 'v> {
     workers: &'a Workers,
     store: &'a Store,
-    verifier: &'a Verifier<'a>,
+    verifier: &'a Verifier<'v>,
 }
 
 /// A package file given to `skl arch import`.
@@ -706,10 +709,8 @@ fn import_archive(
     }
     file.seek(SeekFrom::Start(0))?;
     let importing = || format!("importing {what}");
-    let (pkg, stats) = ctx
-        .workers
-        .import_arch(ctx.store, file)
-        .with_context(importing)?;
+    let (pkg, stats) =
+        arch::import_in_worker(ctx.workers, ctx.store, file).with_context(importing)?;
     // The metadata must be usable for dependency resolution.
     arch::repo::package_candidate(&pkg).with_context(importing)?;
     if let Some(entry) = entry {
@@ -928,12 +929,10 @@ fn with_verifier<T>(
         })
     })()
     .with_context(loading)?;
-    workers
-        .with_verifier(files, jobs.get(), f)
-        .map_err(|e| match e.is::<KeyringError>() {
-            true => e.context(loading()),
-            false => e,
-        })
+    verify::with_verifier(workers, files, jobs.get(), f).map_err(|e| match e.is::<KeyringError>() {
+        true => e.context(loading()),
+        false => e,
+    })
 }
 
 /// `path` with `suffix` appended to its last component.

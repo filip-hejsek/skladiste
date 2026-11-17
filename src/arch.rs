@@ -4,20 +4,76 @@
 //!
 //! The archive is untrusted input, so [`import`] touches nothing but the
 //! stream it reads and the [`ObjectSink`] it writes to; `skl` runs it in a
-//! sandboxed worker process (see [`crate::worker`]).
+//! sandboxed worker process with [`import_in_worker`].
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::os::fd::FromRawFd;
 
 use anyhow::{Context, Result, bail};
 use tar::EntryType;
 
 use crate::manifest::{Entry, EntryKind, ObjectId, Package, XattrValue, normalize_path};
-use crate::store::ObjectSink;
+use crate::sandbox::{self, Policy};
+use crate::store::{ObjectSink, Store};
+use crate::worker::{self, Args, ImportStats, Kind, NO_CAPS, RemoteSink, Workers};
 
 pub mod repo;
 pub mod signature;
+pub mod verify;
 pub mod version;
+
+/// Address space limit of the import and database workers. Real packages
+/// need tens of MiB; zstd's default limit on the decoding window is
+/// 128 MiB, and very large packages have manifests of tens of MiB.
+const IMPORT_MAX_MEMORY: u64 = 1 << 30;
+
+/// The worker that imports a package archive: fd 0 is the archive, fd 1 a
+/// socket. It parses the archive with [`import`] and streams each file's
+/// content to the supervisor, which stores and hashes the objects as they
+/// arrive; `DONE` holds the manifest. Data flows only from the worker: it
+/// never waits for the supervisor. No filesystem access, no ioctls.
+pub(crate) const IMPORT_WORKER: Kind = Kind {
+    name: "import-arch",
+    dirs: &[],
+    caps: NO_CAPS,
+    main: import_main,
+};
+
+/// Parse an Arch package archive in a worker, adding its file contents
+/// to `store`. The returned manifest is checked but not saved.
+pub fn import_in_worker(
+    workers: &Workers,
+    store: &Store,
+    archive: File,
+) -> Result<(Package, ImportStats)> {
+    let (ours, theirs) = worker::stream_socket()?;
+    let w = workers.spawn(&IMPORT_WORKER, archive.into(), theirs, &[], &[])?;
+    let mut conn = worker::receiver(ours)?;
+    let result = worker::receive_objects(store, &mut conn).and_then(|(objects, json, stats)| {
+        let pkg: Package<ObjectId> =
+            serde_json::from_slice(&json).context("parsing manifest from worker")?;
+        let pkg = pkg.resolve(&objects)?;
+        pkg.validate()?;
+        Ok((pkg, stats))
+    });
+    drop(conn);
+    w.finish(result)
+}
+
+fn import_main(args: Args) -> Result<Vec<u8>> {
+    args.no_extra()?;
+    // SAFETY: the supervisor passes the archive as fd 0.
+    let archive = unsafe { File::from_raw_fd(0) };
+    let policy = Policy {
+        max_memory: Some(IMPORT_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(args.layers, &policy)?;
+    let pkg = import(archive, RemoteSink::new(args.out))?;
+    Ok(serde_json::to_vec(&pkg)?)
+}
 
 /// Read a package archive, adding file contents to `objects`.
 pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package<ObjectId>> {

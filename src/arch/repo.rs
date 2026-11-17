@@ -7,23 +7,27 @@
 //!
 //! A database is untrusted input, so [`read_db`] reads only the stream it
 //! is given; `skl` runs it in a sandboxed worker and checks the result
-//! with [`validate`].
+//! with [`validate`] (see [`load_db`]).
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::os::fd::FromRawFd;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::arch::IMPORT_MAX_MEMORY;
 use crate::arch::signature::MAX_SIGNATURE_SIZE;
+use crate::download::{self, Downloaded, Request};
 use crate::http::Url;
 use crate::manifest::Package;
 use crate::repo::{self, SyncRecord};
 use crate::resolve::{Candidate, Dep, Op, Provide};
+use crate::sandbox::{self, Policy};
 use crate::store::Store;
-use crate::worker::{Downloaded, Request, Workers};
+use crate::worker::{self, Args, Kind, NO_CAPS, Workers};
 
 /// Largest `desc` file accepted (most are under 2 KiB).
 const MAX_DESC: u64 = 1 << 20;
@@ -268,7 +272,8 @@ pub fn db_record(
 /// return a record of it to save once it has been checked.
 pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<SyncRecord> {
     let request = db_request(config)?;
-    let (data, downloaded) = workers.download(&request.url, request.sink, request.max_size)?;
+    let (data, downloaded) =
+        download::download(workers, &request.url, request.sink, request.max_size)?;
     db_record(store, &request.url, &data, downloaded)
 }
 
@@ -276,9 +281,43 @@ pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<Syn
 /// in a worker.
 pub fn load_db(workers: &Workers, store: &Store, record: &SyncRecord) -> Result<Vec<DbEntry>> {
     let db = File::from(store.open_object(&record.hash)?);
-    workers
-        .read_arch_db(db)
-        .with_context(|| format!("reading database from {}", record.url))
+    read_db_in_worker(workers, db).with_context(|| format!("reading database from {}", record.url))
+}
+
+/// The worker that reads a database: fd 0 is the database, fd 1 a pipe. It
+/// reads it with [`read_db`] and sends the entries in `DONE`; the
+/// supervisor validates them. No filesystem access, no ioctls.
+pub(crate) const READ_DB_WORKER: Kind = Kind {
+    name: "read-arch-db",
+    dirs: &[],
+    caps: NO_CAPS,
+    main: read_db_main,
+};
+
+/// Read a database in a worker, and validate the entries.
+fn read_db_in_worker(workers: &Workers, db: File) -> Result<Vec<DbEntry>> {
+    use rustix::pipe::{PipeFlags, pipe_with};
+    let (result_r, result_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+    let w = workers.spawn(&READ_DB_WORKER, db.into(), result_w, &[], &[])?;
+    let result = worker::read_result(&mut BufReader::new(File::from(result_r))).and_then(|json| {
+        let entries: Vec<DbEntry> =
+            serde_json::from_slice(&json).context("parsing result from worker")?;
+        validate(&entries)?;
+        Ok(entries)
+    });
+    w.finish(result)
+}
+
+fn read_db_main(args: Args) -> Result<Vec<u8>> {
+    args.no_extra()?;
+    // SAFETY: the supervisor passes the database as fd 0.
+    let db = unsafe { File::from_raw_fd(0) };
+    let policy = Policy {
+        max_memory: Some(IMPORT_MAX_MEMORY),
+        ..Policy::default()
+    };
+    sandbox::confine(args.layers, &policy)?;
+    Ok(serde_json::to_vec(&read_db(db)?)?)
 }
 
 /// A package in a repo's database. Sent by the worker that reads the

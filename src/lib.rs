@@ -4,6 +4,7 @@ pub mod arch;
 pub mod btrfs;
 mod bwrap;
 pub mod diff;
+pub mod download;
 pub mod http;
 pub mod install;
 pub mod jobs;
