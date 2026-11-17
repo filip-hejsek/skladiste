@@ -246,9 +246,10 @@ pub(crate) fn hex_decode(s: &str) -> anyhow::Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(bad());
     }
-    s.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Ok(digit(pair[0]).ok_or_else(bad)? << 4 | digit(pair[1]).ok_or_else(bad)?))
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Ok(digit(hi).ok_or_else(bad)? << 4 | digit(lo).ok_or_else(bad)?))
         .collect()
 }
 
