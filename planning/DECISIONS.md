@@ -351,13 +351,33 @@ are in BUGS.md.
   to 65 s. Rejected: GnuPG/gpgme as pacman uses (C, and the web of trust
   below); rPGP (also pure Rust, but lower level, leaving more of
   certificate validity to us).
-- Verification runs in the supervisor, not a worker. The verdict can't
-  be checked by the supervisor, so a compromised verifier is already as
-  bad as a forged signature; a worker would add protection of the host
-  for a per-package process and protocol. The untrusted input is only
-  the small `.sig` file and the archive bytes being hashed. That host
-  protection still matters when `skl` has more privileges than the image
-  will run with, but isn't a priority (see Sandboxing in TODO.md).
+- Verification runs in `verify-arch` workers (`src/worker/verify.rs`),
+  so an exploit of the OpenPGP parser doesn't get `skl`'s privileges,
+  which may exceed the image's. The supervisor can't check a verdict, so
+  a compromised verifier is as bad as a forged signature: the worker
+  protects the host, not the result.
+  - A pool (`Workers::with_verifier`): up to `--jobs` workers, started
+    as callers need them, so verification stays parallel. Each loads the
+    keyring once and keeps its certification cache for the run. Rejected:
+    a worker per package (a start and a keyring load each); a single
+    worker for the run (verifying on one core while imports use all).
+  - A worker has one item at a time: each caller waits for its verdict
+    before going on, so there is nothing to pipeline per caller, and
+    concurrent callers get different workers.
+  - Input is a `SOCK_SEQPACKET` socket with fds attached (`SCM_RIGHTS`):
+    first the three keyring files, then a signature with the archive's fd
+    per item. Verdicts come back on a pipe. The supervisor sends a new
+    read-only open file of each (through `/proc/self/fd`, regular files
+    only), so the worker can't write a download in the store, and its
+    reads don't move the supervisor's offset. Rejected: streaming the
+    archive through the socket (a copy, and an item wouldn't fit in the
+    socket buffer, so sending could block).
+  - Cost, measured on a build of the 42-package set from kept downloads
+    (40 MB, all verified again, 8 CPUs): 995 ms instead of 936 ms. With
+    `-j1`: verifying took 143 ms in the worker instead of 126 ms in the
+    supervisor, round trips 4 ms in all, and the first worker's start and
+    keyring load 36-65 ms instead of 30 ms. Ending 8 workers one after
+    another took 18 ms, so their inputs are closed together.
 - Trust is an explicit rule, not GnuPG's web of trust: a packager key is
   a certificate with a user ID certified by at least 3 master keys
   (`archlinux-trusted`, which must list them at marginal trust `4`;
@@ -507,7 +527,10 @@ are in BUGS.md.
   present), the `skl` binary bound from an `O_PATH` fd at `/skl`, and the
   worker's directories bound from their fds at fixed paths, which the
   worker opens before confining itself. New pid, net, ipc, uts and cgroup
-  namespaces; `--die-with-parent` and `--new-session`. bwrap exits with
+  namespaces; `--die-with-parent` and `--new-session`. That kills a
+  worker when the *thread* that started it ends (`PR_SET_PDEATHSIG`), so
+  workers shared between threads are started by a thread that outlives
+  them (see Package signatures). bwrap exits with
   128 + the signal that killed the worker, which is reported like the
   signal itself. Namespaces add what Landlock lacks: a read-only store
   (Landlock doesn't restrict metadata changes), no view of host processes
@@ -530,7 +553,9 @@ are in BUGS.md.
   then a seccomp allowlist that kills the process on any other system
   call. Allowlisting also rejects x32 system calls. `fcntl` is allowed
   only with `F_GETFD`, which debug builds use when closing fds; `ioctl`
-  only with listed request numbers.
+  only with listed request numbers. Before confining, a worker calls
+  `tzset()`: glibc's `strftime` (Sequoia's error messages) otherwise
+  opens `/etc/localtime` on first use, and seccomp kills the worker.
 - Workers have a fixed address space limit (`RLIMIT_AS`, soft and hard,
   set before confining): 1 GiB for import (real packages need tens of
   MiB; zstd's decoding window is at most 128 MiB by default), 4 GiB for
@@ -613,9 +638,10 @@ are in BUGS.md.
   (0.50 s at `-j1`, 0.75 s at `-j8`), presumably contention in btrfs.
   Starting in command-line order instead took 0.56 s with `-j2` and
   0.49 s with `-j8`.
-- A package archive is opened once, verified, hashed for its id, and the
-  same open file is parsed, so the manifest matches the id unless the
-  file is written to meanwhile (see BUGS.md).
+- A package archive is opened once, verified (through a read-only open
+  file of it), hashed for its id, and the same open file is parsed, so
+  the manifest matches the id unless the file is written to meanwhile
+  (see BUGS.md).
 - Package code (install scripts, hooks) runs under an existing sandbox
   tool, bubblewrap for now (minijail or nsjail would also do). Rejected:
   setting up namespaces ourselves; no clear benefit for more code. Workers

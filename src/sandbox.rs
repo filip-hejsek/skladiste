@@ -109,6 +109,17 @@ pub(crate) fn confine(layers: Layers, policy: &Policy) -> Result<()> {
         };
         setrlimit(Resource::As, limit).context("limiting memory")?;
     }
+    // glibc loads the time zone (`/etc/localtime`, absent in a worker, so
+    // UTC) when `strftime` or `localtime` first needs it, which would be
+    // a system call seccomp kills the worker for. Sequoia formats times
+    // with `strftime` in error messages. Once loaded, it is kept as long as
+    // `TZ` doesn't change (the environment is cleared).
+    unsafe extern "C" {
+        fn tzset();
+    }
+    // SAFETY: the worker is single-threaded here, and nothing else changes
+    // the environment or time zone state.
+    unsafe { tzset() };
     // Required for unprivileged Landlock and seccomp; also keeps exec from
     // gaining privileges if seccomp is off.
     rustix::thread::set_no_new_privs(true).context("setting no_new_privs")?;

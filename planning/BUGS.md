@@ -15,7 +15,7 @@ are in TODO.md.
 
 ## Arch frontend
 
-- The archive is read three times from the same open file (signature
+- The archive is read three times from the same file (signature
   check, hash, import). Someone who can write the file meanwhile can get
   unverified content imported. This affects package files given as
   paths; downloads are written only by the supervisor (in the store).

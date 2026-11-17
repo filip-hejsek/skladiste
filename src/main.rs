@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt;
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use skladiste::arch;
 use skladiste::arch::repo::{DbEntry, Snapshot};
-use skladiste::arch::signature::{self, Keyring};
+use skladiste::arch::signature;
 use skladiste::btrfs;
 use skladiste::diff::Change;
 use skladiste::http::{RootCerts, Url};
@@ -27,7 +27,9 @@ use skladiste::manifest::Package;
 use skladiste::repo::LOCAL;
 use skladiste::resolve::{self, Candidate, Target};
 use skladiste::store::{Store, TmpFile, hash_reader};
-use skladiste::worker::{self, Downloaded, Request, Sink, Workers};
+use skladiste::worker::{
+    self, Downloaded, KeyringError, KeyringFiles, Request, Sink, Verifier, Workers,
+};
 
 #[derive(Parser)]
 #[command(name = "skl", about = "Content-addressed package manager on btrfs")]
@@ -212,22 +214,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
         .context("no store given (--store or SKL_STORE)")?;
     let store = Store::open(store)?;
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
-    let keyring = || -> Result<Keyring> {
-        let prefix = cli
-            .keyring
-            .as_deref()
-            .context("no keyring given (--keyring or SKL_KEYRING)")?;
-        load_keyring(prefix)
-    };
+    let keyring = cli.keyring.as_deref();
     match cli.command {
         Command::Import { packages } => {
-            let keyring = keyring()?;
-            let ctx = Ctx {
-                workers: &workers,
-                store: &store,
-                keyring: &keyring,
-            };
-            import_local(&ctx, &packages, jobs)?;
+            with_verifier(&workers, keyring, jobs, |verifier| {
+                let ctx = Ctx {
+                    workers: &workers,
+                    store: &store,
+                    verifier,
+                };
+                import_local(&ctx, &packages, jobs)
+            })?;
         }
         Command::Build {
             output,
@@ -250,13 +247,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let sources = load_sources(&workers, &store, &repos, jobs)?;
             let chosen = choose(&sources, &targets)?;
             let packages = if chosen.iter().any(|c| matches!(c, Chosen::Repo(_))) {
-                let keyring = keyring()?;
-                let ctx = Ctx {
-                    workers: &workers,
-                    store: &store,
-                    keyring: &keyring,
-                };
-                get_packages(&ctx, &chosen, fetch, jobs)?
+                with_verifier(&workers, keyring, jobs, |verifier| {
+                    let ctx = Ctx {
+                        workers: &workers,
+                        store: &store,
+                        verifier,
+                    };
+                    get_packages(&ctx, &chosen, fetch, jobs)
+                })?
             } else {
                 chosen
                     .iter()
@@ -489,7 +487,7 @@ impl<T> Iterator for Feed<T> {
 struct Ctx<'a> {
     workers: &'a Workers,
     store: &'a Store,
-    keyring: &'a Keyring,
+    verifier: &'a Verifier<'a>,
 }
 
 /// A package file given to `skl import`.
@@ -756,14 +754,15 @@ fn import_local(ctx: &Ctx, args: &[OsString], jobs: NonZeroUsize) -> Result<()> 
         |archive| {
             let (file, what) = match archive {
                 LocalArchive::Path(path) => {
-                    let mut file =
+                    let file =
                         File::open(path).with_context(|| format!("opening {}", path.display()))?;
                     let sig_path = with_suffix(path, ".sig");
                     let sig = File::open(&sig_path)
                         .with_context(|| format!("opening {}", sig_path.display()))?;
                     let sig = read_signature(sig)
                         .with_context(|| format!("reading {}", sig_path.display()))?;
-                    verify(ctx.keyring, &sig, &mut file)
+                    ctx.verifier
+                        .verify(&sig, &file)
                         .with_context(|| format!("verifying {}", path.display()))?;
                     (file, path.display().to_string())
                 }
@@ -865,11 +864,11 @@ fn get_repo_package(ctx: &Ctx, pkg: &RepoPackage, fetched: Option<File>) -> Resu
     let file = match fetched {
         Some(file) => file,
         None => {
-            let mut file = ctx
+            let file = ctx
                 .store
                 .open_download(repo, name)?
                 .with_context(|| format!("{repo}/{name} is no longer in the store"))?;
-            verify(ctx.keyring, pkg.signature()?, &mut file).with_context(|| {
+            ctx.verifier.verify(pkg.signature()?, &file).with_context(|| {
                 format!("verifying {name}, downloaded earlier (delete downloads/{repo}/{name} in the store to download it again)")
             })?;
             file
@@ -885,11 +884,11 @@ fn get_repo_package(ctx: &Ctx, pkg: &RepoPackage, fetched: Option<File>) -> Resu
 /// verified, from the store, importing it if needed (the second value
 /// tells whether it was). Packages are identified by their repo and the
 /// hash of the archive file. With `entry`, the SHA-256 must be the one it
-/// gives. The file is read from the same open file as it was verified
-/// from, so the parsed content is the content that was verified and
-/// hashed, unless the file is written to meanwhile (see planning/BUGS.md;
-/// only the supervisor writes downloads). Concurrent calls for the same
-/// archive each import it.
+/// gives. The file is the one that was verified (which the verification
+/// worker read through its own open file), so the parsed content is the
+/// content that was verified and hashed, unless the file is written to
+/// meanwhile (see planning/BUGS.md; only the supervisor writes
+/// downloads). Concurrent calls for the same archive each import it.
 fn import_archive(
     ctx: &Ctx,
     mut file: File,
@@ -1051,9 +1050,9 @@ fn open_kept(ctx: &Ctx, url: &Url) -> Result<File> {
         let file = ctx.store.open_download(LOCAL, name)?;
         file.with_context(|| format!("{LOCAL}/{name} is no longer in the store"))
     };
-    let (sig, mut file) = (open(&sig_name)?, open(name)?);
+    let (sig, file) = (open(&sig_name)?, open(name)?);
     let sig = read_signature(sig).with_context(|| format!("reading downloaded {sig_name}"))?;
-    verify(ctx.keyring, &sig, &mut file).with_context(|| {
+    ctx.verifier.verify(&sig, &file).with_context(|| {
         format!("verifying {name}, downloaded earlier (delete downloads/{LOCAL}/{name} in the store to download it again)")
     })?;
     Ok(file)
@@ -1083,7 +1082,9 @@ fn keep_download(
             .with_context(|| format!("downloading {url}"))?;
     }
     // An empty download has no file yet.
-    verify(ctx.keyring, sig, archive.tmp()?.file()).with_context(|| format!("verifying {url}"))?;
+    ctx.verifier
+        .verify(sig, archive.tmp()?.file())
+        .with_context(|| format!("verifying {url}"))?;
     let store = ctx.store;
     let file = archive.tmp.take().unwrap().save_download(repo, name)?;
     let sig_name = format!("{name}.sig");
@@ -1109,27 +1110,39 @@ fn read_signature(file: File) -> Result<Vec<u8>> {
     Ok(sig)
 }
 
-/// Check `file`'s signature from its start.
-fn verify(keyring: &Keyring, sig: &[u8], file: &mut File) -> Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    keyring.verify(sig, &*file)?;
-    Ok(())
-}
-
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-/// Load the keyring `PREFIX.gpg`, `PREFIX-trusted`, `PREFIX-revoked`.
-fn load_keyring(prefix: &Path) -> Result<Keyring> {
+/// Run `f` with a verifier that checks signatures with the keyring
+/// `PREFIX.gpg`, `PREFIX-trusted`, `PREFIX-revoked`, in up to `jobs`
+/// workers at once.
+fn with_verifier<T>(
+    workers: &Workers,
+    prefix: Option<&Path>,
+    jobs: NonZeroUsize,
+    f: impl FnOnce(&Verifier) -> Result<T>,
+) -> Result<T> {
+    let prefix = prefix.context("no keyring given (--keyring or SKL_KEYRING)")?;
+    let loading = || format!("loading keyring {}", prefix.display());
     let open = |suffix| {
         let path = with_suffix(prefix, suffix);
-        File::open(&path)
-            .map(BufReader::new)
-            .with_context(|| format!("opening {}", path.display()))
+        File::open(&path).with_context(|| format!("opening {}", path.display()))
     };
-    Keyring::load(open(".gpg")?, open("-trusted")?, open("-revoked")?)
-        .with_context(|| format!("loading keyring {}", prefix.display()))
+    let files = (|| -> Result<KeyringFiles> {
+        Ok(KeyringFiles {
+            certs: open(".gpg")?,
+            trusted: open("-trusted")?,
+            revoked: open("-revoked")?,
+        })
+    })()
+    .with_context(loading)?;
+    workers
+        .with_verifier(files, jobs.get(), f)
+        .map_err(|e| match e.is::<KeyringError>() {
+            true => e.context(loading()),
+            false => e,
+        })
 }
 
 /// `path` with `suffix` appended to its last component.

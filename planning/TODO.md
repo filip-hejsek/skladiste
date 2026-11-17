@@ -112,6 +112,3 @@ Decisions already made are under Sandboxing in DECISIONS.md.
   the store, the package files and the image's parent directory).
 - Package code has no limits on memory, processes or disk use in the
   image (it can fill the filesystem). Cgroups or btrfs qgroups would do.
-- Low priority: signature verification in a worker (one per import
-  run, not per package). It runs in the supervisor now, so a parser
-  exploit gets `skl`'s privileges, which may exceed the image's.

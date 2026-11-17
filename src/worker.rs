@@ -33,6 +33,13 @@
 //!   worker reads it with [`arch::repo::read_db`] and sends the entries in
 //!   `DONE`; the supervisor validates them. No filesystem access, no
 //!   ioctls.
+//! - `verify-arch`: fd 0 is a socket for input, fd 1 a pipe. A queue
+//!   worker that checks package signatures: the supervisor sends it the
+//!   keyring files, then signatures with the archive's fd, and it answers
+//!   each with a verdict. The supervisor can't check the verdict; the
+//!   worker keeps a parser exploit from getting `skl`'s privileges. No
+//!   filesystem access, no ioctls. See the `verify` module here, and
+//!   [`Verifier`] for the pool of such workers.
 //! - `diff`: fd 0 is unused, fd 1 a socket, and the tree before (a
 //!   snapshot) and after are bound read-only at `/old` and `/new`. The
 //!   worker compares them with [`diff::diff`] and streams the new
@@ -70,8 +77,10 @@ use crate::sandbox::{self, Layers, Policy};
 use crate::store::{ObjectSink, Store};
 
 mod download;
+mod verify;
 
 pub use download::{Downloaded, Request, Sink};
+pub use verify::{KeyringError, KeyringFiles, Verifier};
 
 /// First argument that makes `skl` run as a worker. `main` must check for
 /// it before doing anything else.
@@ -714,6 +723,7 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
             download::worker(layers, origin, true, out)
         }
         ("read-arch-db", []) if dirs.is_empty() => read_db_worker(layers),
+        ("verify-arch", []) if dirs.is_empty() => verify::worker(layers, out),
         ("diff", []) => {
             let [old, new] = <[OwnedFd; 2]>::try_from(dirs)
                 .map_err(|_| anyhow::anyhow!("diff worker needs two directories"))?;
