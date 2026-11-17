@@ -5,19 +5,66 @@
 //! (see [`crate::store`]). What a repo's configuration and database contain
 //! depends on the frontend (e.g. [`crate::arch::repo`]); the core keeps
 //! only a [`SyncRecord`] of each database it fetched.
+//!
+//! Each package format has its own namespace: the store knows a repo by
+//! its id `@FORMAT/NAME` (see [`id`]), e.g. `@arch/core`, so that formats
+//! don't compete for names.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::Hash;
 
-/// Pseudo-repo of packages imported from files or URLs.
+/// Name of the pseudo-repo of a format's packages imported from files or
+/// URLs (id `@FORMAT/@local`).
 pub const LOCAL: &str = "@local";
 
 /// Longest repo name accepted.
 const MAX_NAME: usize = 64;
+
+/// Longest format name accepted.
+const MAX_FORMAT: usize = 16;
+
+/// The id of repo `name` (a repo name or [`LOCAL`]) of package format
+/// `format`: `@FORMAT/NAME`.
+pub fn id(format: &str, name: &str) -> Result<String> {
+    let id = format!("@{format}/{name}");
+    check_id(&id)?;
+    Ok(id)
+}
+
+/// Check a repo id (see [`id`]).
+pub fn check_id(id: &str) -> Result<()> {
+    split_id(id).map(drop)
+}
+
+/// The format and the name of the repo with id `id`.
+pub fn split_id(id: &str) -> Result<(&str, &str)> {
+    let Some((format, name)) = id.strip_prefix('@').and_then(|s| s.split_once('/')) else {
+        bail!("bad repo id {id:?} (not @FORMAT/NAME)");
+    };
+    check_format(format)?;
+    if name != LOCAL {
+        check_name(name)?;
+    }
+    Ok((format, name))
+}
+
+/// Check the name of a package format: ASCII lowercase letters and
+/// digits, starting with a letter.
+pub fn check_format(format: &str) -> Result<()> {
+    ensure!(
+        format.len() <= MAX_FORMAT
+            && format.starts_with(|c: char| c.is_ascii_lowercase())
+            && format
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+        "bad package format {format:?}"
+    );
+    Ok(())
+}
 
 /// Check the name of a configured repo: ASCII letters, digits and `._+-`,
 /// not starting with `.` or `-`. Names starting with `@` are reserved for
@@ -33,15 +80,6 @@ pub fn check_name(name: &str) -> Result<()> {
         "bad repo name {name:?} (allowed: ASCII letters, digits and ._+-, not first . or -)"
     );
     Ok(())
-}
-
-/// Check a repo name that may also be a pseudo-repo.
-pub(crate) fn check_name_or_local(name: &str) -> Result<()> {
-    if name == LOCAL {
-        Ok(())
-    } else {
-        check_name(name)
-    }
 }
 
 /// One fetched version of a repo's database (a snapshot), kept as
@@ -101,8 +139,27 @@ mod tests {
         for bad in ["", ".x", "-x", "a/b", "@local", "é", &"a".repeat(65)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
-        check_name_or_local(LOCAL).unwrap();
-        assert!(check_name_or_local("@other").is_err());
+    }
+
+    #[test]
+    fn ids() {
+        assert_eq!(id("arch", "core").unwrap(), "@arch/core");
+        assert_eq!(id("arch", LOCAL).unwrap(), "@arch/@local");
+        assert_eq!(split_id("@deb2/main").unwrap(), ("deb2", "main"));
+        for bad in [
+            "core",
+            "@arch",
+            "@arch/",
+            "@/core",
+            "@Arch/core",
+            "@2/core",
+            "@arch/@other",
+            "@arch/a/b",
+            "@arch/..",
+            "@../core",
+        ] {
+            assert!(check_id(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

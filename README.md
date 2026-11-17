@@ -86,11 +86,15 @@ directory they can write to, with all its contents.
 - `objects/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
 - `packages/<repo>/<hash>.json` — imported package manifests, keyed by the
   archive's hash; packages imported from files or URLs are in the repo
-  `@local`
+  `@arch/@local`
 - `downloads/<repo>/` — downloaded packages and their signatures
 - `repos/<repo>/` — a repo's configuration and a record of each version of
   its database that was synced (the database itself is an object)
 - `tmp/` — staging area for new objects
+
+`<repo>` is the repo's id, `@FORMAT/NAME`: each package format has its
+own namespace, so the Arch repo `core` is `@arch/core`. `skl repo list`
+lists the repos of all formats by id; `skl arch` takes names or ids.
 
 ## License
 

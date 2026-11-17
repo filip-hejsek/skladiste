@@ -23,7 +23,7 @@ are in BUGS.md.
 
 - Commands of a package format are under a subcommand named for its
   frontend (`skl arch import|build|repo|sync`); format-independent ones
-  (`skl run`) are at the top level. Options only a frontend uses
+  (`skl run`, `skl repo list`) are at the top level. Options only a frontend uses
   (`--keyring`) are its subcommand's. Rejected: flat commands (`skl
   build`), which give the generic verbs to Arch; core verbs that
   dispatch to a frontend by the repo's format, premature with one
@@ -62,8 +62,8 @@ are in BUGS.md.
 - An imported package is identified by its repo and the BLAKE3 hash of
   its archive file (`<repo>/<hash>`), so re-importing the same file is
   skipped. Objects are shared, so a package in two repos costs only its
-  manifest twice. Packages imported from paths or URLs belong to the
-  pseudo-repo `@local`.
+  manifest twice. Packages imported from paths or URLs belong to their
+  format's pseudo-repo `@local` (`@arch/@local`).
 - Manifests are JSON; hashes and xattr values are hex strings.
 
 ## Arch frontend
@@ -84,7 +84,18 @@ are in BUGS.md.
   repos it may use, and restrictions are per repo. Names are ASCII
   letters, digits and `._+-`; names starting with `@` are kept for
   pseudo-repos.
-- Configuration is in the store, `repos/<name>/config.json`, written by
+- Repos are partitioned by package format: the store knows a repo by its
+  id `@FORMAT/NAME` (`@arch/core`, `@arch/@local`; `src/repo.rs`), which
+  is also its path under `repos/`, `packages/` and `downloads/`. So
+  formats don't compete for names: Arch can't take `core` from another
+  distro's repo. Frontend commands take names in their own namespace or
+  ids (`skl arch build --repo core`, or `--repo @arch/core`, and
+  `@arch/core/bash`); `skl repo list` lists all repos by id. Rejected:
+  one shared namespace with the format recorded in each repo's config.
+  Format names are lowercase ASCII letters and digits. Stores from
+  before the namespaces need their repos moved under `@arch/` by hand
+  (repos, packages and downloads directories).
+- Configuration is in the store, `repos/<repo>/config.json`, written by
   `skl arch repo add NAME SERVER [--db DB]`. For Arch: a URL template in the
   format of pacman's `Server` (`…/$repo/os/$arch`, `$arch` is always
   `x86_64`) and the remote database name (`core` for `core.db`; default
@@ -142,7 +153,7 @@ are in BUGS.md.
   repos first (as `skl arch sync` with those repos), `--fetch` downloads
   packages that aren't in the store's downloads; without it, a missing
   package is an error.
-- Package files and URLs are imported in a step of their own (`skl
+- Package files and URLs are imported in a step of their own (`skl arch
   import FILE|URL...`) into the pseudo-repo `@local`, which a build uses
   like any other repo (`--repo @local`, `@local/NAME`). So `build`'s
   arguments are never paths, and local packages take part in dependency

@@ -61,6 +61,11 @@ struct Cli {
 enum Command {
     /// Arch Linux packages: repos, importing, and building images.
     Arch(cli::arch::ArchArgs),
+    /// Manage repos of all package formats.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
     /// Run a program in an image, as root, sandboxed with bubblewrap.
     ///
     /// The program sees only the image, read-write, with a read-only /proc
@@ -88,6 +93,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// List repos by id (`@FORMAT/NAME`) with the time of their latest sync.
+    List,
 }
 
 fn main() -> ExitCode {
@@ -132,6 +143,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
     match cli.command {
         Command::Arch(args) => cli::arch::run(args, &workers, &store, jobs)?,
+        Command::Repo {
+            command: RepoCommand::List,
+        } => {
+            for id in store.repos()? {
+                let synced = match store.latest_sync(&id)? {
+                    Some(record) => record.fetched,
+                    None => "never synced".to_owned(),
+                };
+                println!("{id}\t{synced}");
+            }
+        }
         Command::Run {
             image,
             program,

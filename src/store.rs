@@ -4,7 +4,7 @@
 //! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
 //!   and the archive's hash (packages imported from files or URLs belong to
-//!   the pseudo-repo [`repo::LOCAL`])
+//!   their format's pseudo-repo `@FORMAT/@local`, see [`repo::LOCAL`])
 //! - `downloads/<repo>/<name>` — downloaded package archives (and their
 //!   signatures), by repo and file name
 //! - `repos/<repo>/config.json` — a repo's configuration (see
@@ -14,6 +14,9 @@
 //!   itself is an object
 //! - `tmp/` — staging area for files being written: unnamed
 //!   (`O_TMPFILE`) until complete and checked, except manifests
+//!
+//! `<repo>` is the repo's id `@FORMAT/NAME` (see [`repo::id`]), so it is
+//! two directory levels, e.g. `repos/@arch/core/`.
 //!
 //! After [`Store::open`], every access is relative to the store's directory
 //! fd, so the store also works from a sandboxed process that was handed only
@@ -79,7 +82,7 @@ fn object_name(hash: &Hash) -> String {
 
 /// `packages/<repo>/<hash>.json`.
 fn package_name(repo: &str, hash: &Hash) -> Result<String> {
-    repo::check_name_or_local(repo)?;
+    repo::check_id(repo)?;
     Ok(format!("packages/{repo}/{hash}.json"))
 }
 
@@ -280,7 +283,7 @@ impl Store {
 
     /// The archive hashes of the packages imported from `repo`, sorted.
     pub fn packages(&self, repo: &str) -> Result<Vec<Hash>> {
-        repo::check_name_or_local(repo)?;
+        repo::check_id(repo)?;
         let dir = format!("packages/{repo}");
         if let Err(Errno::NOENT) = rustix::fs::statat(&self.dir, &dir, AtFlags::empty()) {
             return Ok(Vec::new());
@@ -299,15 +302,17 @@ impl Store {
     /// package don't interfere; one of them wins.
     pub fn save_package(&self, repo: &str, hash: &Hash, pkg: &Package) -> Result<()> {
         let name = package_name(repo, hash)?;
-        mkdir_exist_ok(&self.dir, &format!("packages/{repo}"))
-            .with_context(|| format!("creating packages/{repo}"))?;
+        mkdir_repo(&self.dir, "packages", repo)?;
         self.write_replace(&name, &serde_json::to_vec(pkg)?)
     }
 
-    /// Add repo `name` with `config` (in the frontend's format). Fails if
-    /// the repo exists.
+    /// Add the repo with id `name` with `config` (in the frontend's
+    /// format). Fails if the repo exists, or is a pseudo-repo.
     pub fn add_repo(&self, name: &str, config: &impl Serialize) -> Result<()> {
-        repo::check_name(name)?;
+        let (format, repo_name) = repo::split_id(name)?;
+        repo::check_name(repo_name)?;
+        let parent = format!("repos/@{format}");
+        mkdir_exist_ok(&self.dir, &parent).with_context(|| format!("creating {parent}"))?;
         let dir = format!("repos/{name}");
         match rustix::fs::mkdirat(&self.dir, &dir, Mode::from_raw_mode(0o755)) {
             Ok(()) => {}
@@ -322,17 +327,27 @@ impl Store {
 
     /// Configuration of repo `name`, which must exist.
     pub fn repo_config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
-        repo::check_name(name)?;
+        repo::check_id(name)?;
         self.read_json(&format!("repos/{name}/config.json"))?
-            .with_context(|| format!("no repo {name} (add it with `skl arch repo add`)"))
+            .with_context(|| format!("no repo {name}"))
     }
 
-    /// Names of the configured repos, sorted.
+    /// Ids of the configured repos of all formats, sorted.
     pub fn repos(&self) -> Result<Vec<String>> {
-        let mut names = self.list_dir("repos")?;
-        names.retain(|n| repo::check_name(n).is_ok());
-        names.sort();
-        Ok(names)
+        let mut ids = Vec::new();
+        for namespace in self.list_dir("repos")? {
+            let format = namespace.strip_prefix('@').unwrap_or_default();
+            if repo::check_format(format).is_err() {
+                continue;
+            }
+            for name in self.list_dir(&format!("repos/{namespace}"))? {
+                if repo::check_name(&name).is_ok() {
+                    ids.push(format!("{namespace}/{name}"));
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
     }
 
     /// Names in directory `path`, other than `.` and `..`, unsorted.
@@ -354,7 +369,7 @@ impl Store {
     /// Record a sync of repo `name`, as `syncs/<fetched>.json`. Fails if
     /// a record by that name exists.
     pub fn save_sync(&self, name: &str, record: &SyncRecord) -> Result<()> {
-        repo::check_name(name)?;
+        repo::check_id(name)?;
         anyhow::ensure!(
             record
                 .fetched
@@ -373,7 +388,7 @@ impl Store {
 
     /// The latest sync of repo `name` (by fetch time), if it was synced.
     pub fn latest_sync(&self, name: &str) -> Result<Option<SyncRecord>> {
-        repo::check_name(name)?;
+        repo::check_id(name)?;
         let dir = format!("repos/{name}/syncs");
         let latest = self
             .list_dir(&dir)?
@@ -387,9 +402,20 @@ impl Store {
     }
 }
 
+/// Create `<base>/<repo>` and its parent `<base>/@FORMAT` if needed, for
+/// the id `repo` (checked before).
+fn mkdir_repo(dir: impl AsFd, base: &str, repo: &str) -> Result<()> {
+    let path = format!("{base}/{repo}");
+    let parent = path.rsplit_once('/').unwrap().0;
+    for p in [parent, &path] {
+        mkdir_exist_ok(&dir, p).with_context(|| format!("creating {p}"))?;
+    }
+    Ok(())
+}
+
 /// `downloads/<repo>/<name>`, if `name` is a plain file name.
 fn download_path(repo: &str, name: &str) -> Result<String> {
-    repo::check_name_or_local(repo)?;
+    repo::check_id(repo)?;
     anyhow::ensure!(
         !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\0']),
         "bad file name {name:?} for a download"
@@ -414,8 +440,7 @@ impl TmpFile<'_> {
     pub fn save_download(self, repo: &str, name: &str) -> Result<File> {
         let dest = download_path(repo, name)?;
         let dir = &self.store.dir;
-        mkdir_exist_ok(dir, &format!("downloads/{repo}"))
-            .with_context(|| format!("creating downloads/{repo}"))?;
+        mkdir_repo(dir, "downloads", repo)?;
         // Linking doesn't replace, so remove the old file first. A
         // concurrent save of the same download can link in between; then
         // replace that one.
@@ -500,18 +525,22 @@ mod tests {
             conflicts: vec![],
             entries: vec![],
         };
-        store.save_package(repo::LOCAL, &hash, &pkg("1-1")).unwrap();
-        store.save_package("core", &hash, &pkg("2-1")).unwrap();
+        store
+            .save_package("@arch/@local", &hash, &pkg("1-1"))
+            .unwrap();
+        store
+            .save_package("@arch/core", &hash, &pkg("2-1"))
+            .unwrap();
         let load = |repo| store.load_package(repo, &hash).unwrap().map(|p| p.version);
-        assert_eq!(load(repo::LOCAL).as_deref(), Some("1-1"));
-        assert_eq!(load("core").as_deref(), Some("2-1"));
-        assert_eq!(load("extra"), None);
-        assert_eq!(store.packages("core").unwrap(), [hash]);
-        assert_eq!(store.packages("extra").unwrap(), []);
+        assert_eq!(load("@arch/@local").as_deref(), Some("1-1"));
+        assert_eq!(load("@arch/core").as_deref(), Some("2-1"));
+        assert_eq!(load("@arch/extra"), None);
+        assert_eq!(store.packages("@arch/core").unwrap(), [hash]);
+        assert_eq!(store.packages("@arch/extra").unwrap(), []);
         assert!(store.save_package("../x", &hash, &pkg("1")).is_err());
         assert!(
             dir.path()
-                .join(format!("packages/core/{hash}.json"))
+                .join(format!("packages/@arch/core/{hash}.json"))
                 .exists()
         );
     }
@@ -521,16 +550,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         assert!(store.repos().unwrap().is_empty());
-        store.add_repo("b", &"config b").unwrap();
-        store.add_repo("a", &"config a").unwrap();
-        let e = store.add_repo("a", &"again").unwrap_err();
+        store.add_repo("@deb/a", &"config deb").unwrap();
+        store.add_repo("@arch/b", &"config b").unwrap();
+        store.add_repo("@arch/a", &"config a").unwrap();
+        let e = store.add_repo("@arch/a", &"again").unwrap_err();
         assert!(e.to_string().contains("already exists"), "{e}");
         assert!(store.add_repo("../x", &"").is_err());
-        assert_eq!(store.repos().unwrap(), ["a", "b"]);
-        assert_eq!(store.repo_config::<String>("a").unwrap(), "config a");
-        assert!(store.repo_config::<String>("c").is_err());
+        assert!(store.add_repo("a", &"").is_err());
+        assert!(store.add_repo("@arch/@local", &"").is_err());
+        assert_eq!(store.repos().unwrap(), ["@arch/a", "@arch/b", "@deb/a"]);
+        assert_eq!(store.repo_config::<String>("@arch/a").unwrap(), "config a");
+        assert_eq!(store.repo_config::<String>("@deb/a").unwrap(), "config deb");
+        assert!(store.repo_config::<String>("@arch/c").is_err());
 
-        assert_eq!(store.latest_sync("a").unwrap(), None);
+        assert_eq!(store.latest_sync("@arch/a").unwrap(), None);
         let record = |fetched: &str| SyncRecord {
             hash: store.add_object(&mut fetched.as_bytes()).unwrap().hash,
             size: 1,
@@ -543,15 +576,15 @@ mod tests {
             record("2026-01-02T00:00:00.000000Z"),
             record("2026-01-10T00:00:00.000000Z"),
         );
-        store.save_sync("a", &new).unwrap();
-        store.save_sync("a", &old).unwrap();
+        store.save_sync("@arch/a", &new).unwrap();
+        store.save_sync("@arch/a", &old).unwrap();
         assert!(
-            store.save_sync("a", &old).is_err(),
+            store.save_sync("@arch/a", &old).is_err(),
             "records aren't replaced"
         );
-        assert!(store.save_sync("a", &record("../../x")).is_err());
-        assert_eq!(store.latest_sync("a").unwrap(), Some(new));
-        assert_eq!(store.latest_sync("b").unwrap(), None);
+        assert!(store.save_sync("@arch/a", &record("../../x")).is_err());
+        assert_eq!(store.latest_sync("@arch/a").unwrap(), Some(new));
+        assert_eq!(store.latest_sync("@arch/b").unwrap(), None);
         assert!(tmp_is_empty(dir.path()));
     }
 
@@ -564,13 +597,13 @@ mod tests {
         for content in [&b"old"[..], b"new"] {
             let mut tmp = store.tmp_file().unwrap();
             tmp.file().write_all(content).unwrap();
-            let mut file = tmp.save_download("core", "a.pkg").unwrap();
+            let mut file = tmp.save_download("@arch/core", "a.pkg").unwrap();
             file.rewind().unwrap();
             let mut read = Vec::new();
             file.read_to_end(&mut read).unwrap();
             assert_eq!(read, content);
         }
-        let saved = std::fs::read(dir.path().join("downloads/core/a.pkg")).unwrap();
+        let saved = std::fs::read(dir.path().join("downloads/@arch/core/a.pkg")).unwrap();
         assert_eq!(saved, b"new");
         assert!(tmp_is_empty(dir.path()));
     }

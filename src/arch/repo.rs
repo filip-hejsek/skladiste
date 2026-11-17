@@ -36,6 +36,20 @@ pub const ARCH: &str = "x86_64";
 /// Largest database accepted (`extra.db` is about 8 MiB).
 pub const MAX_DB_SIZE: u64 = 64 << 20;
 
+/// The package format's name: Arch repos have the ids `@arch/NAME` (see
+/// [`repo::id`]).
+pub const FORMAT: &str = "arch";
+
+/// The id of the pseudo-repo of Arch packages imported from files or URLs.
+pub const LOCAL_REPO: &str = "@arch/@local";
+
+/// The id of the Arch repo given as `NAME` (a repo name or
+/// [`repo::LOCAL`]) or as its id `@arch/NAME`.
+pub fn repo_id(arg: &str) -> Result<String> {
+    let prefix = format!("@{FORMAT}/");
+    repo::id(FORMAT, arg.strip_prefix(&prefix).unwrap_or(arg))
+}
+
 /// Configuration of an Arch repo, kept in the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -535,6 +549,17 @@ fn check_file_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_ids() {
+        assert_eq!(repo_id("core").unwrap(), "@arch/core");
+        assert_eq!(repo_id("@arch/core").unwrap(), "@arch/core");
+        assert_eq!(repo_id(repo::LOCAL).unwrap(), LOCAL_REPO);
+        assert_eq!(repo_id(LOCAL_REPO).unwrap(), LOCAL_REPO);
+        for bad in ["@deb/main", "@arch/@arch/core", "a/b", ""] {
+            assert!(repo_id(bad).is_err(), "{bad}");
+        }
+    }
 
     const GLIBC: &str = "%FILENAME%\nglibc-2.44-1-x86_64.pkg.tar.zst\n\n%NAME%\nglibc\n\n\
         %BASE%\nglibc\n\n%VERSION%\n2.44-1\n\n%DESC%\nGNU C Library\n\n\

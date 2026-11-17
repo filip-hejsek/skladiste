@@ -13,13 +13,12 @@ use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 
 use skladiste::arch;
-use skladiste::arch::repo::{DbEntry, Snapshot};
+use skladiste::arch::repo::{DbEntry, LOCAL_REPO as LOCAL, Snapshot, repo_id};
 use skladiste::arch::signature;
 use skladiste::http::Url;
 use skladiste::install;
 use skladiste::jobs::par_map;
 use skladiste::manifest::Package;
-use skladiste::repo::LOCAL;
 use skladiste::resolve::{self, Candidate, Target};
 use skladiste::store::{Store, TmpFile, hash_reader};
 use skladiste::worker::{KeyringError, KeyringFiles, Request, Sink, Verifier, Workers};
@@ -45,7 +44,7 @@ enum ArchCommand {
     /// Packages are files or http(s) URLs. The signature is read from the
     /// same path or URL with `.sig` appended. Builds can use the imported
     /// packages with `--repo @local`. Downloads are kept in the store's
-    /// `downloads/@local/` directory and not downloaded again for the
+    /// `downloads/@arch/@local/` directory and not downloaded again for the
     /// same file name. Redirects are not followed.
     Import {
         /// Package files or URLs.
@@ -71,7 +70,8 @@ enum ArchCommand {
         /// Repo to take packages from (repeatable, in priority order): a
         /// repo added with `skl arch repo add`, of which the latest sync is
         /// used, or `@local` for the packages imported with `skl arch
-        /// import`.
+        /// import`. Repos are given by name (`core`) or by id
+        /// (`@arch/core`).
         #[arg(long = "repo", value_name = "REPO", required = true)]
         repos: Vec<String>,
         /// Package names: `NAME`, or `REPO/NAME` to take it from that repo.
@@ -143,6 +143,10 @@ pub(crate) fn run(
             if output.symlink_metadata().is_ok() {
                 bail!("{} already exists", output.display());
             }
+            let repos = repos
+                .iter()
+                .map(|r| repo_id(r))
+                .collect::<Result<Vec<_>>>()?;
             let targets = packages
                 .iter()
                 .map(|arg| parse_target(arg, &repos))
@@ -193,31 +197,47 @@ pub(crate) fn run(
         ArchCommand::Repo {
             command: RepoCommand::Add { name, server, db },
         } => {
+            skladiste::repo::check_name(&name)?;
             let config = arch::repo::Config::new(&server, db.as_deref().unwrap_or(&name))?;
-            store.add_repo(&name, &config)?;
+            store.add_repo(&repo_id(&name)?, &config)?;
         }
         ArchCommand::Repo {
             command: RepoCommand::List,
         } => {
-            for name in store.repos()? {
-                let config: arch::repo::Config = store.repo_config(&name)?;
-                let synced = match store.latest_sync(&name)? {
+            for id in arch_repos(store)? {
+                let config: arch::repo::Config = store.repo_config(&id)?;
+                let name = skladiste::repo::split_id(&id)?.1;
+                let synced = match store.latest_sync(&id)? {
                     Some(record) => record.fetched,
                     None => "never synced".to_owned(),
                 };
                 println!("{name}\t{}\t{}\t{synced}", config.db, config.server);
             }
         }
-        ArchCommand::Sync { repos } => sync(workers, store, repos, jobs)?,
+        ArchCommand::Sync { repos } => {
+            let repos = repos
+                .iter()
+                .map(|r| repo_id(r))
+                .collect::<Result<Vec<_>>>()?;
+            sync(workers, store, repos, jobs)?;
+        }
     }
     Ok(())
 }
 
-/// Download the databases of `repos` (all if empty), and record the new
-/// versions once all of them were downloaded and read.
+/// The ids of the configured Arch repos, sorted.
+fn arch_repos(store: &Store) -> Result<Vec<String>> {
+    let mut ids = store.repos()?;
+    ids.retain(|id| skladiste::repo::split_id(id).is_ok_and(|(f, _)| f == arch::repo::FORMAT));
+    Ok(ids)
+}
+
+/// Download the databases of the repos with ids `repos` (all Arch repos if
+/// empty), and record the new versions once all of them were downloaded
+/// and read.
 fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize) -> Result<()> {
     let repos = if repos.is_empty() {
-        store.repos()?
+        arch_repos(store)?
     } else {
         repos
     };
@@ -318,23 +338,23 @@ impl RepoPackage<'_> {
 }
 
 /// Read a package argument of `build`: `NAME`, or `REPO/NAME` where `REPO`
-/// is one of `repos`.
+/// (a name or an id, see [`repo_id`]) is one of `repos` (ids).
 fn parse_target(arg: &str, repos: &[String]) -> Result<Target> {
-    let (repo, name) = match arg.split_once('/') {
-        Some((repo, name)) => (Some(repo), name),
+    let (repo, name) = match arg.rsplit_once('/') {
+        Some((repo, name)) => (Some(repo_id(repo)), name),
         None => (None, arg),
     };
-    let known = |repo: &str| repo == LOCAL || skladiste::repo::check_name(repo).is_ok();
     ensure!(
-        arch::repo::check_name(name).is_ok() && repo.is_none_or(known),
+        arch::repo::check_name(name).is_ok() && repo.as_ref().is_none_or(Result::is_ok),
         "{arg:?} is not NAME or REPO/NAME (to build with package files, \
-         import them with `skl arch import` and use --repo {LOCAL})"
+         import them with `skl arch import` and use --repo @local)"
     );
     let repo = repo
         .map(|repo| {
+            let repo = repo?;
             repos
                 .iter()
-                .position(|r| r == repo)
+                .position(|r| *r == repo)
                 .with_context(|| format!("{arg}: repo {repo} is not among --repo"))
         })
         .transpose()?;
@@ -929,11 +949,19 @@ mod tests {
 
     #[test]
     fn build_arguments() {
-        let repos = ["core".to_owned(), LOCAL.to_owned()];
+        let repos = ["@arch/core".to_owned(), LOCAL.to_owned()];
         let parse = |s: &str| parse_target(s, &repos).map(|t| (t.repo, t.name));
         assert_eq!(parse("bash").unwrap(), (None, "bash".to_owned()));
         assert_eq!(parse("core/bash").unwrap(), (Some(0), "bash".to_owned()));
+        assert_eq!(
+            parse("@arch/core/bash").unwrap(),
+            (Some(0), "bash".to_owned())
+        );
         assert_eq!(parse("@local/bash").unwrap(), (Some(1), "bash".to_owned()));
+        assert_eq!(
+            parse("@arch/@local/bash").unwrap(),
+            (Some(1), "bash".to_owned())
+        );
         let e = parse("extra/bash").unwrap_err().to_string();
         assert!(e.contains("not among --repo"), "{e}");
         for bad in [
