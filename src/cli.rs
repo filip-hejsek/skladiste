@@ -163,7 +163,10 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
 /// The store at `path`, which `skl init` has set up.
 fn open_store(path: &Path) -> Result<Store> {
     Store::open_path(path).map_err(|e| match e.downcast_ref::<NotAStore>() {
-        Some(not) => anyhow!("{} is {not}; set one up with `skl init`", path.display()),
+        Some(not) if not.can_init() => {
+            anyhow!("{} is {not}; set one up with `skl init`", path.display())
+        }
+        Some(not) => anyhow!("{} is {not}", path.display()),
         None => e,
     })
 }

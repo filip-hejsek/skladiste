@@ -1,6 +1,8 @@
 //! Content-addressed object store.
 //!
 //! Layout:
+//! - `skl-store.json` — the store manifest ([`StoreManifest`]): marks the
+//!   directory as a store and records the version of the store format
 //! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
 //!   and the archive's hash (packages imported from files or URLs belong to
@@ -19,10 +21,10 @@
 //! two directory levels, e.g. `repos/@arch/core/`.
 //!
 //! A new store is set up with [`Store::init`], an existing one opened with
-//! [`Store::open`]; both take the store's directory fd ([`Store::init_path`]
-//! and [`Store::open_path`] open it from a path). Every access is relative
-//! to that fd, so the store also works from a sandboxed process that was
-//! handed only the fd.
+//! [`Store::open`], which accepts only a store of [`FORMAT_VERSION`]; both take
+//! the store's directory fd ([`Store::init_path`] and [`Store::open_path`]
+//! open it from a path). Every access is relative to that fd, so the store
+//! also works from a sandboxed process that was handed only the fd.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -33,8 +35,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Hash, ObjectId, Package};
 use crate::repo::{self, SyncRecord};
@@ -78,6 +80,10 @@ pub enum NotAStore {
     Missing,
     /// What is at the path isn't a directory.
     NotADirectory,
+    /// The directory is empty.
+    Empty,
+    /// The directory isn't empty but has no store manifest (`skl-store.json`).
+    NoManifest,
     /// A directory of the layout is missing (or isn't a directory).
     NoSubdir(&'static str),
 }
@@ -87,6 +93,8 @@ impl std::fmt::Display for NotAStore {
         match self {
             NotAStore::Missing => write!(f, "not a store: it doesn't exist"),
             NotAStore::NotADirectory => write!(f, "not a store: it isn't a directory"),
+            NotAStore::Empty => write!(f, "not a store: it is empty"),
+            NotAStore::NoManifest => write!(f, "not a store: it has no {MANIFEST}"),
             NotAStore::NoSubdir(sub) => write!(f, "not a store: it has no {sub}/ directory"),
         }
     }
@@ -94,12 +102,38 @@ impl std::fmt::Display for NotAStore {
 
 impl std::error::Error for NotAStore {}
 
+impl NotAStore {
+    /// Whether [`Store::init_path`] would make it a store: it refuses a
+    /// non-empty directory without a manifest and what isn't a directory.
+    pub fn can_init(self) -> bool {
+        match self {
+            NotAStore::Missing | NotAStore::Empty | NotAStore::NoSubdir(_) => true,
+            NotAStore::NotADirectory | NotAStore::NoManifest => false,
+        }
+    }
+}
+
 fn open_dir(path: &Path) -> Result<OwnedFd, Errno> {
     rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )
+}
+
+/// The name of the store manifest.
+const MANIFEST: &str = "skl-store.json";
+
+/// The version of the store format this skl uses. There is no support for
+/// other versions (neither reading nor migrating) until the format is
+/// stable: a store of another version is rejected.
+pub const FORMAT_VERSION: u64 = 0;
+
+/// The store manifest, `skl-store.json` in the store's directory.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoreManifest {
+    /// The version of the store format.
+    pub version: u64,
 }
 
 /// The directories of a store, see the module documentation.
@@ -110,6 +144,80 @@ fn mkdir_exist_ok(dir: impl AsFd, path: &str) -> Result<(), Errno> {
         Err(Errno::EXIST) => Ok(()),
         r => r,
     }
+}
+
+/// Read and check the store manifest of `dir`, if it has one: fails if the
+/// store isn't of [`FORMAT_VERSION`].
+fn read_manifest(dir: impl AsFd) -> Result<Option<StoreManifest>> {
+    let fd = match rustix::fs::openat(
+        dir,
+        MANIFEST,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening {MANIFEST}")),
+    };
+    let mut data = Vec::new();
+    File::from(fd)
+        .read_to_end(&mut data)
+        .with_context(|| format!("reading {MANIFEST}"))?;
+    let manifest: StoreManifest =
+        serde_json::from_slice(&data).with_context(|| format!("parsing {MANIFEST}"))?;
+    anyhow::ensure!(
+        manifest.version == FORMAT_VERSION,
+        "the store has format version {}, but this skl supports only version {FORMAT_VERSION}",
+        manifest.version
+    );
+    Ok(Some(manifest))
+}
+
+/// Write the store manifest into `dir`, as an unnamed file linked into
+/// place, so it is never seen incomplete. If a concurrent init wrote it
+/// first, check that one.
+fn write_manifest(dir: impl AsFd) -> Result<()> {
+    let dir = dir.as_fd();
+    let fd = rustix::fs::openat(
+        dir,
+        ".",
+        OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .with_context(|| format!("creating {MANIFEST}"))?;
+    let mut data = serde_json::to_vec_pretty(&StoreManifest {
+        version: FORMAT_VERSION,
+    })?;
+    data.push(b'\n');
+    let mut file = File::from(fd);
+    file.write_all(&data)
+        .with_context(|| format!("writing {MANIFEST}"))?;
+    match link_unnamed(&file, dir, MANIFEST) {
+        Ok(()) => Ok(()),
+        Err(Errno::EXIST) => read_manifest(dir).map(drop),
+        Err(e) => Err(e).with_context(|| format!("linking {MANIFEST}")),
+    }
+}
+
+/// Whether the directory `dir` has no entries.
+fn is_empty(dir: impl AsFd) -> Result<bool> {
+    for entry in rustix::fs::Dir::read_from(dir).context("reading the directory")? {
+        let entry = entry.context("reading the directory")?;
+        if ![&b"."[..], b".."].contains(&entry.file_name().to_bytes()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Give the unnamed file `fd` the name `dest` in `dir`; fails with
+/// `EEXIST` if the name is taken. Linking by the fd itself
+/// (`AT_EMPTY_PATH`) needs `CAP_DAC_READ_SEARCH`, so this goes through
+/// `/proc`.
+fn link_unnamed(fd: impl AsFd, dir: impl AsFd, dest: &str) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd;
+    let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
+    rustix::fs::linkat(rustix::fs::CWD, &path, dir, dest, AtFlags::SYMLINK_FOLLOW)
 }
 
 fn object_name(hash: &Hash) -> String {
@@ -124,9 +232,19 @@ fn package_name(repo: &str, hash: &Hash) -> Result<String> {
 }
 
 impl Store {
-    /// Make the directory `dir` a store, creating the parts of the layout
-    /// that are missing, and use it.
+    /// Make the directory `dir` a store and use it. `dir` must be empty or
+    /// already a store of [`FORMAT_VERSION`]; then the parts of the layout
+    /// that are missing are created.
     pub fn init(dir: OwnedFd) -> Result<Store> {
+        if read_manifest(&dir)?.is_none() {
+            anyhow::ensure!(
+                is_empty(&dir)?,
+                "the directory isn't empty and has no {MANIFEST}, so it isn't a store"
+            );
+            // The manifest comes first, so an interrupted init can be
+            // repeated; until the layout is complete, `open` fails.
+            write_manifest(&dir)?;
+        }
         for sub in SUBDIRS {
             mkdir_exist_ok(&dir, sub).with_context(|| format!("creating {sub}/"))?;
         }
@@ -134,8 +252,17 @@ impl Store {
     }
 
     /// Use the store in the directory `dir`, which [`Store::init`] has set
-    /// up. Fails with [`NotAStore`] if it hasn't.
+    /// up. Fails with [`NotAStore`] if it hasn't, and also if the store
+    /// isn't of [`FORMAT_VERSION`].
     pub fn open(dir: OwnedFd) -> Result<Store> {
+        if read_manifest(&dir)?.is_none() {
+            return Err(if is_empty(&dir)? {
+                NotAStore::Empty
+            } else {
+                NotAStore::NoManifest
+            }
+            .into());
+        }
         for sub in SUBDIRS {
             match rustix::fs::statat(&dir, sub, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(s) if FileType::from_raw_mode(s.st_mode) == FileType::Directory => {}
@@ -252,18 +379,9 @@ impl Store {
     }
 
     /// Give the unnamed file `fd` the name `dest`; fails with `EEXIST` if
-    /// the name is taken. Linking by the fd itself (`AT_EMPTY_PATH`)
-    /// needs `CAP_DAC_READ_SEARCH`, so this goes through `/proc`.
+    /// the name is taken (see [`link_unnamed`]).
     fn link(&self, fd: impl AsFd, dest: &str) -> Result<(), Errno> {
-        use std::os::fd::AsRawFd;
-        let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
-        rustix::fs::linkat(
-            rustix::fs::CWD,
-            &path,
-            &self.dir,
-            dest,
-            AtFlags::SYMLINK_FOLLOW,
-        )
+        link_unnamed(fd, &self.dir, dest)
     }
 
     /// Open `downloads/<repo>/<name>`, if it exists.
@@ -567,12 +685,31 @@ mod tests {
             not_a_store(Store::open_path(&root)),
             NotAStore::NotADirectory
         );
+        assert!(!NotAStore::NotADirectory.can_init());
         std::fs::remove_file(&root).unwrap();
         std::fs::create_dir(&root).unwrap();
+        assert_eq!(not_a_store(Store::open_path(&root)), NotAStore::Empty);
+        // A directory with the layout but no manifest isn't a store.
+        for sub in SUBDIRS {
+            std::fs::create_dir(root.join(sub)).unwrap();
+        }
+        assert_eq!(not_a_store(Store::open_path(&root)), NotAStore::NoManifest);
+        let e = Store::init_path(&root).err().unwrap();
+        assert!(format!("{e:#}").contains("isn't empty"), "{e:#}");
+        assert!(!NotAStore::NoManifest.can_init());
+        for sub in SUBDIRS {
+            std::fs::remove_dir(root.join(sub)).unwrap();
+        }
+        Store::init_path(&root).unwrap();
+        Store::open_path(&root).unwrap();
+        let manifest = std::fs::read(root.join(MANIFEST)).unwrap();
+        let manifest: StoreManifest = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(manifest.version, FORMAT_VERSION);
+        // Missing parts of the layout are reported.
+        std::fs::remove_dir(root.join("objects")).unwrap();
         let e = not_a_store(Store::open_path(&root));
         assert_eq!(e, NotAStore::NoSubdir("objects"));
         Store::init_path(&root).unwrap();
-        Store::open_path(&root).unwrap();
         std::fs::remove_dir(root.join("tmp")).unwrap();
         std::os::unix::fs::symlink("objects", root.join("tmp")).unwrap();
         let e = not_a_store(Store::open(File::open(&root).unwrap().into()));
@@ -581,6 +718,27 @@ mod tests {
         std::fs::remove_file(root.join("tmp")).unwrap();
         Store::init_path(&root).unwrap();
         Store::open_path(&root).unwrap();
+    }
+
+    #[test]
+    fn other_versions_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::init_path(dir.path()).unwrap();
+        let other = FORMAT_VERSION + 1;
+        for (content, expected) in [
+            (
+                format!(r#"{{"version": {other}}}"#),
+                format!("format version {other}"),
+            ),
+            ("{}".to_owned(), format!("parsing {MANIFEST}")),
+        ] {
+            std::fs::write(dir.path().join(MANIFEST), &content).unwrap();
+            let e = Store::open_path(dir.path()).err().unwrap();
+            assert!(e.downcast_ref::<NotAStore>().is_none(), "{e:#}");
+            assert!(format!("{e:#}").contains(&expected), "{e:#}");
+            let e = Store::init_path(dir.path()).err().unwrap();
+            assert!(format!("{e:#}").contains(&expected), "{e:#}");
+        }
     }
 
     fn tmp_is_empty(root: &Path) -> bool {
