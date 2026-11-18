@@ -1024,6 +1024,7 @@ mod tests {
             version: version.into(),
             entries: vec![],
             sections: [].into(),
+            overlay: None,
         };
         let (one, two) = (pkg("1-1"), pkg("2-1"));
         let (id1, id2) = (

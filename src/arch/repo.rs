@@ -800,6 +800,7 @@ mod tests {
                 version: version.into(),
                 entries: vec![],
                 sections: [section.into_section(vec![]).unwrap()].into(),
+                overlay: None,
             }
         };
         let c = package_candidate(&pkg("bash", "5.3-1", "glibc>=2.40")).unwrap();

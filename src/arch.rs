@@ -165,6 +165,7 @@ pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<Bl
         version: info.version,
         entries,
         sections: [section.into_section(install.into_iter().collect())?].into(),
+        overlay: None,
     })
 }
 

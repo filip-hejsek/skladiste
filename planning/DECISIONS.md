@@ -495,7 +495,10 @@ are in BUGS.md.
   image (including absolute ones like `/bin -> /usr/bin`) resolve inside
   the image and can never reach the host.
 - Two packages providing the same path is an error, except for
-  directories, where the first package wins.
+  directories, where the first package wins. An overlay package (what
+  package code changed, PACKAGES.md) replaces entries of the packages
+  before it and removes paths; an entry that isn't a directory replaces
+  a directory with its contents, as `diff::Change` means it.
 - Entries are created in path order. Entries whose parent is missing
   (reached through a symlink to a path that sorts later) are retried
   until no more progress is made. Hard links are created after

@@ -198,6 +198,81 @@ fn install_scriptlets_are_kept() {
 }
 
 #[test]
+fn overlays_change_earlier_packages() {
+    use skladiste::manifest::{Content, Entry, EntryKind, Overlay, Package};
+    let Some(tmp) = btrfs_tempdir() else { return };
+    let store = Store::init_path(&tmp.path().join("store")).unwrap();
+    let base = make_package(
+        tmp.path(),
+        "base",
+        &[
+            Item::Dir("etc/", 0o755),
+            Item::File("etc/conf", 0o644, b"old"),
+            Item::File("etc/gone", 0o644, b"x"),
+            Item::Dir("var/", 0o755),
+            Item::Dir("var/lib/", 0o755),
+            Item::File("var/lib/f", 0o644, b"f"),
+        ],
+    );
+    let base = import(&store, &base);
+    let added = store.add_blob(&mut &b"new"[..]).unwrap();
+    let entry = |path: &str, kind| Entry {
+        path: path.into(),
+        kind,
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        mtime: 5,
+        xattrs: Default::default(),
+    };
+    let content = Content {
+        hash: added.hash,
+        size: added.size,
+    };
+    let overlay = Package {
+        name: "@test/overlay".into(),
+        version: String::new(),
+        entries: vec![
+            entry("etc/conf", EntryKind::File(content)),
+            entry(
+                "etc/link",
+                EntryKind::Hardlink {
+                    target: "etc/conf".into(),
+                },
+            ),
+            // A directory replaced by a symlink, with its contents.
+            entry(
+                "var/lib",
+                EntryKind::Symlink {
+                    target: "/elsewhere".into(),
+                },
+            ),
+        ],
+        sections: Default::default(),
+        overlay: Some(Overlay {
+            removed: vec!["etc/gone".into()],
+        }),
+    };
+    let overlay = store.add_package(&overlay).unwrap();
+    let img = tmp.path().join("img");
+    build(&store, &[base, overlay], &img).unwrap();
+    assert_eq!(fs::read(img.join("etc/conf")).unwrap(), b"new");
+    let conf = fs::metadata(img.join("etc/conf")).unwrap();
+    assert_eq!(
+        (conf.permissions().mode() & 0o777, conf.nlink()),
+        (0o600, 2)
+    );
+    assert!(!img.join("etc/gone").exists());
+    assert_eq!(
+        fs::read_link(img.join("var/lib")).unwrap(),
+        Path::new("/elsewhere")
+    );
+    // An overlay's changes need the packages before it.
+    let e = build(&store, &[overlay], &tmp.path().join("img2")).unwrap_err();
+    assert!(format!("{e:#}").contains("/etc"), "{e:#}");
+}
+
+#[test]
 fn conflicting_files_are_rejected() {
     let Some(tmp) = btrfs_tempdir() else { return };
     let store = Store::init_path(&tmp.path().join("store")).unwrap();

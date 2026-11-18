@@ -79,6 +79,20 @@ pub struct Package<F = Content, B = Hash> {
     /// What each package format keeps about the package, by the format's
     /// name (e.g. `arch`): the core keeps it and doesn't read it.
     pub sections: BTreeMap<String, Section<B>>,
+    /// Whether this is an overlay: a package that changes the packages
+    /// installed before it, such as what package code changed. Its
+    /// entries replace those at their paths (a directory's contents with
+    /// it, unless the entry is a directory too), its hard links point
+    /// only to its own files, and it removes paths. Ordinary packages can
+    /// do neither.
+    pub overlay: Option<Overlay>,
+}
+
+/// What an overlay package removes, besides the entries it replaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overlay {
+    /// Paths removed, each with everything beneath it.
+    pub removed: Vec<String>,
 }
 
 /// A package format's part of a manifest: JSON of the format's own
@@ -144,6 +158,10 @@ struct StoredPackage {
     version: String,
     entries: Vec<Entry<Stored>>,
     sections: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    overlay: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<String>,
 }
 
 /// The content of `blob` in `blobs` (in the order received).
@@ -179,6 +197,7 @@ impl Package<BlobId, BlobId> {
             version: self.version,
             entries,
             sections,
+            overlay: self.overlay,
         })
     }
 }
@@ -247,6 +266,12 @@ impl Package {
             version: self.version.clone(),
             entries,
             sections,
+            overlay: self.overlay.is_some(),
+            removed: self
+                .overlay
+                .as_ref()
+                .map(|o| o.removed.clone())
+                .unwrap_or_default(),
         })?;
         Ok((refs, body))
     }
@@ -288,11 +313,18 @@ impl Package {
                 Ok((name, Section { value, blobs }))
             })
             .collect::<anyhow::Result<_>>()?;
+        anyhow::ensure!(
+            stored.overlay || stored.removed.is_empty(),
+            "a package that isn't an overlay removes paths"
+        );
         Ok(Package {
             name: stored.name,
             version: stored.version,
             entries,
             sections,
+            overlay: stored.overlay.then_some(Overlay {
+                removed: stored.removed,
+            }),
         })
     }
 }
@@ -324,6 +356,28 @@ impl<F, B> Package<F, B> {
     /// so their output is checked again by the code that stores it.
     pub fn validate(&self) -> anyhow::Result<()> {
         self.entries.iter().try_for_each(Entry::validate)?;
+        if let Some(overlay) = &self.overlay {
+            let mut paths = std::collections::BTreeSet::new();
+            let mut files = std::collections::BTreeSet::new();
+            for e in &self.entries {
+                anyhow::ensure!(paths.insert(&*e.path), "/{} is listed twice", e.path);
+                match &e.kind {
+                    EntryKind::File(_) => {
+                        files.insert(&*e.path);
+                    }
+                    EntryKind::Hardlink { target } => anyhow::ensure!(
+                        files.contains(&**target),
+                        "/{}: hard link to /{target}, which isn't a file of the overlay listed before",
+                        e.path
+                    ),
+                    _ => {}
+                }
+            }
+            for path in &overlay.removed {
+                anyhow::ensure!(is_normal_path(path)?, "invalid path: {path:?}");
+                anyhow::ensure!(paths.insert(path), "/{path} is listed twice");
+            }
+        }
         for (name, section) in &self.sections {
             crate::repo::check_format(name)?;
             let count = section.blobs.len() as u64;
@@ -491,6 +545,7 @@ mod tests {
             version: "1".into(),
             entries,
             sections,
+            overlay: None,
         }
     }
 
@@ -591,6 +646,47 @@ mod tests {
         assert_eq!(back, expected);
         let (refs, body) = back.to_object().unwrap();
         assert_eq!(crate::object::encode(refs.as_slice(), &body).unwrap(), data);
+    }
+
+    #[test]
+    fn overlays() {
+        let (a, b) = (content("a"), content("b"));
+        let mut pkg = package::<Content, Hash>(
+            vec![
+                entry("etc/a", EntryKind::File(a)),
+                entry(
+                    "etc/b",
+                    EntryKind::Hardlink {
+                        target: "etc/a".into(),
+                    },
+                ),
+            ],
+            [].into(),
+        );
+        pkg.overlay = Some(Overlay {
+            removed: vec!["usr/x".into()],
+        });
+        pkg.validate().unwrap();
+        let (refs, body) = pkg.to_object().unwrap();
+        assert_eq!(body["overlay"], json!(true));
+        assert_eq!(body["removed"], json!(["usr/x"]));
+        let data = crate::object::encode(refs.as_slice(), &body).unwrap();
+        let back = Package::from_object(&crate::object::decode(&data).unwrap()).unwrap();
+        assert_eq!(back, pkg);
+        // Ordinary packages leave both out.
+        let plain = package::<Content, Hash>(vec![entry("f", EntryKind::File(b))], [].into());
+        let (_, body) = plain.to_object().unwrap();
+        assert!(body.get("overlay").is_none() && body.get("removed").is_none());
+        // Hard links only to files listed before, each path once.
+        let mut bad = pkg.clone();
+        bad.entries.reverse();
+        assert!(bad.validate().is_err());
+        let mut bad = pkg.clone();
+        bad.overlay.as_mut().unwrap().removed.push("etc/a".into());
+        assert!(bad.validate().is_err());
+        let mut bad = pkg.clone();
+        bad.overlay.as_mut().unwrap().removed.push("../x".into());
+        assert!(bad.validate().is_err());
     }
 
     #[test]

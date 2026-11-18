@@ -29,7 +29,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{BlobId, Content, Entry, EntryKind, XattrValue, is_normal_path};
+use crate::manifest::{BlobId, Content, Entry, EntryKind, Overlay, XattrValue, is_normal_path};
 use crate::sandbox::{self, Policy};
 use crate::store::{BlobSink, Store};
 use crate::worker::{self, Args, Caps, ImportStats, Kind, RemoteSink, Workers};
@@ -162,6 +162,21 @@ impl Change<BlobId> {
             Change::Removed(path) => Change::Removed(path),
         })
     }
+}
+
+/// The entries and removals of an overlay package that makes `changes`
+/// (see [`Overlay`]): added and modified entries replace what was at their
+/// paths, and removed paths go with everything beneath them.
+pub fn overlay(changes: Vec<Change>) -> (Vec<Entry>, Overlay) {
+    let mut entries = Vec::new();
+    let mut removed = Vec::new();
+    for change in changes {
+        match change {
+            Change::Added(e) | Change::Modified(e) => entries.push(e),
+            Change::Removed(path) => removed.push(path),
+        }
+    }
+    (entries, Overlay { removed })
 }
 
 /// Check changes from a worker: valid entries, each path at most once,

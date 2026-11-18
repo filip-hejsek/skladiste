@@ -4,7 +4,8 @@ Design for skl's own package format: a manifest that refers to blobs
 in the store, without an archive for now. Frontends convert their
 packages to it, and the core builds images from a list of such
 packages. Implemented: blobs and objects, canonical JSON,
-manifests with sections, the Arch index and the build split.
+manifests with sections, the Arch index, the build split and
+overlays.
 
 Decided: objects with a reference header, manifests as objects
 with untyped sections per format, the build split, one
@@ -131,7 +132,8 @@ questions are at the end.
     its own list of blobs, so that it stands alone; the core renumbers
     them when writing the manifest and back when reading it. Sections
     refer only to blobs for now, without their sizes.
-  - Overlay packages (below) also have `"overlay": true` and `removed`.
+  - Overlay packages (below) also have `"overlay": true` and `removed`
+    (`manifest::Overlay`; `diff::overlay` makes one from changes).
 - Arch's section (`arch::ArchSection`): `depends`, `provides`,
   `conflicts` (in Arch's syntax, checked when importing as now), later
   `replaces`, and `install`, the reference to `.INSTALL` if the package
