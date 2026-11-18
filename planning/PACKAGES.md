@@ -33,7 +33,14 @@ questions are at the end.
   `b` is a blob, `o` an object, so following references needs no
   knowledge of the body. The body is canonical JSON (below) and refers
   to blobs and objects only by their index in the header, counting
-  from 0; it contains no hashes.
+  from 0; it contains no hashes. A reference in the body is a JSON
+  object with the single key `#`, `{"#":0}`, and `#` is reserved for
+  that: any other object with that key is an error. This is what lets
+  the core find references in a body without its schema, to renumber
+  them when writing and check them when reading (`src/object.rs`).
+  Rejected: plain numbers for indices, which only code that knows the
+  schema can tell from other numbers (a frontend's section couldn't be
+  written canonically by the core).
 - So the GC reads only headers: it starts from the roots (below) and
   follows `o` references, never parsing a body. Any part of a body,
   including a frontend's section, can refer to blobs and objects
@@ -47,7 +54,7 @@ questions are at the end.
   one.
 - The header is canonical: each reference once, in the order of its
   first use in the body. Workers keep referring to blobs by their
-  position in the stream they send (now `ObjectId`); the supervisor
+  position in the stream they send (`BlobId`); the supervisor
   maps those positions to header indices when it writes the object, so
   the same content always gets the same address, also when a package
   has two identical files. The supervisor alone writes objects, so the
@@ -69,7 +76,7 @@ questions are at the end.
   package of 17,000 files, no more than today's JSON with hashes inline.
   Binary would halve it but not be readable. Paths in the store and the
   ids skl prints are hex as before.
-- Bodies aren't readable on their own (`"blob": 17`); `skl show ID`
+- Bodies aren't readable on their own (`"blob":{"#":17}`); `skl show ID`
   would print an object with its references resolved.
 
 ## Canonical JSON
@@ -92,7 +99,9 @@ questions are at the end.
   units (the same for ASCII keys) and in its rules for floats, which
   aren't allowed here.
 - Objects are written only through one function that canonicalizes
-  the body. Reading checks the hash, not the form: only the supervisor
+  the body (`object::encode`, through `Store::add_object`, which takes
+  the body with references as indices into a list the caller collected
+  in any order). Reading checks the hash, not the form: only the supervisor
   writes, so a check on every read would cost a second serialization of
   large manifests to protect against nothing. A `skl fsck` would check
   it.
@@ -106,7 +115,7 @@ questions are at the end.
   Body:
 
   ```json
-  {"entries":[{"mode":493,"path":"usr/bin/bash","type":"file","blob":0,"size":1234,…}],
+  {"entries":[{"mode":493,"path":"usr/bin/bash","type":"file","blob":{"#":0},"size":1234,…}],
    "name":"bash","sections":{"arch":{"depends":["glibc","readline>=8.3"],…}},
    "version":"5.3.3-1"}
   ```

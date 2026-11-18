@@ -9,6 +9,7 @@ pub mod http;
 pub mod install;
 pub mod jobs;
 pub mod manifest;
+pub mod object;
 pub mod repo;
 pub mod resolve;
 pub mod run;

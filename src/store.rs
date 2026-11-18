@@ -1,9 +1,11 @@
-//! Content-addressed blob store.
+//! Content-addressed store of blobs (file contents) and objects.
 //!
 //! Layout:
 //! - `skl-store.json` — the store manifest ([`StoreManifest`]): marks the
 //!   directory as a store and records the version of the store format
 //! - `blobs/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
+//! - `objects/ab/cdef…` — skl's own records ([`crate::object`]), named by
+//!   their address, read-only
 //! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
 //!   and the archive's hash (packages imported from files or URLs belong to
 //!   their format's pseudo-repo `@FORMAT/@local`, see [`repo::LOCAL`])
@@ -33,13 +35,14 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{BlobId, Hash, Package};
+use crate::object::{self, Object, Ref};
 use crate::repo::{self, SyncRecord};
 
 pub mod format;
@@ -159,7 +162,7 @@ impl StoreManifest {
 }
 
 /// The directories of a store, see the module documentation.
-const SUBDIRS: [&str; 5] = ["blobs", "packages", "downloads", "repos", "tmp"];
+const SUBDIRS: [&str; 6] = ["blobs", "objects", "packages", "downloads", "repos", "tmp"];
 
 fn mkdir_exist_ok(dir: impl AsFd, path: &str) -> Result<(), Errno> {
     match rustix::fs::mkdirat(dir, path, Mode::from_raw_mode(0o755)) {
@@ -250,6 +253,14 @@ fn blob_name(hash: &Hash) -> String {
     let hex = hash.to_string();
     format!("blobs/{}/{}", &hex[..2], &hex[2..])
 }
+
+fn object_name(hash: &Hash) -> String {
+    let hex = hash.to_string();
+    format!("objects/{}/{}", &hex[..2], &hex[2..])
+}
+
+/// Largest object accepted when reading.
+const MAX_OBJECT: u64 = 1 << 30;
 
 /// `packages/<repo>/<hash>.json`.
 fn package_name(repo: &str, hash: &Hash) -> Result<String> {
@@ -405,29 +416,67 @@ impl Store {
         let size = io::copy(content, &mut writer).context("writing blob")?;
         let hash: Hash = writer.hasher.finalize().into();
 
-        let dest = blob_name(&hash);
-        match rustix::fs::statat(&self.dir, &dest, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(_) => {
-                return Ok(Added {
-                    hash,
-                    size,
-                    new: false,
-                });
-            }
+        let new = self.publish(&file, &blob_name(&hash))?;
+        Ok(Added { hash, size, new })
+    }
+
+    /// Make the unnamed file `file` the read-only content-addressed file
+    /// `dest` unless that exists already; returns whether it didn't.
+    fn publish(&self, file: &File, dest: &str) -> Result<bool> {
+        match rustix::fs::statat(&self.dir, dest, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return Ok(false),
             Err(Errno::NOENT) => {}
             Err(e) => return Err(e).with_context(|| format!("checking {dest}")),
         }
-        rustix::fs::fchmod(&file, Mode::from_raw_mode(0o444))?;
+        rustix::fs::fchmod(file, Mode::from_raw_mode(0o444))?;
         let (subdir, _) = dest.rsplit_once('/').unwrap();
         mkdir_exist_ok(&self.dir, subdir).with_context(|| format!("creating {subdir}"))?;
-        // Another thread or process may have added the same blob since
+        // Another thread or process may have added the same file since
         // the check above; linking never replaces it.
-        let new = match self.link(&file, &dest) {
-            Ok(()) => true,
-            Err(Errno::EXIST) => false,
-            Err(e) => return Err(e).with_context(|| format!("linking blob to {dest}")),
-        };
-        Ok(Added { hash, size, new })
+        match self.link(file, dest) {
+            Ok(()) => Ok(true),
+            Err(Errno::EXIST) => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("linking {dest}")),
+        }
+    }
+
+    /// Write the object with `body`, whose references are indexes into
+    /// `refs`, in canonical form (see [`object::encode`]), and return its
+    /// address. Safe to call concurrently, as [`Store::add_blob`].
+    pub fn add_object(&self, refs: &[Ref], body: &serde_json::Value) -> Result<Hash> {
+        let data = object::encode(refs, body)?;
+        let hash = object::address(&data);
+        let dest = object_name(&hash);
+        if rustix::fs::statat(&self.dir, &dest, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
+            return Ok(hash);
+        }
+        let mut file = File::from(self.unnamed_file(0o600)?);
+        file.write_all(&data).context("writing object")?;
+        self.publish(&file, &dest)?;
+        Ok(hash)
+    }
+
+    /// Read the object with address `hash`, checking that its bytes have
+    /// that address and that its references are within its header.
+    pub fn read_object(&self, hash: &Hash) -> Result<Object> {
+        let name = object_name(hash);
+        let fd = self
+            .openat(&name, OFlags::RDONLY, 0)
+            .with_context(|| format!("opening object {hash}"))?;
+        let mut data = Vec::new();
+        File::from(fd)
+            .take(MAX_OBJECT + 1)
+            .read_to_end(&mut data)
+            .with_context(|| format!("reading object {hash}"))?;
+        ensure!(
+            data.len() as u64 <= MAX_OBJECT,
+            "object {hash} is larger than {MAX_OBJECT} bytes"
+        );
+        ensure!(
+            object::address(&data) == *hash,
+            "object {hash} is corrupt: its content has another address"
+        );
+        object::decode(&data).with_context(|| format!("reading object {hash}"))
     }
 
     /// Create an unnamed file in `tmp/`, which is freed when closed unless
@@ -904,6 +953,31 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o444);
         assert!(tmp_is_empty(dir.path()));
+    }
+
+    #[test]
+    fn objects_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
+        let blob = store.add_blob(&mut &b"x"[..]).unwrap().hash;
+        let body = serde_json::json!({"file": {"#": 0}});
+        let id = store.add_object(&[Ref::Blob(blob)], &body).unwrap();
+        assert_eq!(store.add_object(&[Ref::Blob(blob)], &body).unwrap(), id);
+        let obj = store.read_object(&id).unwrap();
+        assert_eq!(obj.refs, [Ref::Blob(blob)]);
+        assert_eq!(obj.body, body);
+        let path = dir.path().join(object_name(&id));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+        assert!(tmp_is_empty(dir.path()));
+        // A changed object no longer has its address.
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        data.push(b' ');
+        std::fs::write(&path, data).unwrap();
+        let e = store.read_object(&id).unwrap_err();
+        assert!(format!("{e:#}").contains("corrupt"), "{e:#}");
+        assert!(store.read_object(&blob).is_err());
     }
 
     #[test]

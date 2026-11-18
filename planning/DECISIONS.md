@@ -46,7 +46,9 @@ are in BUGS.md.
   SHA-256.
 - Rejected for now: the fs-verity digest as the content address. fs-verity
   is left for later, so there's no need to tie the store to it now.
-- Layout: `blobs/ab/cdef…` (read-only, mode 0444),
+- Layout: `blobs/ab/cdef…` (read-only, mode 0444) for file contents,
+  `objects/ab/cdef…` (also read-only) for skl's own records (see
+  PACKAGES.md: a header of references and a canonical JSON body),
   `packages/<repo>/<hash>.json` for imported manifests,
   `downloads/<repo>/` for downloaded packages, `repos/<repo>/` for repos
   (see Repos), `tmp/` for blobs and manifests being written.
