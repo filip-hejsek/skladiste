@@ -3,7 +3,8 @@
 Plans and open questions. Decisions already made are in DECISIONS.md;
 known bugs are in BUGS.md.
 
-Next priorities: install scripts and hooks.
+Next priorities: native packages (planning/PACKAGES.md), then install
+scripts and hooks on top of them.
 
 ## Arch frontend
 
@@ -68,7 +69,7 @@ Next priorities: install scripts and hooks.
 - Run `.INSTALL` scriptlets and alpm hooks inside the image, with
   `run::run_captured`, which also finds what they changed (see Changes by
   package code in DECISIONS.md). Next: run them in `skl arch build` and record
-  their changes with the image (see Images). Output of package code should go to the
+  their changes as a synthetic package (see PACKAGES.md). Output of package code should go to the
   user escaped, as workers' stderr does; `skl run` passes the terminal
   through.
 - Device nodes and FIFOs in packages are rejected; support them if a
@@ -76,8 +77,8 @@ Next priorities: install scripts and hooks.
 
 ## Images
 
-- Open question: where to record what an image contains, including the
-  changes install scripts and hooks made, (needed for
+- Open question: where to record what an image contains (an image
+  record in PACKAGES.md: its packages and synthetic package), (needed for
   upgrade and verify), including the snapshot used per repo (for
   upgrades, and to refuse versions older than those already used).
   Inside the image (e.g. `/var/lib/skl`), or alongside it outside the
@@ -89,9 +90,9 @@ Next priorities: install scripts and hooks.
   granted to the container), or record ownership in the manifest only
   and apply it on export.
 - Split building into a frontend step that works out what an image
-  contains (a spec: the packages' manifests, later what install scripts
-  need) and a format-independent step that builds an image from a spec.
-  `build` may then become a core verb (see CLI in DECISIONS.md).
+  contains (a list of package ids) and a format-independent step that
+  builds an image from it (see Building in PACKAGES.md). `build` may
+  then become a core verb (see CLI in DECISIONS.md).
 - Export to OCI images, or use podman's btrfs storage driver directly.
 - Upgrades and generations using subvolume snapshots, with rollback.
 
@@ -99,9 +100,10 @@ Next priorities: install scripts and hooks.
 
 - Lock the store during `skl migrate` (and against it in other
   commands); for now nothing else may use the store meanwhile.
-- Garbage collection of objects no package or sync record references,
-  and of old repo database snapshots. Must not race with `add_object`
-  finding an object already present (see DECISIONS.md, store layout).
+- Garbage collection of file contents no package or sync record
+  references, and of old repo database snapshots; with blobs and
+  objects (PACKAGES.md) it reads only objects' headers. Must not race
+  with `add_object` finding an object already present (see DECISIONS.md, store layout).
 - Detect modified files cheaply by comparing extents (FIEMAP) with the
   store object; on a mismatch, rehash instead of reporting a
   modification, since defrag also breaks sharing.

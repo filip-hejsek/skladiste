@@ -8,7 +8,7 @@ Decisions already made, with rejected alternatives, are in
 planning/DECISIONS.md; plans and open questions are in planning/TODO.md,
 and known bugs in planning/BUGS.md. Designs that outlive their TODO
 item have their own file (planning/WORKERS.md: workers that handle a
-queue of items). Larger designs that were rejected are kept in
+queue of items; planning/PACKAGES.md: the native package format). Larger designs that were rejected are kept in
 planning/rejected/, with the reason. Check them before proposing design
 changes, and keep them up to date: when something is done or fixed,
 remove it from TODO.md or BUGS.md and record the decisions it involved
