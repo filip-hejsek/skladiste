@@ -159,12 +159,12 @@ are in BUGS.md.
 - `skl arch sync` downloads each repo's database with the download stage
   (see Downloads; at most 64 MiB, held in memory) and keeps every
   version: the database
-  as a store blob, and a record `repos/<repo>/syncs/<time>.json` with
-  its hash, size, URL, the fetch time (supervisor's clock, UTC with
+  as a store blob, and a record, an object referring to it, whose id
+  `repos/<repo>/syncs/<time>` holds, with its size, URL, the fetch time (supervisor's clock, UTC with
   microseconds; fixed width, so the names sort by time) and the server's
   `Last-Modified` and `ETag` (sent by the worker, so untrusted: at most
   100 and 256 bytes, control characters escaped, for information only
-  until requests are conditional). Records are linked
+  until requests are conditional). The files with the ids are linked
   into place from an unnamed file, so one is never replaced or seen
   half-written. Records of repos synced together are written only after
   all of them were downloaded. A repo's latest record is its current

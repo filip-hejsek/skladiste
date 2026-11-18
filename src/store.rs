@@ -17,9 +17,9 @@
 //!   signatures), by repo and file name
 //! - `repos/<repo>/config.json` — a repo's configuration (see
 //!   [`crate::repo`]); its format is the frontend's
-//! - `repos/<repo>/syncs/<time>.json` — a record of each version of the
-//!   repo's database that was fetched ([`SyncRecord`]); the database
-//!   itself is a blob
+//! - `repos/<repo>/syncs/<time>` — the id of a record of each version of
+//!   the repo's database that was fetched ([`SyncRecord`], an object); the
+//!   database itself is a blob
 //! - `tmp/` — staging area for files being written: unnamed
 //!   (`O_TMPFILE`) until complete and checked, except files that are
 //!   replaced (index entries, the store manifest)
@@ -733,8 +733,8 @@ impl Store {
         Ok(names)
     }
 
-    /// Record a sync of repo `name`, as `syncs/<fetched>.json`. Fails if
-    /// a record by that name exists.
+    /// Record a sync of repo `name`: write the record as an object and its
+    /// id as `syncs/<fetched>`. Fails if a record by that name exists.
     pub fn save_sync(&self, name: &str, record: &SyncRecord) -> Result<()> {
         repo::check_id(name)?;
         anyhow::ensure!(
@@ -745,9 +745,11 @@ impl Store {
             "bad sync time {:?}",
             record.fetched
         );
-        let dest = format!("repos/{name}/syncs/{}.json", record.fetched);
+        let (refs, body) = record.to_object()?;
+        let id = self.add_object(refs.as_slice(), &body)?;
+        let dest = format!("repos/{name}/syncs/{}", record.fetched);
         let mut file = File::from(self.unnamed_file(0o644)?);
-        file.write_all(&serde_json::to_vec(record)?)
+        file.write_all(format!("{id}\n").as_bytes())
             .with_context(|| format!("writing {dest}"))?;
         self.link(&file, &dest)
             .with_context(|| format!("linking {dest}"))
@@ -760,12 +762,18 @@ impl Store {
         let latest = self
             .list_dir(&dir)?
             .into_iter()
-            .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+            .filter(|n| !n.starts_with('.'))
             .max();
-        match latest {
-            Some(file) => self.read_json(&format!("{dir}/{file}")),
-            None => Ok(None),
-        }
+        let Some(file) = latest else {
+            return Ok(None);
+        };
+        let path = format!("{dir}/{file}");
+        let id = self
+            .read_id(&path)?
+            .with_context(|| format!("{path} is gone"))?;
+        let obj = self.read_object(&id)?;
+        let record = SyncRecord::from_object(&obj).with_context(|| format!("reading {path}"))?;
+        Ok(Some(record))
     }
 }
 

@@ -16,6 +16,8 @@ use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::Hash;
+use crate::object::{Index, Object, Ref, Refs};
+use serde_json::Value;
 
 /// Name of the pseudo-repo of a format's packages imported from files or
 /// URLs (id `@FORMAT/@local`).
@@ -82,9 +84,9 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// One fetched version of a repo's database (a snapshot), kept as
-/// `repos/<repo>/syncs/<fetched>.json`. The database itself is a store
-/// blob.
+/// One fetched version of a repo's database (a snapshot): an object
+/// ([`SyncRecord::to_object`]) that refers to the database, a blob, and
+/// whose id `repos/<repo>/syncs/<fetched>` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRecord {
     /// The database's store blob.
@@ -99,6 +101,49 @@ pub struct SyncRecord {
     /// information only.
     pub last_modified: Option<String>,
     pub etag: Option<String>,
+}
+
+/// A sync record as an object's body stores it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSync {
+    database: Index,
+    size: u64,
+    url: String,
+    fetched: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+}
+
+impl SyncRecord {
+    /// The record as an object: its references and body.
+    pub fn to_object(&self) -> Result<(Refs, Value)> {
+        let mut refs = Refs::new();
+        let body = serde_json::to_value(StoredSync {
+            database: refs.add(Ref::Blob(self.hash)),
+            size: self.size,
+            url: self.url.clone(),
+            fetched: self.fetched.clone(),
+            last_modified: self.last_modified.clone(),
+            etag: self.etag.clone(),
+        })?;
+        Ok((refs, body))
+    }
+
+    /// The record in `obj`.
+    pub fn from_object(obj: &Object) -> Result<SyncRecord> {
+        let s: StoredSync = serde_json::from_value(obj.body.clone())?;
+        Ok(SyncRecord {
+            hash: obj.blob(s.database)?,
+            size: s.size,
+            url: s.url,
+            fetched: s.fetched,
+            last_modified: s.last_modified,
+            etag: s.etag,
+        })
+    }
 }
 
 /// `time` in UTC as `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`. Of fixed width (for

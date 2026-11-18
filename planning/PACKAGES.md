@@ -5,8 +5,9 @@ in the store, without an archive for now. Frontends convert their
 packages to it, and the core builds images from a list of such
 packages. Implemented: blobs and objects, canonical JSON,
 manifests with sections, the Arch index, the build split,
-overlays, and package code as synthetic packages with reuse; image
-records and roots are not.
+overlays, package code as synthetic packages with reuse, and sync
+records as objects; image records are not, and nothing reads the roots
+yet (no GC).
 
 Decided: objects with a reference header, manifests as objects
 with untyped sections per format, the build split, one
@@ -237,9 +238,11 @@ questions are at the end.
 ## Roots
 
 - What the GC starts from: the Arch index, the synthetic cache, image
-  records, and repo snapshots. Sync records become objects
-  referring to the database (a blob), with a named ref per
-  repo snapshot. Roots are small files holding an id, outside `objects/`.
+  records (not kept yet), and repo snapshots. Sync records are objects
+  referring to the database (a blob), each with a named ref
+  (`repos/<repo>/syncs/<time>`). Roots are small files holding an id,
+  outside `objects/`. Build specs aren't roots: a synthetic cache entry
+  is named by one and keeps it (and so its packages) alive.
 - GC itself is still in TODO.md, with the race against `add_object`
   (`add_blob` then).
 

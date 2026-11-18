@@ -3,8 +3,9 @@
 Plans and open questions. Decisions already made are in DECISIONS.md;
 known bugs are in BUGS.md.
 
-Next priorities: native packages (planning/PACKAGES.md), then install
-scripts and hooks on top of them.
+Native packages and package code are in place (planning/PACKAGES.md);
+left of that design: image records (see Images) and garbage collection
+(see Store).
 
 ## Arch frontend
 
