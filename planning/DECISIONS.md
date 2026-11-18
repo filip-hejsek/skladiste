@@ -50,6 +50,11 @@ are in BUGS.md.
   `packages/<repo>/<hash>.json` for imported manifests,
   `downloads/<repo>/` for downloaded packages, `repos/<repo>/` for repos
   (see Repos), `tmp/` for objects and manifests being written.
+- A store is set up explicitly (`skl init`, `Store::init`); other
+  commands only open an existing one and fail if a directory of the
+  layout is missing, so a mistyped `--store` doesn't silently start an
+  empty store. Setting up an existing store again creates what's
+  missing.
   Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
   then linked into place unless an identical object already exists;
   linking fails if the name exists, so of concurrent adds of the same

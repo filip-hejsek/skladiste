@@ -125,4 +125,5 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 - Not worth doing yet: return proper error types from the library
   instead of `anyhow` messages, and move all messages that mention CLI
   commands or flags (e.g. ``run `skl arch sync` ``, `use --fetch`) to
-  the CLI, which would match on the errors to add them.
+  the CLI, which would match on the errors to add them, as it does for
+  `store::NotAStore` (found with `downcast_ref`).

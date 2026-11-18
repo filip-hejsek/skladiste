@@ -38,6 +38,7 @@ The store and images must be on the same btrfs filesystem.
 
 ```sh
 export SKL_STORE=/path/on/btrfs/store
+skl init
 export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
 skl arch repo add core "$mirror"

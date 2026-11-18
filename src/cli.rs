@@ -9,14 +9,14 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 
 use skladiste::btrfs;
 use skladiste::diff::Change;
 use skladiste::http::RootCerts;
 use skladiste::jobs::default_jobs;
-use skladiste::store::Store;
+use skladiste::store::{NotAStore, Store};
 use skladiste::worker::Workers;
 
 pub(crate) mod arch;
@@ -60,6 +60,11 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set up a store in the directory given with --store (or SKL_STORE),
+    /// creating the directory if needed. Other commands need a store set
+    /// up this way. In an existing store, it creates the parts of the
+    /// layout that are missing.
+    Init,
     /// Arch Linux packages: repos, importing, and building images.
     Arch(arch::ArchArgs),
     /// Manage repos of all package formats.
@@ -123,17 +128,21 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
             .with_context(|| format!("loading root certificates from {}", path.display()))?;
         workers.set_root_certs(roots);
     }
-    let store = cli
+    let store_path = cli
         .store
         .as_deref()
         .context("no store given (--store or SKL_STORE)")?;
-    let store = Store::init_path(store)?;
+    let store = || open_store(store_path);
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
     match cli.command {
-        Command::Arch(args) => arch::run(args, &workers, &store, jobs)?,
+        Command::Init => {
+            Store::init_path(store_path)?;
+        }
+        Command::Arch(args) => arch::run(args, &workers, &store()?, jobs)?,
         Command::Repo {
             command: RepoCommand::List,
         } => {
+            let store = store()?;
             for id in store.repos()? {
                 let synced = match store.latest_sync(&id)? {
                     Some(record) => record.fetched,
@@ -146,9 +155,17 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
             image,
             program,
             args,
-        } => return run_in_image(&workers, &store, &image, &program, &args),
+        } => return run_in_image(&workers, &store()?, &image, &program, &args),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The store at `path`, which `skl init` has set up.
+fn open_store(path: &Path) -> Result<Store> {
+    Store::open_path(path).map_err(|e| match e.downcast_ref::<NotAStore>() {
+        Some(not) => anyhow!("{} is {not}; set one up with `skl init`", path.display()),
+        None => e,
+    })
 }
 
 /// `skl run`: run the program, then print what it changed.

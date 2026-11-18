@@ -42,7 +42,7 @@ dir=tmp  # any directory on btrfs
 export SKL_STORE=$dir/store SKL_KEYRING=/usr/share/pacman/keyrings/archlinux
 skl() { cargo run -q --release -- "$@"; }
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
-skl arch repo add core "$mirror" && skl arch repo add extra "$mirror"  # once
+skl init && skl arch repo add core "$mirror" && skl arch repo add extra "$mirror"  # once
 # 42 packages with dependencies, downloaded into the store's downloads/.
 skl arch build --sync --fetch --repo core --repo extra -o $dir/img filesystem bash coreutils
 unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
