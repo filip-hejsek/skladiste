@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::{BufRead, Read as _};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -277,16 +278,24 @@ pub fn decode(data: &[u8]) -> Result<Object> {
 
 /// The references of an object, and the rest of its bytes (the body).
 pub fn parse_header(data: &[u8]) -> Result<(Vec<Ref>, &[u8])> {
-    let (first, mut rest) = split_line(data).context("no header")?;
+    let mut rest = data;
+    let refs = read_header(&mut rest)?;
+    Ok((refs, rest))
+}
+
+/// Read the header of an object from `reader`, leaving it at the start of
+/// the body. Reads no more than the header, so following references (as
+/// the GC does) costs no more than the header's size.
+pub fn read_header(reader: &mut impl BufRead) -> Result<Vec<Ref>> {
+    let first = read_line(reader)?.context("no header")?;
     let count = first
         .strip_prefix(&format!("{MAGIC} {FORMAT} {ALGORITHM} "))
         .and_then(|n| n.parse::<usize>().ok())
         .filter(|&n| n <= MAX_REFS)
         .with_context(|| format!("bad object header {first:?}"))?;
-    let mut refs = Vec::with_capacity(count);
+    let mut refs = Vec::with_capacity(count.min(1 << 16));
     for _ in 0..count {
-        let (line, next) = split_line(rest).context("header ends early")?;
-        rest = next;
+        let line = read_line(reader)?.context("header ends early")?;
         let r = match line.split_once(' ') {
             Some(("b", hash)) => Ref::Blob(hash.parse()?),
             Some(("o", hash)) => Ref::Object(hash.parse()?),
@@ -294,14 +303,24 @@ pub fn parse_header(data: &[u8]) -> Result<(Vec<Ref>, &[u8])> {
         };
         refs.push(r);
     }
-    Ok((refs, rest))
+    Ok(refs)
 }
 
-/// The first line of `data` without its newline, and what follows.
-fn split_line(data: &[u8]) -> Option<(&str, &[u8])> {
-    let n = data.iter().position(|&b| b == b'\n')?;
-    let line = std::str::from_utf8(&data[..n]).ok()?;
-    Some((line, &data[n + 1..]))
+/// Longest line in a header, newline included.
+const MAX_HEADER_LINE: u64 = 128;
+
+/// The next line of a header without its newline; `None` if there is no
+/// complete line, or it isn't UTF-8 or too long.
+fn read_line(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut line = Vec::new();
+    reader
+        .take(MAX_HEADER_LINE)
+        .read_until(b'\n', &mut line)
+        .context("reading the header")?;
+    if line.pop() != Some(b'\n') {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(line).ok())
 }
 
 /// Check that every reference in `v` is a valid one, below `count`.
@@ -399,6 +418,17 @@ mod tests {
         ] {
             assert!(decode(data.as_bytes()).is_err(), "{data:?}");
         }
+    }
+
+    #[test]
+    fn header_alone() {
+        let r = [Ref::Blob(hash("a")), Ref::Object(hash("b"))];
+        let data = encode(&r, &json!([{"#": 0}, {"#": 1}])).unwrap();
+        let mut reader = &data[..];
+        assert_eq!(read_header(&mut reader).unwrap(), r);
+        assert_eq!(reader, br##"[{"#":0},{"#":1}]"##);
+        let long = format!("skl-object 1 blake3 1\nb {}0\n", hash("a"));
+        assert!(read_header(&mut long.as_bytes()).is_err());
     }
 
     #[test]

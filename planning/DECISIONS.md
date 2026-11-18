@@ -86,7 +86,7 @@ are in BUGS.md.
   - Each migration is followed by writing the manifest with the version
     it reached, so an interrupted migration is run again: migrations
     must be safe to repeat. Nothing else may use the store during a
-    migration; nothing enforces this yet.
+    migration; the store's lock enforces it (below).
   - There is no stable version yet; the old `{"version": 0}` is rejected
     like an unknown development version.
   - Init writes the manifest first (an unnamed file linked into place),
@@ -100,10 +100,10 @@ are in BUGS.md.
   blob (threads or processes) exactly one counts it as new. The
   existing blob must be the one kept, with the new copy dropped:
   replacing it would leave images reflinked to the old extents, so the
-  same content would be stored twice. A future GC must not delete a
-  blob between an add finding it present and the caller recording a
-  reference to it (e.g. by locking, or by sparing blobs added during
-  the GC). An unnamed file leaves nothing behind if skl is killed, and nobody can open it by
+  same content would be stored twice. The GC must not delete a blob
+  between an add finding it present and the caller recording a
+  reference to it, which the store's lock prevents (Garbage
+  collection). An unnamed file leaves nothing behind if skl is killed, and nobody can open it by
   name while it's written. Linking goes through `/proc/self/fd/N`
   (`AT_SYMLINK_FOLLOW`), since `AT_EMPTY_PATH` needs
   `CAP_DAC_READ_SEARCH`; so writing to the store needs `/proc` (only the
@@ -119,6 +119,38 @@ are in BUGS.md.
   (`@arch/@local`).
 - Manifests are canonical JSON (PACKAGES.md); hashes are in the
   object's header, xattr values are hex strings.
+
+## Garbage collection
+
+- `skl gc` (`Store::gc`, `src/store/gc.rs`) removes every blob and
+  object not reachable from the roots (PACKAGES.md, Roots: package
+  indexes, the synthetic cache by both its name and its content, sync
+  records), following only objects' headers.
+- Concurrency by a lock: an open store holds a `flock` on its directory,
+  shared normally, exclusive for the GC (`Store::open_exclusive`) and
+  migrations. Exclusive takers fail with `InUse` instead of waiting
+  (a long build would block them indefinitely); shared takers wait, as
+  a GC is short. The lock is on the open directory, so workers handed
+  its fd keep it. Rejected: sparing what was added or found during the
+  GC, without a lock: an add that finds a blob present leaves no trace
+  (it would have to touch the blob), and a build reflinking from a blob
+  needs it until it's done, which only a lock covers. The lock also
+  enforces that nothing uses the store during a migration.
+- A root or reachable object that is missing or unreadable stops the GC
+  before it removes anything: what it refers to is unknown. Names in
+  `blobs/` and `objects/` that aren't a lowercase hash are left alone;
+  emptied fan-out directories are removed.
+- Old sync records go only when asked (`--keep-syncs N`, the latest N
+  per repo), since a record is history that can't be fetched again.
+  Records are removed before the sweep, so an interrupted GC leaves
+  only garbage for the next one.
+- Under the exclusive lock everything in `tmp/` is a leftover of a
+  killed process: named files of replaced entries and `snapshot-*`
+  subvolumes of `skl run` are removed.
+- Sizes reported are the removed files' sizes; extents shared with
+  images stay allocated.
+- `skl gc -n` on a store with the 42-package test build (8,965 blobs,
+  46 objects): 20 ms.
 
 ## Arch frontend
 

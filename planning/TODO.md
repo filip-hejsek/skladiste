@@ -4,8 +4,7 @@ Plans and open questions. Decisions already made are in DECISIONS.md;
 known bugs are in BUGS.md.
 
 Native packages and package code are in place (planning/PACKAGES.md);
-left of that design: image records (see Images) and garbage collection
-(see Store).
+left of that design: image records (see Images).
 
 ## Arch frontend
 
@@ -95,12 +94,13 @@ left of that design: image records (see Images) and garbage collection
 
 ## Store
 
-- Lock the store during `skl migrate` (and against it in other
-  commands); for now nothing else may use the store meanwhile.
-- Garbage collection of file contents no package or sync record
-  references, and of old repo database snapshots; with blobs and
-  objects (PACKAGES.md) it reads only objects' headers. Must not race
-  with `add_blob` finding a blob already present (see DECISIONS.md, store layout).
+- GC (DECISIONS.md, Garbage collection): `downloads/` isn't collected,
+  so archives of packages no longer in any snapshot stay; neither are
+  index entries of packages no build can choose any more. Images
+  aren't roots until image records exist, so what `skl run` adds is
+  removed.
+- Commands wait without a message while `skl gc` or `skl migrate`
+  holds the store's lock.
 - Detect modified files cheaply by comparing extents (FIEMAP) with the
   store blob; on a mismatch, rehash instead of reporting a
   modification, since defrag also breaks sharing.

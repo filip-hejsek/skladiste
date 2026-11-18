@@ -33,6 +33,11 @@
 //! directory fd ([`Store::init_path`] and [`Store::open_path`]
 //! open it from a path). Every access is relative to that fd, so the store
 //! also works from a sandboxed process that was handed only the fd.
+//!
+//! An open store holds a lock on its directory (`flock`): shared, or
+//! exclusive for garbage collection ([`Store::open_exclusive`],
+//! [`Store::gc`]) and migrations, which then fail with [`InUse`] if
+//! another process uses the store.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -52,6 +57,7 @@ use crate::repo::{self, SyncRecord};
 use crate::spec::BuildSpec;
 
 pub mod format;
+pub mod gc;
 
 use format::{FORMATS, Formats};
 pub use format::{FormatVersion, VersionProblem, WrongVersion};
@@ -59,6 +65,42 @@ pub use format::{FormatVersion, VersionProblem, WrongVersion};
 pub struct Store {
     dir: OwnedFd,
     tmp_counter: AtomicU64,
+    /// Whether this holds the store's lock exclusively (see [`lock`]).
+    exclusive: bool,
+}
+
+/// The error when the store's lock is needed exclusively (by
+/// [`Store::open_exclusive`] or [`Store::migrate`]) but another process
+/// uses the store (found with [`anyhow::Error::downcast_ref`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InUse;
+
+impl std::fmt::Display for InUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the store is in use by another process")
+    }
+}
+
+impl std::error::Error for InUse {}
+
+/// Take the store's lock: a `flock` on the store's directory, held until
+/// every fd of that open directory is closed (also those passed to
+/// workers). Every [`Store`] holds it shared, waiting while it is held
+/// exclusively; the GC and migrations hold it exclusively, and fail with
+/// [`InUse`] rather than wait. So nothing adds to the store while the GC
+/// decides what is garbage, and nothing uses the store during a migration.
+fn lock(dir: impl AsFd, exclusive: bool) -> Result<()> {
+    use rustix::fs::FlockOperation;
+    let op = if exclusive {
+        FlockOperation::NonBlockingLockExclusive
+    } else {
+        FlockOperation::LockShared
+    };
+    match rustix::fs::flock(dir, op) {
+        Ok(()) => Ok(()),
+        Err(Errno::WOULDBLOCK) => Err(InUse.into()),
+        Err(e) => Err(e).context("locking the store"),
+    }
 }
 
 /// What [`Store::migrate`] did: `from` and `to` are equal if the store
@@ -287,6 +329,7 @@ impl Store {
     /// already a store of the format version this skl uses; then the parts of the layout
     /// that are missing are created.
     pub fn init(dir: OwnedFd) -> Result<Store> {
+        lock(&dir, false)?;
         // Emptiness is checked before the manifest: the manifest is the
         // first entry an init creates, so a concurrent init can't make a
         // directory found non-empty lack it.
@@ -309,8 +352,20 @@ impl Store {
     /// Use the store in the directory `dir`, which [`Store::init`] has set
     /// up. Fails with [`NotAStore`] if it hasn't, and with
     /// [`WrongVersion`] if the store isn't of the format version this skl
-    /// uses.
+    /// uses. Waits while another process holds the store exclusively (as
+    /// [`Store::open_exclusive`] and [`Store::migrate`] do).
     pub fn open(dir: OwnedFd) -> Result<Store> {
+        Store::open_locked(dir, false)
+    }
+
+    /// [`Store::open`], holding the store's lock exclusively, as the GC
+    /// needs: fails with [`InUse`] if another process uses the store.
+    pub fn open_exclusive(dir: OwnedFd) -> Result<Store> {
+        Store::open_locked(dir, true)
+    }
+
+    fn open_locked(dir: OwnedFd, exclusive: bool) -> Result<Store> {
+        lock(&dir, exclusive)?;
         // Emptiness first, as in `init`.
         if is_empty(&dir)? {
             return Err(NotAStore::Empty.into());
@@ -325,7 +380,9 @@ impl Store {
                 Err(e) => return Err(e).with_context(|| format!("checking {sub}/")),
             }
         }
-        Ok(Store::from_dir(dir))
+        let mut store = Store::from_dir(dir);
+        store.exclusive = exclusive;
+        Ok(store)
     }
 
     /// [`Store::init`] for the directory at `path`, which is created if
@@ -340,13 +397,23 @@ impl Store {
     /// [`Store::open`] for the directory at `path`. Fails with
     /// [`NotAStore`] also if there is no directory at `path`.
     pub fn open_path(path: &Path) -> Result<Store> {
+        Store::open_path_locked(path, false)
+    }
+
+    /// [`Store::open_exclusive`] for the directory at `path`, as
+    /// [`Store::open_path`].
+    pub fn open_exclusive_path(path: &Path) -> Result<Store> {
+        Store::open_path_locked(path, true)
+    }
+
+    fn open_path_locked(path: &Path, exclusive: bool) -> Result<Store> {
         let dir = match open_dir(path) {
             Ok(dir) => Ok(dir),
             Err(Errno::NOENT) => Err(NotAStore::Missing.into()),
             Err(Errno::NOTDIR) => Err(NotAStore::NotADirectory.into()),
             Err(e) => Err(anyhow::Error::from(e)),
         };
-        dir.and_then(Store::open)
+        dir.and_then(|dir| Store::open_locked(dir, exclusive))
             .with_context(|| format!("opening the store {}", path.display()))
     }
 
@@ -354,13 +421,14 @@ impl Store {
     /// skl uses. Migrating a store of the latest stable version to a
     /// development version needs `allow_dev`: afterwards only builds of
     /// that development version can open it. Fails with [`WrongVersion`]
-    /// if the store can't be migrated. Nothing else may use the store
-    /// meanwhile.
+    /// if the store can't be migrated, and with [`InUse`] if another
+    /// process uses the store (the migration holds its lock exclusively).
     pub fn migrate(dir: OwnedFd, allow_dev: bool) -> Result<Migrated> {
         Store::migrate_formats(dir, &FORMATS, allow_dev)
     }
 
     fn migrate_formats(dir: OwnedFd, formats: &Formats, allow_dev: bool) -> Result<Migrated> {
+        lock(&dir, true)?;
         if is_empty(&dir)? {
             return Err(NotAStore::Empty.into());
         }
@@ -389,10 +457,12 @@ impl Store {
     }
 
     /// Use an already open store directory, e.g. one passed to a worker.
+    /// Takes no lock: the process that opened it holds it.
     pub fn from_dir(dir: OwnedFd) -> Store {
         Store {
             dir,
             tmp_counter: AtomicU64::new(0),
+            exclusive: false,
         }
     }
 

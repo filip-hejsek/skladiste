@@ -16,7 +16,7 @@ use skladiste::btrfs;
 use skladiste::diff::Change;
 use skladiste::http::RootCerts;
 use skladiste::jobs::default_jobs;
-use skladiste::store::{NotAStore, Store, VersionProblem, WrongVersion};
+use skladiste::store::{InUse, NotAStore, Store, VersionProblem, WrongVersion, gc};
 use skladiste::worker::Workers;
 
 pub(crate) mod arch;
@@ -67,7 +67,7 @@ enum Command {
     Init,
     /// Migrate the store to the format version this skl uses.
     ///
-    /// Nothing else may use the store meanwhile. A development build of skl
+    /// Fails if another skl process uses the store. A development build of skl
     /// uses a development version of the format: migrating a store to it
     /// needs --dev, and afterwards only builds of that version can open the
     /// store. Snapshot the store first to keep a copy.
@@ -75,6 +75,23 @@ enum Command {
         /// Allow migrating to a development version.
         #[arg(long)]
         dev: bool,
+    },
+    /// Remove file contents and records that nothing refers to.
+    ///
+    /// Keeps what the package indexes, the cache of package code's results
+    /// and the repos' sync records refer to; everything else in the store
+    /// is removed, including what `skl run` added (images aren't recorded
+    /// yet). Images are unaffected: they hold their own copies. Needs the
+    /// store to itself: fails if another skl process uses it, and other
+    /// commands wait until it's done.
+    Gc {
+        /// Keep only the latest N syncs of each repo, removing older
+        /// repo databases.
+        #[arg(long, value_name = "N")]
+        keep_syncs: Option<NonZeroUsize>,
+        /// Only print what would be removed.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
     /// Arch Linux packages: repos, importing, and building images.
     Arch(arch::ArchArgs),
@@ -160,6 +177,36 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
+        Command::Gc {
+            keep_syncs,
+            dry_run,
+        } => {
+            let store = Store::open_exclusive_path(store_path).map_err(|e| {
+                match e.downcast_ref::<InUse>() {
+                    Some(_) => anyhow!("{e:#}; try again when it's done"),
+                    None => store_error(store_path, e),
+                }
+            })?;
+            let options = gc::Options {
+                keep_syncs,
+                dry_run,
+            };
+            let report = store.gc(&options)?;
+            let verb = if dry_run { "would remove" } else { "removed" };
+            let (objects, blobs) = (report.objects, report.blobs);
+            println!(
+                "{verb} {} sync records, {} objects ({:.1} MiB), {} blobs ({:.1} MiB) and {} \
+                 leftovers in tmp/; kept {} objects and {} blobs",
+                report.syncs,
+                objects.removed,
+                mib(objects.removed_bytes),
+                blobs.removed,
+                mib(blobs.removed_bytes),
+                report.tmp,
+                objects.kept,
+                blobs.kept,
+            );
+        }
         Command::Arch(args) => arch::run(args, &workers, &store()?, jobs)?,
         Command::Repo {
             command: RepoCommand::List,
@@ -184,13 +231,18 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
 
 /// The store at `path`, which `skl init` has set up.
 fn open_store(path: &Path) -> Result<Store> {
-    Store::open_path(path).map_err(|e| match e.downcast_ref::<NotAStore>() {
+    Store::open_path(path).map_err(|e| store_error(path, e))
+}
+
+/// The error `e` of opening the store at `path`, with hints.
+fn store_error(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<NotAStore>() {
         Some(not) if not.can_init() => {
             anyhow!("{} is {not}; set one up with `skl init`", path.display())
         }
         Some(not) => anyhow!("{} is {not}", path.display()),
         None => migrate_hint(e),
-    })
+    }
 }
 
 /// Suggest `skl migrate` for a store that needs it.

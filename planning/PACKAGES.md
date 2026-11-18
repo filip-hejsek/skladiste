@@ -6,8 +6,7 @@ packages to it, and the core builds images from a list of such
 packages. Implemented: blobs and objects, canonical JSON,
 manifests with sections, the Arch index, the build split,
 overlays, package code as synthetic packages with reuse, and sync
-records as objects; image records are not, and nothing reads the roots
-yet (no GC).
+records as objects, and the GC; image records are not.
 
 Decided: objects with a reference header, manifests as objects
 with untyped sections per format, the build split, one
@@ -243,8 +242,8 @@ questions are at the end.
   (`repos/<repo>/syncs/<time>`). Roots are small files holding an id,
   outside `objects/`. Build specs aren't roots: a synthetic cache entry
   is named by one and keeps it (and so its packages) alive.
-- GC itself is still in TODO.md, with the race against `add_object`
-  (`add_blob` then).
+- The GC (`Store::gc`, `skl gc`) is under Garbage collection in
+  DECISIONS.md.
 
 ## Open
 
