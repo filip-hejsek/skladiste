@@ -219,7 +219,14 @@ fn run_in_image(
         "{} is not a directory",
         image.display()
     );
-    let captured = skladiste::run::run_captured(workers, store, dir.as_fd(), program, args)?;
+    let captured = skladiste::run::run_captured(
+        workers,
+        store,
+        dir.as_fd(),
+        program,
+        args,
+        &Default::default(),
+    )?;
     let (mut added, mut modified, mut removed) = (0, 0, 0);
     for change in &captured.changes {
         let letter = match change {
@@ -246,14 +253,7 @@ fn run_in_image(
         mib(stats.new_bytes)
     );
     if captured.snapshot_removal == btrfs::Removal::EntryByEntry {
-        eprintln!(
-            "hint: without root, skl had to remove the snapshot it took entry by entry, which is \
-             slow for large images; mounting the filesystem with {0} (e.g. `mount -o \
-             remount,{0} MOUNTPOINT`) lets it remove the snapshot at once. Note that the option \
-             lets any user remove a subvolume whose root directory they can write to, with all \
-             its contents.",
-            btrfs::USER_RM_OPTION
-        );
+        eprintln!("{}", snapshot_hint());
     }
     let status = captured.status;
     let code = status
@@ -261,6 +261,19 @@ fn run_in_image(
         .or_else(|| status.signal().map(|s| 128 + s))
         .unwrap_or(1);
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+}
+
+/// What to say when the snapshot for finding changes had to be removed
+/// entry by entry.
+pub(crate) fn snapshot_hint() -> String {
+    format!(
+        "hint: without root, skl had to remove the snapshot it took entry by entry, which is \
+         slow for large images; mounting the filesystem with {0} (e.g. `mount -o \
+         remount,{0} MOUNTPOINT`) lets it remove the snapshot at once. Note that the option \
+         lets any user remove a subvolume whose root directory they can write to, with all \
+         its contents.",
+        btrfs::USER_RM_OPTION
+    )
 }
 
 pub(crate) fn mib(bytes: u64) -> f64 {

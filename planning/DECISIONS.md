@@ -749,6 +749,14 @@ are in BUGS.md.
   setting up namespaces ourselves; no clear benefit for more code. Workers
   running skl's own code also start under bubblewrap and add Landlock and
   seccomp themselves.
+- `skl arch build` runs the packages' install scriptlets and hooks
+  with `run::run_captured` and keeps what they changed as a synthetic
+  package, reused by later builds of the same packages (PACKAGES.md).
+  Measured with the 42-package set (2 scriptlets, 3 glibc hooks), from
+  kept downloads under `unshare --map-auto --map-root-user`, without
+  `user_subvol_rm_allowed`: 2.7 s when the code runs, 1.9 s when its
+  synthetic package is reused, 1.8 s for the same build before package
+  code ran at all.
 - Package code runs with `skl::run` (`skl run IMAGE PROGRAM...`): bwrap
   with the image fd bound read-write as `/`, new pid, net, ipc, uts and
   cgroup namespaces, a read-only `/proc`, bwrap's minimal `/dev`, tmpfs on

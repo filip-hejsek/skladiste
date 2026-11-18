@@ -66,19 +66,17 @@ scripts and hooks on top of them.
   the result, and the supervisor pass it to that origin's worker), use
   the system's CA certificates by default (now only with `--ca-certs`),
   support HTTP proxies.
-- Run `.INSTALL` scriptlets and alpm hooks inside the image, with
-  `run::run_captured`, which also finds what they changed (see Changes by
-  package code in DECISIONS.md). Next: run them in `skl arch build` and record
-  their changes as a synthetic package (see PACKAGES.md). Output of package code should go to the
-  user escaped, as workers' stderr does; `skl run` passes the terminal
-  through.
+- Package code (PACKAGES.md): masking hooks with a symlink to
+  `/dev/null`, and hooks' `Depends`, aren't supported. `skl run` passes
+  the terminal through to the program; builds escape its output.
 - Device nodes and FIFOs in packages are rejected; support them if a
   package needs them.
 
 ## Images
 
 - Open question: where to record what an image contains (an image
-  record in PACKAGES.md: its packages and synthetic package), (needed for
+  record in PACKAGES.md: its build spec and synthetic package; neither
+  is recorded per image yet), (needed for
   upgrade and verify), including the snapshot used per repo (for
   upgrades, and to refuse versions older than those already used).
   Inside the image (e.g. `/var/lib/skl`), or alongside it outside the

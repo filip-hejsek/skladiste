@@ -69,8 +69,15 @@ fn captures_changes() {
     let root = File::open(&image).unwrap();
     let args = minimal_image::child_args("captures_changes");
     let child = OsStr::new(minimal_image::CHILD);
-    let captured =
-        skladiste::run::run_captured(&workers, &store, root.as_fd(), child, &args).unwrap();
+    let captured = skladiste::run::run_captured(
+        &workers,
+        &store,
+        root.as_fd(),
+        child,
+        &args,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(captured.status.code(), Some(3));
 
     let summary: Vec<String> = captured

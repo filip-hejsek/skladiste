@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::arch::repo::{self, DbEntry, LOCAL_REPO as LOCAL, Snapshot};
 use crate::arch::signature::MAX_SIGNATURE_SIZE;
 use crate::arch::verify::Verifier;
-use crate::arch::{self, version};
+use crate::arch::{self, ArchSection, version};
 use crate::download::{Request, Sink, fetch_and_run};
 use crate::http::Url;
 use crate::jobs::par_map;
@@ -454,6 +454,7 @@ fn import_archive(
         arch::import_in_worker(ctx.workers, ctx.store, file).with_context(importing)?;
     // The metadata must be usable for dependency resolution.
     repo::package_candidate(&pkg).with_context(importing)?;
+    ArchSection::of(&pkg)?.validate().with_context(importing)?;
     if let Some(entry) = entry {
         check_identity(&pkg, entry).with_context(importing)?;
     }
@@ -641,7 +642,6 @@ fn read_signature(file: File) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::ArchSection;
 
     #[test]
     fn local_packages_newest_first() {

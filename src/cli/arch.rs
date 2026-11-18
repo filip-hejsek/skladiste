@@ -12,9 +12,9 @@ use rustix::fs::{Mode, OFlags};
 
 use skladiste::arch::packages::{self, Context, Event, LocalFile, LocalPackage, Source};
 use skladiste::arch::repo::{self, LOCAL_REPO as LOCAL, repo_id};
+use skladiste::arch::scripts::{self, Code};
 use skladiste::arch::verify::{self, KeyringError, KeyringFiles, Verifier};
 use skladiste::http::Url;
-use skladiste::install;
 use skladiste::resolve::Target;
 use skladiste::store::Store;
 use skladiste::worker::Workers;
@@ -50,7 +50,11 @@ enum ArchCommand {
     /// Create a new image subvolume containing the given packages and
     /// their dependencies.
     ///
-    /// Install scripts are not run.
+    /// The packages are installed in dependency order; then their install
+    /// scripts and the alpm hooks they trigger run in the image, as with
+    /// `skl run`. What that code changed is kept in the store and
+    /// installed instead of running the code again when the same packages
+    /// are built again (unless --rerun-scripts).
     Build {
         /// Path of the new subvolume (must not exist).
         #[arg(short, long)]
@@ -63,6 +67,11 @@ enum ArchCommand {
         /// a build uses the network only for `--sync`.
         #[arg(long)]
         fetch: bool,
+        /// Run the packages' install scripts and hooks even if an earlier
+        /// build of the same packages ran them, and keep what they change
+        /// now instead.
+        #[arg(long)]
+        rerun_scripts: bool,
         /// Repo to take packages from (repeatable, in priority order): a
         /// repo added with `skl arch repo add`, of which the latest sync is
         /// used, or `@local` for the packages imported with `skl arch
@@ -133,6 +142,7 @@ pub(crate) fn run(
             output,
             sync: sync_first,
             fetch,
+            rerun_scripts,
             repos,
             packages,
         } => {
@@ -179,8 +189,16 @@ pub(crate) fn run(
                     packages::get_packages(&ctx, &chosen, fetch)
                 })?,
             };
-            let r = install::build(workers, store, &packages, parent.as_fd(), name)
-                .with_context(|| format!("building {}", output.display()))?;
+            let built = scripts::build(
+                workers,
+                store,
+                &packages,
+                parent.as_fd(),
+                name,
+                rerun_scripts,
+            )
+            .with_context(|| format!("building {}", output.display()))?;
+            let r = built.report;
             eprintln!(
                 "built {}: {} files, {} dirs, {} symlinks, {} hard links",
                 output.display(),
@@ -198,6 +216,7 @@ pub(crate) fn run(
             if r.xattr_failures > 0 {
                 eprintln!("warning: could not set {} xattrs", r.xattr_failures);
             }
+            report_code(&built.code);
         }
         ArchCommand::Repo {
             command: RepoCommand::Add { name, server, db },
@@ -224,6 +243,37 @@ pub(crate) fn run(
         }
     }
     Ok(())
+}
+
+/// Report what a build did about package code.
+fn report_code(code: &Code) {
+    match code {
+        Code::None => {}
+        Code::Reused(id) => eprintln!(
+            "installed what install scripts and hooks changed in an earlier build ({id}); \
+             use --rerun-scripts to run them again"
+        ),
+        Code::Ran(ran) => {
+            let (added, modified, removed) = ran.changes;
+            eprintln!(
+                "ran {} install scripts and {} hooks: {added} added, {modified} modified, \
+                 {removed} removed; {} new blobs ({:.1} MiB)",
+                ran.scripts,
+                ran.hooks,
+                ran.stats.new_blobs,
+                mib(ran.stats.new_bytes)
+            );
+            if !ran.status.success() {
+                eprintln!(
+                    "warning: package code failed (see above); its changes are in the image, \
+                     but a build of the same packages will run it again"
+                );
+            }
+            if ran.snapshot_removal == skladiste::btrfs::Removal::EntryByEntry {
+                eprintln!("{}", super::snapshot_hint());
+            }
+        }
+    }
 }
 
 /// The directory `path` is in, opened, and the last component of `path`.

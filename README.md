@@ -22,8 +22,12 @@ formats can be added as frontends.
   continues a file after a broken connection where the server allows
 - Resolves dependencies pacman-style (versioned dependencies, provides,
   conflicts)
-- No install scripts or hooks yet; `skl run` runs a program in an image,
-  sandboxed with bubblewrap, and lists what it changed
+- Runs the packages' install scripts and the alpm hooks they trigger in
+  the new image, sandboxed with bubblewrap, and keeps what they changed
+  in the store, so that building the same packages again gives the same
+  image without running them again (`--rerun-scripts` runs them anyway)
+- `skl run` runs a program in an image, sandboxed the same way, and
+  lists what it changed
 - Owners are applied only where permitted; unprivileged builds report how
   many entries could not be chowned
 - Archives and repo databases are parsed and images filled by worker
@@ -89,14 +93,20 @@ directory they can write to, with all its contents.
   for a development one (until the first stable format, all are
   development formats). A store of an older stable version is migrated
   with `skl migrate`; one of another development version can't be.
-- `objects/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
-- `packages/<repo>/<hash>.json` — imported package manifests, keyed by the
-  archive's hash; packages imported from files or URLs are in the repo
-  `@arch/@local`
+- `blobs/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
+- `objects/ab/cdef…` — skl's own records, such as package manifests,
+  named by their hash (read-only): a header listing the blobs and
+  objects they refer to, and a JSON body. A package's id is the hash of
+  its manifest.
+- `packages/<repo>/<hash>` — each repo's index: the id of the package
+  imported from the archive with that hash; packages imported from
+  files or URLs are in the repo `@arch/@local`
+- `synthetic/<spec>` — the id of the package that holds what install
+  scripts and hooks changed in a build of the packages of a build spec
 - `downloads/<repo>/` — downloaded packages and their signatures
 - `repos/<repo>/` — a repo's configuration and a record of each version of
-  its database that was synced (the database itself is an object)
-- `tmp/` — staging area for new objects
+  its database that was synced (the database itself is a blob)
+- `tmp/` — staging area for new files
 
 `<repo>` is the repo's id, `@FORMAT/NAME`: each package format has its
 own namespace, so the Arch repo `core` is `@arch/core`. `skl repo list`

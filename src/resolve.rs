@@ -215,6 +215,45 @@ pub fn resolve(repos: &[&[Candidate]], targets: &[Target], cmp: Compare) -> Resu
     Ok(chosen)
 }
 
+/// An order for installing `packages` (indexes into it) in which each
+/// package comes after those that satisfy its dependencies, as pacman
+/// orders them: depth first, from each package in the given order, so
+/// that a dependency cycle is broken where it is first entered. A
+/// dependency that no package satisfies is ignored.
+pub fn install_order(packages: &[Candidate], cmp: Compare) -> Vec<usize> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        New,
+        Visiting,
+        Done,
+    }
+    fn visit(
+        i: usize,
+        packages: &[Candidate],
+        cmp: Compare,
+        state: &mut [State],
+        order: &mut Vec<usize>,
+    ) {
+        if state[i] != State::New {
+            return;
+        }
+        state[i] = State::Visiting;
+        for dep in &packages[i].depends {
+            if let Some(j) = packages.iter().position(|c| satisfies(c, dep, cmp)) {
+                visit(j, packages, cmp, state, order);
+            }
+        }
+        state[i] = State::Done;
+        order.push(i);
+    }
+    let mut state = vec![State::New; packages.len()];
+    let mut order = Vec::with_capacity(packages.len());
+    for i in 0..packages.len() {
+        visit(i, packages, cmp, &mut state, &mut order);
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +328,23 @@ mod tests {
             name: name.into(),
             repo: None,
         }
+    }
+
+    #[test]
+    fn dependencies_first() {
+        let packages = [
+            pkg("app 1 d:lib d:sh"),
+            pkg("lib 1 d:base"),
+            pkg("bash 1 p:sh d:base"),
+            pkg("base 1"),
+            pkg("a 1 d:b"),
+            pkg("b 1 d:a d:missing"),
+        ];
+        let order: Vec<&str> = install_order(&packages, cmp)
+            .into_iter()
+            .map(|i| &*packages[i].name)
+            .collect();
+        assert_eq!(order, ["base", "lib", "bash", "app", "b", "a"]);
     }
 
     #[test]

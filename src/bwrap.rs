@@ -146,8 +146,10 @@ pub(crate) fn command(
 /// A command that runs `bwrap` with the directory `image` (an fd) as the
 /// root, read-write, and executes the arguments appended to it there
 /// (searched in the `PATH` given to bwrap). `filters` are seccomp programs
-/// for the process to load (fds of a file or pipe holding raw BPF). The
-/// child must inherit `image` and `filters` (see [`inherit`]).
+/// for the process to load (fds of a file or pipe holding raw BPF).
+/// `files` are put read-only at their paths, with the content read from
+/// the fds. The child must inherit `image`, `filters` and the fds of
+/// `files` (see [`inherit`]).
 ///
 /// New pid, net, ipc, uts and cgroup namespaces, as for workers. The
 /// process runs as root with only `caps`: when skl runs as root, in the
@@ -166,6 +168,7 @@ pub(crate) fn image_command(
     image: BorrowedFd,
     caps: &[&str],
     filters: &[BorrowedFd],
+    files: &[(BorrowedFd, &str)],
 ) -> Result<Command> {
     let mut cmd = new_namespaces(bwrap);
     if rustix::process::getuid().is_root() {
@@ -210,10 +213,11 @@ pub(crate) fn image_command(
         "/tmp",
         "--tmpfs",
         "/run",
-        "--chdir",
-        "/",
-        "--",
     ]);
+    for (fd, dest) in files {
+        cmd.arg("--ro-bind-data").arg(fd_arg(*fd)).arg(dest);
+    }
+    cmd.args(["--chdir", "/", "--"]);
     Ok(cmd)
 }
 

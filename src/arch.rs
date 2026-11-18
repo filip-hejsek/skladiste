@@ -1,8 +1,9 @@
 //! Arch Linux package frontend: reads `.pkg.tar.zst` archives into the store.
 //!
-//! What skl needs of `.PKGINFO` and the install scriptlet (`.INSTALL`)
-//! are kept in the manifest's Arch section ([`ArchSection`]); `.MTREE`,
-//! `.BUILDINFO` and `.CHANGELOG` are ignored.
+//! What skl needs of `.PKGINFO`, the install scriptlet (`.INSTALL`) and
+//! the package's alpm hooks ([`hooks`]) are kept in the manifest's Arch
+//! section ([`ArchSection`]); `.MTREE`, `.BUILDINFO` and `.CHANGELOG` are
+//! ignored.
 //!
 //! The archive is untrusted input, so [`import`] touches nothing but the
 //! stream it reads and the [`BlobSink`] it writes to; `skl` runs it in a
@@ -23,8 +24,10 @@ use crate::sandbox::{self, Policy};
 use crate::store::{BlobSink, Store};
 use crate::worker::{self, Args, ImportStats, Kind, NO_CAPS, RemoteSink, Workers};
 
+pub mod hooks;
 pub mod packages;
 pub mod repo;
+pub mod scripts;
 pub mod signature;
 pub mod verify;
 pub mod version;
@@ -88,6 +91,7 @@ pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<Bl
     let mut entries = Vec::new();
     let mut pkginfo = None;
     let mut install = None;
+    let mut hooks = Vec::new();
 
     for tar_entry in archive.entries()? {
         let mut tar_entry = tar_entry?;
@@ -127,6 +131,20 @@ pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<Bl
 
         let kind = match entry_type {
             EntryType::Directory => EntryKind::Dir,
+            EntryType::Regular | EntryType::Continuous if hooks::hook_name(&path).is_some() => {
+                let size = tar_entry.size();
+                anyhow::ensure!(
+                    size <= hooks::MAX_HOOK_SIZE,
+                    "{path}: a hook larger than {} bytes",
+                    hooks::MAX_HOOK_SIZE
+                );
+                let mut data = Vec::new();
+                tar_entry.read_to_end(&mut data)?;
+                let text = std::str::from_utf8(&data)
+                    .with_context(|| format!("{path}: a hook that isn't UTF-8"))?;
+                hooks.push(hooks::parse(&path, text)?);
+                EntryKind::File(blobs.add_blob(size, &mut &data[..])?)
+            }
             EntryType::Regular | EntryType::Continuous => {
                 let size = tar_entry.size();
                 EntryKind::File(blobs.add_blob(size, &mut tar_entry)?)
@@ -159,6 +177,7 @@ pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<Bl
         provides: info.provides,
         conflicts: info.conflicts,
         install: install.map(|_| Index { index: 0 }),
+        hooks,
     };
     Ok(Package {
         name: info.name,
@@ -184,6 +203,9 @@ pub struct ArchSection {
     /// The install scriptlet (`.INSTALL`): a blob of the section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<Index>,
+    /// The package's alpm hooks, read from its hook files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<hooks::Hook>,
 }
 
 impl ArchSection {
@@ -195,6 +217,12 @@ impl ArchSection {
             .with_context(|| format!("package {} has no {SECTION} section", pkg.name))?;
         serde_json::from_value(section.value.clone())
             .with_context(|| format!("package {}: reading its {SECTION} section", pkg.name))
+    }
+
+    /// Check what the import worker made of a package: its hooks (the
+    /// dependencies are checked by [`repo::package_candidate`]).
+    pub fn validate(&self) -> Result<()> {
+        self.hooks.iter().try_for_each(hooks::Hook::validate)
     }
 
     /// The section with this content, whose references are to `blobs`,

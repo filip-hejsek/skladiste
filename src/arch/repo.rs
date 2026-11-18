@@ -794,6 +794,7 @@ mod tests {
                 provides: vec!["sh".into(), "libfoo.so=1-64".into()],
                 conflicts: vec!["old<2".into()],
                 install: None,
+                hooks: vec![],
             };
             Package::<()> {
                 name: name.into(),

@@ -4,8 +4,9 @@ Design for skl's own package format: a manifest that refers to blobs
 in the store, without an archive for now. Frontends convert their
 packages to it, and the core builds images from a list of such
 packages. Implemented: blobs and objects, canonical JSON,
-manifests with sections, the Arch index, the build split and
-overlays.
+manifests with sections, the Arch index, the build split,
+overlays, and package code as synthetic packages with reuse; image
+records and roots are not.
 
 Decided: objects with a reference header, manifests as objects
 with untyped sections per format, the build split, one
@@ -151,20 +152,44 @@ questions are at the end.
   imported packages (`resolve.rs` stays a format-independent library
   that Arch calls), imports what it chose, and hands the core an
   ordered list of package ids. The core installs them (`install::build`)
-  without knowing their format. This is the build split in TODO.md;
-  `build` may then become a core verb.
+  without knowing their format. `build` may become a core verb.
 - Ordinary packages are merged as now: a path in two packages is an
   error, except directories, where the first wins.
 
 ## Package code: synthetic packages
 
 - After the packages are installed, Arch runs package code in the
-  image in one `run::run_captured`: each package's `post_install`
-  (from `.INSTALL`) in dependency order (dependencies first, as pacman
-  installs them; the resolver's order needs a topological sort), then
-  the `PostTransaction` hooks whose triggers match the installed paths.
+  image in one `run::run_captured` (`arch::scripts`): each package's
+  `post_install` (from `.INSTALL`) in dependency order (dependencies
+  first, as pacman installs them: `resolve::install_order`, depth first
+  from each package in the resolver's order, so a cycle is broken where
+  it is first entered), then the `PostTransaction` hooks whose triggers
+  match, by name. The packages are installed in the same order.
   `PreTransaction` hooks don't run in a new image: pacman reads hooks
   from the system before installing, and there are none yet.
+- Hook files (`usr/share/libalpm/hooks/*.hook`, and
+  `etc/pacman.d/hooks/*.hook`, which replace those of the same name)
+  are package content, so the import worker parses them
+  (`arch::hooks`, at most 64 KiB each; a hook that doesn't parse fails
+  the import) into the Arch section, and the supervisor checks them.
+  Triggers match as in alpm: `Install` operations only (the image is
+  new), `Path` targets against the paths of all packages' entries
+  (directories with a trailing `/`), `Package` targets against their
+  names, with `fnmatch` without flags and the last matching pattern
+  deciding (`!` excludes). Not supported: masking a hook with a symlink
+  to `/dev/null`, and `Depends` (all packages are there).
+- The code runs as one shell script that skl writes (`Plan::driver`),
+  with `/bin/sh` from the image, as pacman's `SCRIPTLET_SHELL`. The
+  script and the scriptlets (their blobs) are read-only files in the
+  sandbox's `/run/skl` (bwrap `--ro-bind-data`), so nothing of them is
+  left in the image. Each scriptlet is sourced in a subshell (they
+  define functions of the same names) and its `pre_install` and
+  `post_install` are called with the version if it defines them
+  (`command -v`); hooks run their `Exec` words, quoted for the shell,
+  with the targets on stdin if `NeedsTargets`. Failures are reported and
+  the rest goes on, as in pacman. Output goes to skl's stderr with
+  control characters escaped (`run::Options::escape_output`); stdin is
+  `/dev/null`.
 - This differs from pacman, which runs each package's scripts right
   after extracting it, before later packages are there. Running them
   with every file present is simpler and needs one snapshot. Accepted:
@@ -180,18 +205,22 @@ questions are at the end.
   path with everything beneath it; ordinary packages can't do either.
   Its hard links point only within itself, since the diff reports every
   path of a changed inode. Its blobs are the contents `run_captured`
-  already adds to the store, which now no manifest refers to.
-- Its Arch section records what ran: the packages whose scripts ran
-  and the hooks, in order. Its name is fixed (e.g. `@arch/scripts`) and
-  its version empty.
+  adds to the store. Mount points that bwrap creates in the image
+  (`dev`, `proc`, `run`, `tmp`, where no package has them) are changes
+  like any other, so installing the synthetic package gives them too.
+- Its Arch section (`ScriptsSection`) records what ran: the packages
+  whose scripts ran and the hooks, in order. Its name is
+  `@arch/scripts` and its version empty.
 - Reuse: the inputs of package code are a build spec, an object
   with the ordered package ids and the version of the way skl runs the
   code (bumped when the environment or order changes). A cache entry
   `synthetic/<spec id>` holds the id of the synthetic package made from
   it. A build whose spec has an entry installs that package instead of
   running the code again, so building the same list twice gives the
-  same image. An option (e.g. `--rerun-scripts`) runs the code anyway
-  and replaces the entry. Package code isn't deterministic (timestamps,
+  same image. `--rerun-scripts` runs the code anyway and replaces the
+  entry. A run in which any code failed isn't recorded, so the next
+  build runs it again. Packages without code get no spec and no
+  synthetic package. Package code isn't deterministic (timestamps,
   generated keys), so reuse is what makes rebuilds reproducible, and
   also means keys generated by scripts are shared between images built
   from the same spec.

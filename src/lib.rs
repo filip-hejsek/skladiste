@@ -14,5 +14,6 @@ pub mod repo;
 pub mod resolve;
 pub mod run;
 mod sandbox;
+pub mod spec;
 pub mod store;
 pub mod worker;

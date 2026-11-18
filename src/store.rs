@@ -11,6 +11,8 @@
 //!   frontend's, e.g. the hash of the archive it was imported from
 //!   (packages imported from files or URLs belong to their format's
 //!   pseudo-repo `@FORMAT/@local`, see [`repo::LOCAL`])
+//! - `synthetic/<spec>` — the id of the synthetic package that running
+//!   package code made for a build spec ([`crate::spec`])
 //! - `downloads/<repo>/<name>` — downloaded package archives (and their
 //!   signatures), by repo and file name
 //! - `repos/<repo>/config.json` — a repo's configuration (see
@@ -47,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{BlobId, Hash, Package};
 use crate::object::{self, Object, Ref};
 use crate::repo::{self, SyncRecord};
+use crate::spec::BuildSpec;
 
 pub mod format;
 
@@ -165,7 +168,15 @@ impl StoreManifest {
 }
 
 /// The directories of a store, see the module documentation.
-const SUBDIRS: [&str; 6] = ["blobs", "objects", "packages", "downloads", "repos", "tmp"];
+const SUBDIRS: [&str; 7] = [
+    "blobs",
+    "objects",
+    "packages",
+    "synthetic",
+    "downloads",
+    "repos",
+    "tmp",
+];
 
 fn mkdir_exist_ok(dir: impl AsFd, path: &str) -> Result<(), Errno> {
     match rustix::fs::mkdirat(dir, path, Mode::from_raw_mode(0o755)) {
@@ -598,15 +609,37 @@ impl Store {
     /// The id of the package that `repo`'s index has under `key` (e.g.
     /// the hash of the archive it was made from), if any.
     pub fn indexed_package(&self, repo: &str, key: &Hash) -> Result<Option<Hash>> {
-        let name = index_name(repo, key)?;
-        let Some(data) = self.read_file(&name)? else {
+        self.read_id(&index_name(repo, key)?)
+    }
+
+    /// The id in the file `name`, if it exists.
+    fn read_id(&self, name: &str) -> Result<Option<Hash>> {
+        let Some(data) = self.read_file(name)? else {
             return Ok(None);
         };
         let id = std::str::from_utf8(&data)
             .ok()
             .and_then(|s| s.trim_ascii_end().parse().ok())
-            .with_context(|| format!("{name} doesn't hold a package id"))?;
+            .with_context(|| format!("{name} doesn't hold an id"))?;
         Ok(Some(id))
+    }
+
+    /// Write the build spec `spec` as an object, returning its id.
+    pub fn add_build_spec(&self, spec: &BuildSpec) -> Result<Hash> {
+        let (refs, body) = spec.to_object()?;
+        self.add_object(refs.as_slice(), &body)
+    }
+
+    /// The id of the synthetic package recorded for the build spec
+    /// `spec`, if any.
+    pub fn synthetic(&self, spec: &Hash) -> Result<Option<Hash>> {
+        self.read_id(&format!("synthetic/{spec}"))
+    }
+
+    /// Record `id` as the synthetic package of the build spec `spec`,
+    /// replacing what was recorded before.
+    pub fn save_synthetic(&self, spec: &Hash, id: &Hash) -> Result<()> {
+        self.write_replace(&format!("synthetic/{spec}"), format!("{id}\n").as_bytes())
     }
 
     /// The keys in `repo`'s package index with the ids they hold, sorted
@@ -1055,6 +1088,17 @@ mod tests {
             },
         );
         assert!(store.add_package(&bad).is_err());
+        // Synthetic packages by build spec.
+        let spec = BuildSpec {
+            packages: vec![id1],
+            runner: "test 1".into(),
+        };
+        let spec = store.add_build_spec(&spec).unwrap();
+        assert_eq!(store.synthetic(&spec).unwrap(), None);
+        store.save_synthetic(&spec, &id2).unwrap();
+        store.save_synthetic(&spec, &id1).unwrap();
+        assert_eq!(store.synthetic(&spec).unwrap(), Some(id1));
+        assert!(tmp_is_empty(dir.path()));
     }
 
     #[test]

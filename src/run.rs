@@ -15,9 +15,10 @@
 //! image with a snapshot taken before (see [`crate::diff`]).
 
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -28,7 +29,7 @@ use crate::bwrap;
 use crate::diff::{self, Change};
 use crate::sandbox;
 use crate::store::Store;
-use crate::worker::{ImportStats, Workers};
+use crate::worker::{self, ImportStats, Workers};
 
 /// Capabilities the program keeps: to change owners, modes, times and
 /// xattrs (including `security.capability`) of any file in the image, and
@@ -48,12 +49,18 @@ const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/bin";
 /// Run `program` with `args` in the image whose root directory is `image`,
 /// as root (see the module documentation), and wait for it. `program` is searched in the image's `PATH` unless it
 /// contains a slash. The environment holds only `PATH`, and `PWD` (`/`),
-/// which bwrap sets; stdin, stdout and stderr are inherited. The program can't create user namespaces.
+/// which bwrap sets; stdin, stdout and stderr are inherited unless
+/// `options` say otherwise. The program can't create user namespaces.
 ///
 /// The returned status is bwrap's: the program's exit code, 128 + the
 /// signal that killed it, or 1 if bwrap itself fails (it explains why on
 /// stderr).
-pub fn run(image: BorrowedFd, program: &OsStr, args: &[OsString]) -> Result<ExitStatus> {
+pub fn run(
+    image: BorrowedFd,
+    program: &OsStr,
+    args: &[OsString],
+    options: &Options,
+) -> Result<ExitStatus> {
     let bwrap = bwrap::find()?;
     let filters = sandbox::no_userns_filters()
         .context("building seccomp filters")?
@@ -61,16 +68,65 @@ pub fn run(image: BorrowedFd, program: &OsStr, args: &[OsString]) -> Result<Exit
         .map(|program| pipe_holding(program))
         .collect::<Result<Vec<OwnedFd>>>()?;
     let filter_fds: Vec<BorrowedFd> = filters.iter().map(|f| f.as_fd()).collect();
-    let mut cmd = bwrap::image_command(&bwrap, image, CAPS, &filter_fds)?;
+    let mut cmd = bwrap::image_command(&bwrap, image, CAPS, &filter_fds, options.files)?;
     cmd.arg(program).args(args);
     let mut fds = vec![image.as_raw_fd()];
     fds.extend(filters.iter().map(|f| f.as_raw_fd()));
+    fds.extend(options.files.iter().map(|(fd, _)| fd.as_raw_fd()));
     bwrap::inherit(&mut cmd, fds);
     cmd.env_clear().env("PATH", PATH).current_dir("/");
-    let status = cmd
-        .status()
-        .with_context(|| format!("running {}", bwrap.display()))?;
+    let running = || format!("running {}", bwrap.display());
+    if !options.escape_output {
+        return cmd.status().with_context(running);
+    }
+    use rustix::pipe::{PipeFlags, pipe_with};
+    let (r, w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
+    cmd.stdin(Stdio::null())
+        .stdout(w.try_clone().context("duplicating pipe")?)
+        .stderr(w);
+    let mut child = cmd.spawn().with_context(running)?;
+    // The command holds the pipe's write end, which must be closed for
+    // reading to end.
+    drop(cmd);
+    let copied = std::thread::scope(|s| {
+        let copy = s.spawn(|| copy_escaped(File::from(r)));
+        let status = child.wait().with_context(running);
+        (status, copy.join().expect("copying output panicked"))
+    });
+    let status = copied.0?;
+    copied.1.context("reading the program's output")?;
     Ok(status)
+}
+
+/// More of what [`run`] does.
+#[derive(Default)]
+pub struct Options<'a> {
+    /// Files to put in the sandbox, read-only, at the paths given (under
+    /// `/tmp` or `/run`, which aren't kept in the image), with the content
+    /// read from the fds when the sandbox is set up.
+    pub files: &'a [(BorrowedFd<'a>, &'a str)],
+    /// Write the program's stdout and stderr to skl's stderr with control
+    /// characters other than tab escaped, so that package code can't
+    /// control the terminal; stdin is `/dev/null`. Otherwise stdin,
+    /// stdout and stderr are inherited.
+    pub escape_output: bool,
+}
+
+/// Copy what `r` yields to stderr, line by line, with control characters
+/// other than tabs escaped.
+fn copy_escaped(r: File) -> std::io::Result<()> {
+    use std::io::BufRead;
+    let mut r = std::io::BufReader::new(r);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if r.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(&line));
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "{}", worker::sanitize(&text, true).replace('\n', ""))?;
+    }
 }
 
 /// What [`run_captured`] found.
@@ -103,10 +159,11 @@ pub fn run_captured(
     image: BorrowedFd,
     program: &OsStr,
     args: &[OsString],
+    options: &Options,
 ) -> Result<Captured> {
     let snapshot = Snapshot::new(store, image)?;
     wait_for_coarse_clock();
-    let status = run(image, program, args)?;
+    let status = run(image, program, args, options)?;
     let (changes, stats) =
         diff::diff_in_worker(workers, store, snapshot.dir(), image).context("finding changes")?;
     let snapshot_removal = snapshot.remove()?;
@@ -228,7 +285,13 @@ mod tests {
         minimal_image::populate(root);
         let dir = File::open(root).unwrap();
         let args = minimal_image::child_args("run::tests::program_sees_only_the_image");
-        let status = run(dir.as_fd(), OsStr::new(minimal_image::CHILD), &args).unwrap();
+        let status = run(
+            dir.as_fd(),
+            OsStr::new(minimal_image::CHILD),
+            &args,
+            &Options::default(),
+        )
+        .unwrap();
         assert!(status.success(), "child {status}");
         assert_eq!(std::fs::read(root.join("kept")).unwrap(), b"x");
         assert!(root.join("tmp").read_dir().unwrap().next().is_none());
