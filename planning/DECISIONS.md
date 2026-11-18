@@ -843,10 +843,13 @@ are in BUGS.md.
   the cargo target directory isn't on btrfs.
 - Checks with real packages use a local repo by default
   (`scripts/test-mirror.sh`): a pinned day of the Arch Linux Archive
-  (`archive.archlinux.org/repos/YYYY/MM/DD/`), 42 packages and their
-  signatures plus that day's keyring, so results don't drift with the
-  live repos and runs don't download from public mirrors again. It is
-  fetched once into `tmp/test-cache` of the main checkout, shared by
+  (`archive.archlinux.org/repos/YYYY/MM/DD/`), 84 packages (`filesystem`,
+  `bash`, `coreutils` and `systemd`, whose hooks are the ones most
+  images run, with dependencies) and their signatures plus that day's
+  keyring, so results don't drift with the live repos and runs don't
+  download from public mirrors again. Its directory is named by the day
+  and a hash of the package list, so a changed list is fetched anew. It
+  is fetched once into `tmp/test-cache` of the main checkout, shared by
   all worktrees (cloud sessions fetch it in the setup script), and
   served by one nginx over HTTP and HTTPS. Its test CA is added to the
   roots in use before (`SKL_CA_CERTS`, which cloud sessions need for

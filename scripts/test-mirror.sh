@@ -21,8 +21,9 @@ set -euo pipefail
 
 # The snapshot: a day of the Arch Linux Archive, and the packages taken
 # from it with their dependencies, plus archlinux-keyring without them.
+# systemd for its hooks (tmpfiles, sysusers) and what they make.
 snapshot=2026/11/15
-packages=(filesystem bash coreutils)
+packages=(filesystem bash coreutils systemd)
 archive=https://archive.archlinux.org/repos/$snapshot
 
 scripts=$(dirname "$(realpath "$0")")
@@ -32,7 +33,9 @@ if [[ -z ${SKL_TEST_CACHE:-} ]]; then
 fi
 cache=$SKL_TEST_CACHE
 port=${SKL_TEST_PORT:-8480}
-name=${snapshot//\//-}
+# The directory is named by the day and the package list, so that a
+# changed list is fetched anew.
+name=${snapshot//\//-}-$(printf '%s\n' "${packages[@]}" | sha256sum | head -c 8)
 snap=$cache/arch/$name
 run=$cache/nginx
 
