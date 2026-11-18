@@ -85,7 +85,10 @@ directory they can write to, with all its contents.
 ## Store layout
 
 - `skl-store.json` — marks the directory as a store and records the
-  version of its format (other versions are rejected for now)
+  version of its format: a number for a stable format, a random string
+  for a development one (until the first stable format, all are
+  development formats). A store of an older stable version is migrated
+  with `skl migrate`; one of another development version can't be.
 - `objects/ab/cdef…` — file contents named by BLAKE3 hash (read-only)
 - `packages/<repo>/<hash>.json` — imported package manifests, keyed by the
   archive's hash; packages imported from files or URLs are in the repo

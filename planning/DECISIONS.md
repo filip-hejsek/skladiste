@@ -57,15 +57,40 @@ are in BUGS.md.
   existing store again creates what's missing; setting up a store in a
   non-empty directory that isn't one is refused. The CLI suggests
   `skl init` only where it would succeed (`NotAStore::can_init`).
-- The store manifest `skl-store.json` (`{"version": 0}`) tells a store
-  apart from a directory that happens to have the layout's directories,
-  and records the store format version. Until the format is stable,
-  only the current version is accepted: no reading of older versions
-  and no migration. Init writes the manifest first (an unnamed file
-  linked into place), so an interrupted init can be repeated. Init and
-  open check whether the directory is empty before reading the
-  manifest, so a concurrent init can't make a directory look non-empty
-  without one.
+- The store manifest `skl-store.json` (`{"version": 1}` or
+  `{"version": "dev-…"}`) tells a store apart from a directory that
+  happens to have the layout's directories, and records the store
+  format version (`src/store/format.rs`). Only the current version is
+  opened; older versions are never read directly.
+  - Stable versions are numbers from 1. Every one after the first has a
+    migration from the one before; `Formats::check` enforces it at
+    compile time (the current version is `latest_stable`).
+  - While the format changes between stable versions, builds use a
+    development version: a random string in `src/store/dev-version`
+    (made by `scripts/new-store-dev-version.sh`), so iterating doesn't
+    use up numbers. Development versions have no order and are never
+    migrated from; two branches that both change the format conflict on
+    the file. A release gives the development version the next number
+    and its migration joins the stable ones. Rejected: numbering every
+    format change, which needs migrations (or skipped numbers) for
+    formats only test stores ever had.
+  - A store of an older stable version is opened only after an explicit
+    `skl migrate`. A development build can migrate the latest stable
+    version to its development version with `skl migrate --dev`; the
+    store then opens only with builds of that version (snapshot it to
+    keep a copy). This development migration is kept apart from the
+    stable ones until the release.
+  - Each migration is followed by writing the manifest with the version
+    it reached, so an interrupted migration is run again: migrations
+    must be safe to repeat. Nothing else may use the store during a
+    migration; nothing enforces this yet.
+  - There is no stable version yet; the old `{"version": 0}` is rejected
+    like an unknown development version.
+  - Init writes the manifest first (an unnamed file linked into place),
+    so an interrupted init can be repeated. Init and open check whether
+    the directory is empty before reading the manifest, so a concurrent
+    init can't make a directory look non-empty without one.
+
   Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
   then linked into place unless an identical object already exists;
   linking fails if the name exists, so of concurrent adds of the same

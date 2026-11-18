@@ -16,7 +16,7 @@ use skladiste::btrfs;
 use skladiste::diff::Change;
 use skladiste::http::RootCerts;
 use skladiste::jobs::default_jobs;
-use skladiste::store::{NotAStore, Store};
+use skladiste::store::{NotAStore, Store, VersionProblem, WrongVersion};
 use skladiste::worker::Workers;
 
 pub(crate) mod arch;
@@ -65,6 +65,17 @@ enum Command {
     /// up this way. In an existing store, it creates the parts of the
     /// layout that are missing.
     Init,
+    /// Migrate the store to the format version this skl uses.
+    ///
+    /// Nothing else may use the store meanwhile. A development build of skl
+    /// uses a development version of the format: migrating a store to it
+    /// needs --dev, and afterwards only builds of that version can open the
+    /// store. Snapshot the store first to keep a copy.
+    Migrate {
+        /// Allow migrating to a development version.
+        #[arg(long)]
+        dev: bool,
+    },
     /// Arch Linux packages: repos, importing, and building images.
     Arch(arch::ArchArgs),
     /// Manage repos of all package formats.
@@ -136,7 +147,18 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
     match cli.command {
         Command::Init => {
-            Store::init_path(store_path)?;
+            Store::init_path(store_path).map_err(migrate_hint)?;
+        }
+        Command::Migrate { dev } => {
+            let migrated = Store::migrate_path(store_path, dev).map_err(migrate_hint)?;
+            if migrated.from == migrated.to {
+                println!("the store already has format version {}", migrated.to);
+            } else {
+                println!(
+                    "migrated the store from format version {} to {}",
+                    migrated.from, migrated.to
+                );
+            }
         }
         Command::Arch(args) => arch::run(args, &workers, &store()?, jobs)?,
         Command::Repo {
@@ -167,8 +189,20 @@ fn open_store(path: &Path) -> Result<Store> {
             anyhow!("{} is {not}; set one up with `skl init`", path.display())
         }
         Some(not) => anyhow!("{} is {not}", path.display()),
-        None => e,
+        None => migrate_hint(e),
     })
+}
+
+/// Suggest `skl migrate` for a store that needs it.
+fn migrate_hint(e: anyhow::Error) -> anyhow::Error {
+    let hint = match e.downcast_ref::<WrongVersion>().map(|w| w.problem) {
+        Some(VersionProblem::NeedsMigration { to_dev: false }) => "run `skl migrate`",
+        Some(VersionProblem::NeedsMigration { to_dev: true }) => {
+            "to migrate it, snapshot it if you want to keep a copy, then run `skl migrate --dev`"
+        }
+        _ => return e,
+    };
+    anyhow!("{e:#}; {hint}")
 }
 
 /// `skl run`: run the program, then print what it changed.

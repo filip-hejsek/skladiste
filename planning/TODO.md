@@ -97,6 +97,8 @@ Next priorities: install scripts and hooks.
 
 ## Store
 
+- Lock the store during `skl migrate` (and against it in other
+  commands); for now nothing else may use the store meanwhile.
 - Garbage collection of objects no package or sync record references,
   and of old repo database snapshots. Must not race with `add_object`
   finding an object already present (see DECISIONS.md, store layout).

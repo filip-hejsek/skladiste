@@ -21,8 +21,9 @@
 //! two directory levels, e.g. `repos/@arch/core/`.
 //!
 //! A new store is set up with [`Store::init`], an existing one opened with
-//! [`Store::open`], which accepts only a store of [`FORMAT_VERSION`]; both take
-//! the store's directory fd ([`Store::init_path`] and [`Store::open_path`]
+//! [`Store::open`], which accepts only a store of the format version this
+//! skl uses (see [`format`](mod@format) and [`Store::migrate`]); they take the store's
+//! directory fd ([`Store::init_path`] and [`Store::open_path`]
 //! open it from a path). Every access is relative to that fd, so the store
 //! also works from a sandboxed process that was handed only the fd.
 
@@ -41,9 +42,22 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{Hash, ObjectId, Package};
 use crate::repo::{self, SyncRecord};
 
+pub mod format;
+
+use format::{FORMATS, Formats};
+pub use format::{FormatVersion, VersionProblem, WrongVersion};
+
 pub struct Store {
     dir: OwnedFd,
     tmp_counter: AtomicU64,
+}
+
+/// What [`Store::migrate`] did: `from` and `to` are equal if the store
+/// already had the current version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Migrated {
+    pub from: FormatVersion,
+    pub to: FormatVersion,
 }
 
 /// Result of adding one object.
@@ -124,16 +138,24 @@ fn open_dir(path: &Path) -> Result<OwnedFd, Errno> {
 /// The name of the store manifest.
 const MANIFEST: &str = "skl-store.json";
 
-/// The version of the store format this skl uses. There is no support for
-/// other versions (neither reading nor migrating) until the format is
-/// stable: a store of another version is rejected.
-pub const FORMAT_VERSION: u64 = 0;
+/// The version of the store format this skl uses.
+pub fn format_version() -> FormatVersion {
+    FORMATS.current()
+}
 
 /// The store manifest, `skl-store.json` in the store's directory.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoreManifest {
     /// The version of the store format.
-    pub version: u64,
+    pub version: FormatVersion,
+}
+
+impl StoreManifest {
+    fn to_json(&self) -> Result<Vec<u8>> {
+        let mut data = serde_json::to_vec_pretty(self)?;
+        data.push(b'\n');
+        Ok(data)
+    }
 }
 
 /// The directories of a store, see the module documentation.
@@ -146,9 +168,18 @@ fn mkdir_exist_ok(dir: impl AsFd, path: &str) -> Result<(), Errno> {
     }
 }
 
-/// Read and check the store manifest of `dir`, if it has one: fails if the
-/// store isn't of [`FORMAT_VERSION`].
+/// Read and check the store manifest of `dir`, if it has one: fails with
+/// [`WrongVersion`] if the store isn't of the version this skl uses.
 fn read_manifest(dir: impl AsFd) -> Result<Option<StoreManifest>> {
+    let manifest = read_manifest_unchecked(dir)?;
+    if let Some(manifest) = &manifest {
+        FORMATS.ensure_current(&manifest.version)?;
+    }
+    Ok(manifest)
+}
+
+/// Read the store manifest of `dir`, if it has one, whatever its version.
+fn read_manifest_unchecked(dir: impl AsFd) -> Result<Option<StoreManifest>> {
     let fd = match rustix::fs::openat(
         dir,
         MANIFEST,
@@ -165,11 +196,6 @@ fn read_manifest(dir: impl AsFd) -> Result<Option<StoreManifest>> {
         .with_context(|| format!("reading {MANIFEST}"))?;
     let manifest: StoreManifest =
         serde_json::from_slice(&data).with_context(|| format!("parsing {MANIFEST}"))?;
-    anyhow::ensure!(
-        manifest.version == FORMAT_VERSION,
-        "the store has format version {}, but this skl supports only version {FORMAT_VERSION}",
-        manifest.version
-    );
     Ok(Some(manifest))
 }
 
@@ -185,10 +211,10 @@ fn write_manifest(dir: impl AsFd) -> Result<()> {
         Mode::from_raw_mode(0o644),
     )
     .with_context(|| format!("creating {MANIFEST}"))?;
-    let mut data = serde_json::to_vec_pretty(&StoreManifest {
-        version: FORMAT_VERSION,
-    })?;
-    data.push(b'\n');
+    let data = StoreManifest {
+        version: format_version(),
+    }
+    .to_json()?;
     let mut file = File::from(fd);
     file.write_all(&data)
         .with_context(|| format!("writing {MANIFEST}"))?;
@@ -233,7 +259,7 @@ fn package_name(repo: &str, hash: &Hash) -> Result<String> {
 
 impl Store {
     /// Make the directory `dir` a store and use it. `dir` must be empty or
-    /// already a store of [`FORMAT_VERSION`]; then the parts of the layout
+    /// already a store of the format version this skl uses; then the parts of the layout
     /// that are missing are created.
     pub fn init(dir: OwnedFd) -> Result<Store> {
         // Emptiness is checked before the manifest: the manifest is the
@@ -256,8 +282,9 @@ impl Store {
     }
 
     /// Use the store in the directory `dir`, which [`Store::init`] has set
-    /// up. Fails with [`NotAStore`] if it hasn't, and also if the store
-    /// isn't of [`FORMAT_VERSION`].
+    /// up. Fails with [`NotAStore`] if it hasn't, and with
+    /// [`WrongVersion`] if the store isn't of the format version this skl
+    /// uses.
     pub fn open(dir: OwnedFd) -> Result<Store> {
         // Emptiness first, as in `init`.
         if is_empty(&dir)? {
@@ -296,6 +323,44 @@ impl Store {
         };
         dir.and_then(Store::open)
             .with_context(|| format!("opening the store {}", path.display()))
+    }
+
+    /// Migrate the store in the directory `dir` to the format version this
+    /// skl uses. Migrating a store of the latest stable version to a
+    /// development version needs `allow_dev`: afterwards only builds of
+    /// that development version can open it. Fails with [`WrongVersion`]
+    /// if the store can't be migrated. Nothing else may use the store
+    /// meanwhile.
+    pub fn migrate(dir: OwnedFd, allow_dev: bool) -> Result<Migrated> {
+        Store::migrate_formats(dir, &FORMATS, allow_dev)
+    }
+
+    fn migrate_formats(dir: OwnedFd, formats: &Formats, allow_dev: bool) -> Result<Migrated> {
+        if is_empty(&dir)? {
+            return Err(NotAStore::Empty.into());
+        }
+        let Some(manifest) = read_manifest_unchecked(&dir)? else {
+            return Err(NotAStore::NoManifest.into());
+        };
+        let from = manifest.version;
+        let store = Store::from_dir(dir);
+        for step in formats.plan(&from, allow_dev)? {
+            (step.migration)(store.dir())
+                .with_context(|| format!("migrating the store to format version {}", step.to))?;
+            let data = StoreManifest { version: step.to }.to_json()?;
+            store.write_replace(MANIFEST, &data)?;
+        }
+        Ok(Migrated {
+            from,
+            to: formats.current(),
+        })
+    }
+
+    /// [`Store::migrate`] for the directory at `path`.
+    pub fn migrate_path(path: &Path, allow_dev: bool) -> Result<Migrated> {
+        let dir = open_dir(path).with_context(|| format!("opening {}", path.display()))?;
+        Store::migrate(dir, allow_dev)
+            .with_context(|| format!("migrating the store {}", path.display()))
     }
 
     /// Use an already open store directory, e.g. one passed to a worker.
@@ -707,7 +772,7 @@ mod tests {
         Store::open_path(&root).unwrap();
         let manifest = std::fs::read(root.join(MANIFEST)).unwrap();
         let manifest: StoreManifest = serde_json::from_slice(&manifest).unwrap();
-        assert_eq!(manifest.version, FORMAT_VERSION);
+        assert_eq!(manifest.version, format_version());
         // Missing parts of the layout are reported.
         std::fs::remove_dir(root.join("objects")).unwrap();
         let e = not_a_store(Store::open_path(&root));
@@ -727,21 +792,94 @@ mod tests {
     fn other_versions_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         Store::init_path(dir.path()).unwrap();
-        let other = FORMAT_VERSION + 1;
-        for (content, expected) in [
-            (
-                format!(r#"{{"version": {other}}}"#),
-                format!("format version {other}"),
-            ),
-            ("{}".to_owned(), format!("parsing {MANIFEST}")),
-        ] {
-            std::fs::write(dir.path().join(MANIFEST), &content).unwrap();
-            let e = Store::open_path(dir.path()).err().unwrap();
-            assert!(e.downcast_ref::<NotAStore>().is_none(), "{e:#}");
-            assert!(format!("{e:#}").contains(&expected), "{e:#}");
-            let e = Store::init_path(dir.path()).err().unwrap();
-            assert!(format!("{e:#}").contains(&expected), "{e:#}");
+        for content in ["0", "1", r#""dev-000000000000""#] {
+            let version: FormatVersion = serde_json::from_str(content).unwrap();
+            std::fs::write(
+                dir.path().join(MANIFEST),
+                format!(r#"{{"version": {content}}}"#),
+            )
+            .unwrap();
+            for e in [
+                Store::open_path(dir.path()).err().unwrap(),
+                Store::init_path(dir.path()).err().unwrap(),
+                Store::migrate_path(dir.path(), true).err().unwrap(),
+            ] {
+                let wrong = e.downcast_ref::<WrongVersion>().unwrap();
+                assert_eq!(wrong.found, version, "{e:#}");
+                assert_eq!(wrong.current, format_version());
+            }
         }
+        std::fs::write(dir.path().join(MANIFEST), "{}").unwrap();
+        let e = Store::open_path(dir.path()).err().unwrap();
+        assert!(e.downcast_ref::<NotAStore>().is_none(), "{e:#}");
+        assert!(
+            format!("{e:#}").contains(&format!("parsing {MANIFEST}")),
+            "{e:#}"
+        );
+    }
+
+    fn mkdir_migration(name: &str) -> impl Fn(BorrowedFd<'_>) -> Result<()> {
+        move |dir| Ok(mkdir_exist_ok(dir, name)?)
+    }
+
+    #[test]
+    fn migrations() {
+        use format::DevFormat;
+        let formats = Formats {
+            latest_stable: 2,
+            migrations: &[|dir| mkdir_migration("two")(dir)],
+            dev: Some(DevFormat {
+                version: "dev-x",
+                migration: Some(|dir| mkdir_migration("dev")(dir)),
+            }),
+        };
+        formats.check();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let migrate = |allow_dev| {
+            Store::migrate_formats(File::open(root).unwrap().into(), &formats, allow_dev)
+        };
+        let version = || {
+            let data = std::fs::read(root.join(MANIFEST)).unwrap();
+            serde_json::from_slice::<StoreManifest>(&data)
+                .unwrap()
+                .version
+        };
+        let e = migrate(false).err().unwrap();
+        assert_eq!(*e.downcast_ref::<NotAStore>().unwrap(), NotAStore::Empty);
+        Store::init_path(root).unwrap();
+        std::fs::write(root.join(MANIFEST), r#"{"version": 1}"#).unwrap();
+        // The step to the development version needs allow_dev, and nothing
+        // is done without it.
+        let e = migrate(false).err().unwrap();
+        let wrong = e.downcast_ref::<WrongVersion>().unwrap();
+        assert_eq!(
+            wrong.problem,
+            VersionProblem::NeedsMigration { to_dev: true }
+        );
+        assert!(!root.join("two").exists());
+        let dev = FormatVersion::Dev("dev-x".into());
+        let migrated = migrate(true).unwrap();
+        assert_eq!(migrated.from, FormatVersion::Stable(1));
+        assert_eq!(migrated.to, dev);
+        assert!(root.join("two").is_dir() && root.join("dev").is_dir());
+        assert_eq!(version(), dev);
+        assert!(tmp_is_empty(root));
+        assert_eq!(migrate(false).unwrap().from, dev);
+        // A failed migration leaves the version of the last step done.
+        let formats = Formats {
+            dev: Some(DevFormat {
+                version: "dev-y",
+                migration: Some(|_| bail!("broken")),
+            }),
+            ..formats
+        };
+        std::fs::write(root.join(MANIFEST), r#"{"version": 1}"#).unwrap();
+        let e = Store::migrate_formats(File::open(root).unwrap().into(), &formats, true)
+            .err()
+            .unwrap();
+        assert!(format!("{e:#}").contains("broken"), "{e:#}");
+        assert_eq!(version(), FormatVersion::Stable(2));
     }
 
     fn tmp_is_empty(root: &Path) -> bool {
