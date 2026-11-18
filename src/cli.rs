@@ -127,7 +127,7 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
         .store
         .as_deref()
         .context("no store given (--store or SKL_STORE)")?;
-    let store = Store::open(store)?;
+    let store = Store::init_path(store)?;
     let jobs = cli.jobs.unwrap_or_else(default_jobs);
     match cli.command {
         Command::Arch(args) => arch::run(args, &workers, &store, jobs)?,

@@ -55,9 +55,9 @@ fn captures_changes() {
         make_changes();
     }
     let Some(dir) = btrfs_tempdir() else { return };
-    let store = Store::open(&dir.path().join("store")).unwrap();
+    let store = Store::init_path(&dir.path().join("store")).unwrap();
     let image = dir.path().join("image");
-    skladiste::btrfs::create_subvolume(&image).unwrap();
+    common::create_subvolume(&image);
     minimal_image::populate(&image);
     for name in ["modified", "chmodded", "removed", "renamed", "same"] {
         fs::write(image.join("etc").join(name), "before").unwrap();
@@ -149,7 +149,7 @@ fn captures_changes() {
 fn removes_subvolumes() {
     let Some(dir) = btrfs_tempdir() else { return };
     let sub = dir.path().join("sub");
-    skladiste::btrfs::create_subvolume(&sub).unwrap();
+    common::create_subvolume(&sub);
     fs::create_dir_all(sub.join("a/b")).unwrap();
     fs::write(sub.join("a/b/f"), "x").unwrap();
     fs::set_permissions(sub.join("a"), PermissionsExt::from_mode(0o555)).unwrap();

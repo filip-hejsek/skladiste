@@ -103,7 +103,7 @@ fn import(store: &Store, path: &Path) -> Package {
 #[test]
 fn build_image() {
     let Some(tmp) = btrfs_tempdir() else { return };
-    let store = Store::open(&tmp.path().join("store")).unwrap();
+    let store = Store::init_path(&tmp.path().join("store")).unwrap();
     let big = vec![7u8; 1 << 20];
 
     let base = make_package(
@@ -169,7 +169,7 @@ fn build_image() {
 #[test]
 fn conflicting_files_are_rejected() {
     let Some(tmp) = btrfs_tempdir() else { return };
-    let store = Store::open(&tmp.path().join("store")).unwrap();
+    let store = Store::init_path(&tmp.path().join("store")).unwrap();
     let a = make_package(tmp.path(), "a", &[Item::File("f", 0o644, b"a")]);
     let b = make_package(tmp.path(), "b", &[Item::File("f", 0o644, b"b")]);
     let pkgs = [import(&store, &a), import(&store, &b)];
@@ -180,7 +180,7 @@ fn conflicting_files_are_rejected() {
 #[test]
 fn worker_errors_are_reported() {
     let Some(tmp) = btrfs_tempdir() else { return };
-    let store = Store::open(&tmp.path().join("store")).unwrap();
+    let store = Store::init_path(&tmp.path().join("store")).unwrap();
     let path = tmp.path().join("bad.pkg.tar.zst");
     fs::write(&path, "not an archive").unwrap();
     let err = arch::import_in_worker(&workers(), &store, File::open(&path).unwrap()).unwrap_err();
@@ -193,7 +193,7 @@ fn worker_errors_are_reported() {
 #[test]
 fn concurrent_imports_share_objects() {
     let Some(tmp) = btrfs_tempdir() else { return };
-    let store = Store::open(&tmp.path().join("store")).unwrap();
+    let store = Store::init_path(&tmp.path().join("store")).unwrap();
     let files: Vec<Vec<u8>> = (0..200u32).map(|i| i.to_le_bytes().repeat(100)).collect();
     let items: Vec<(String, &[u8])> = files
         .iter()

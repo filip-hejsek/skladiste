@@ -18,9 +18,11 @@
 //! `<repo>` is the repo's id `@FORMAT/NAME` (see [`repo::id`]), so it is
 //! two directory levels, e.g. `repos/@arch/core/`.
 //!
-//! After [`Store::open`], every access is relative to the store's directory
-//! fd, so the store also works from a sandboxed process that was handed only
-//! that fd.
+//! A new store is set up with [`Store::init`], an existing one opened with
+//! [`Store::open`]; both take the store's directory fd ([`Store::init_path`]
+//! and [`Store::open_path`] open it from a path). Every access is relative
+//! to that fd, so the store also works from a sandboxed process that was
+//! handed only the fd.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -29,7 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -68,6 +70,41 @@ impl<T: ObjectSink + ?Sized> ObjectSink for &mut T {
     }
 }
 
+/// Why a directory isn't a store: the error of [`Store::open`] and
+/// [`Store::open_path`] (found with [`anyhow::Error::downcast_ref`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAStore {
+    /// There is nothing at the path.
+    Missing,
+    /// What is at the path isn't a directory.
+    NotADirectory,
+    /// A directory of the layout is missing (or isn't a directory).
+    NoSubdir(&'static str),
+}
+
+impl std::fmt::Display for NotAStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotAStore::Missing => write!(f, "not a store: it doesn't exist"),
+            NotAStore::NotADirectory => write!(f, "not a store: it isn't a directory"),
+            NotAStore::NoSubdir(sub) => write!(f, "not a store: it has no {sub}/ directory"),
+        }
+    }
+}
+
+impl std::error::Error for NotAStore {}
+
+fn open_dir(path: &Path) -> Result<OwnedFd, Errno> {
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// The directories of a store, see the module documentation.
+const SUBDIRS: [&str; 5] = ["objects", "packages", "downloads", "repos", "tmp"];
+
 fn mkdir_exist_ok(dir: impl AsFd, path: &str) -> Result<(), Errno> {
     match rustix::fs::mkdirat(dir, path, Mode::from_raw_mode(0o755)) {
         Err(Errno::EXIST) => Ok(()),
@@ -87,20 +124,48 @@ fn package_name(repo: &str, hash: &Hash) -> Result<String> {
 }
 
 impl Store {
-    /// Open the store at `root`, creating its directory structure if needed.
-    pub fn open(root: &Path) -> Result<Store> {
-        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
-        let dir = rustix::fs::open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .with_context(|| format!("opening {}", root.display()))?;
-        for sub in ["objects", "packages", "downloads", "repos", "tmp"] {
-            mkdir_exist_ok(&dir, sub)
-                .with_context(|| format!("creating {}", root.join(sub).display()))?;
+    /// Make the directory `dir` a store, creating the parts of the layout
+    /// that are missing, and use it.
+    pub fn init(dir: OwnedFd) -> Result<Store> {
+        for sub in SUBDIRS {
+            mkdir_exist_ok(&dir, sub).with_context(|| format!("creating {sub}/"))?;
         }
         Ok(Store::from_dir(dir))
+    }
+
+    /// Use the store in the directory `dir`, which [`Store::init`] has set
+    /// up. Fails with [`NotAStore`] if it hasn't.
+    pub fn open(dir: OwnedFd) -> Result<Store> {
+        for sub in SUBDIRS {
+            match rustix::fs::statat(&dir, sub, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(s) if FileType::from_raw_mode(s.st_mode) == FileType::Directory => {}
+                Ok(_) | Err(Errno::NOENT) => return Err(NotAStore::NoSubdir(sub).into()),
+                Err(e) => return Err(e).with_context(|| format!("checking {sub}/")),
+            }
+        }
+        Ok(Store::from_dir(dir))
+    }
+
+    /// [`Store::init`] for the directory at `path`, which is created if
+    /// needed (with its parents). A convenience for callers that have
+    /// paths, such as the CLI.
+    pub fn init_path(path: &Path) -> Result<Store> {
+        std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+        let dir = open_dir(path).with_context(|| format!("opening {}", path.display()))?;
+        Store::init(dir).with_context(|| format!("setting up the store in {}", path.display()))
+    }
+
+    /// [`Store::open`] for the directory at `path`. Fails with
+    /// [`NotAStore`] also if there is no directory at `path`.
+    pub fn open_path(path: &Path) -> Result<Store> {
+        let dir = match open_dir(path) {
+            Ok(dir) => Ok(dir),
+            Err(Errno::NOENT) => Err(NotAStore::Missing.into()),
+            Err(Errno::NOTDIR) => Err(NotAStore::NotADirectory.into()),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        dir.and_then(Store::open)
+            .with_context(|| format!("opening the store {}", path.display()))
     }
 
     /// Use an already open store directory, e.g. one passed to a worker.
@@ -488,6 +553,36 @@ mod tests {
     use std::io::Seek;
     use std::os::unix::fs::PermissionsExt;
 
+    fn not_a_store(r: Result<Store>) -> NotAStore {
+        *r.err().unwrap().downcast_ref::<NotAStore>().unwrap()
+    }
+
+    #[test]
+    fn open_needs_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        assert_eq!(not_a_store(Store::open_path(&root)), NotAStore::Missing);
+        std::fs::write(&root, "").unwrap();
+        assert_eq!(
+            not_a_store(Store::open_path(&root)),
+            NotAStore::NotADirectory
+        );
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let e = not_a_store(Store::open_path(&root));
+        assert_eq!(e, NotAStore::NoSubdir("objects"));
+        Store::init_path(&root).unwrap();
+        Store::open_path(&root).unwrap();
+        std::fs::remove_dir(root.join("tmp")).unwrap();
+        std::os::unix::fs::symlink("objects", root.join("tmp")).unwrap();
+        let e = not_a_store(Store::open(File::open(&root).unwrap().into()));
+        assert_eq!(e, NotAStore::NoSubdir("tmp"));
+        // Setting up an existing store again fills in what's missing.
+        std::fs::remove_file(root.join("tmp")).unwrap();
+        Store::init_path(&root).unwrap();
+        Store::open_path(&root).unwrap();
+    }
+
     fn tmp_is_empty(root: &Path) -> bool {
         std::fs::read_dir(root.join("tmp"))
             .unwrap()
@@ -498,7 +593,7 @@ mod tests {
     #[test]
     fn objects_are_linked_once() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
         let a = store.add_object(&mut &b"hello"[..]).unwrap();
         assert!(a.new);
         assert_eq!(a.size, 5);
@@ -515,7 +610,7 @@ mod tests {
     #[test]
     fn packages_by_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
         let hash = store.add_object(&mut &b"archive"[..]).unwrap().hash;
         let pkg = |version: &str| Package {
             name: "a".into(),
@@ -548,7 +643,7 @@ mod tests {
     #[test]
     fn repos_and_syncs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
         assert!(store.repos().unwrap().is_empty());
         store.add_repo("@deb/a", &"config deb").unwrap();
         store.add_repo("@arch/b", &"config b").unwrap();
@@ -591,7 +686,7 @@ mod tests {
     #[test]
     fn downloads_replace_earlier_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
         // Dropped unsaved: leaves nothing.
         store.tmp_file().unwrap().file().write_all(b"x").unwrap();
         for content in [&b"old"[..], b"new"] {

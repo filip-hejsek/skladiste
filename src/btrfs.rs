@@ -3,7 +3,6 @@
 use std::ffi::OsStr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
@@ -26,25 +25,6 @@ const SNAP_DESTROY: rustix::ioctl::Opcode = opcode::write::<VolArgs>(BTRFS_IOCTL
 
 /// Inode number of a subvolume's root directory.
 const FIRST_FREE_OBJECTID: u64 = 256;
-
-/// Create a new subvolume at `path`. The parent directory must exist.
-pub fn create_subvolume(path: &Path) -> Result<()> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let name = path
-        .file_name()
-        .with_context(|| format!("invalid subvolume path {}", path.display()))?;
-    let parent_fd = rustix::fs::open(
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("opening {}", parent.display()))?;
-    create_subvolume_at(parent_fd.as_fd(), name)
-        .with_context(|| format!("creating subvolume {}", path.display()))
-}
 
 /// Create a new subvolume named `name` in the directory `parent`.
 pub fn create_subvolume_at(parent: impl AsFd, name: &OsStr) -> Result<()> {

@@ -524,7 +524,11 @@ are in BUGS.md.
 - Library code works on file descriptors, not paths: `Store` holds a
   directory fd, frontends read from a `Read` and write file contents to
   an `ObjectSink`, and the installer uses only the store fd and the
-  image root fd. Only the CLI opens paths.
+  image root fd. Only the CLI opens paths. Exceptions:
+  `Store::init_path` and `Store::open_path`, conveniences for the CLI
+  and tests that open the directory and call `Store::init` or
+  `Store::open`, and the programs `Workers` executes (see Sandboxing in
+  TODO.md).
 - Workers (`src/worker.rs`) are started by re-executing the `skl` binary
   (`/proc/self/exe`; tests pass `CARGO_BIN_EXE_skl`) with the hidden
   `__worker` subcommand, which `main` checks before parsing arguments.

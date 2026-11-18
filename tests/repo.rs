@@ -77,7 +77,7 @@ fn sync_and_read() {
         ("/bad/x86_64/bad.db", b"not a database".to_vec()),
     ]);
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open(tmp.path()).unwrap();
+    let store = Store::init_path(tmp.path()).unwrap();
     let workers = workers();
 
     let config = Config::new(&format!("{base}/$repo/$arch"), "main").unwrap();

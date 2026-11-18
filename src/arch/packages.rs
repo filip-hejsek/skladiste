@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn local_packages_newest_first() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
         let add = |name: &str, version: &str, depends: &[&str]| {
             let id = format!("{name} {version}");
             let hash = store.add_object(&mut id.as_bytes()).unwrap().hash;
