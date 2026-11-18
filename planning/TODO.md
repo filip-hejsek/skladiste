@@ -114,5 +114,15 @@ Decisions already made are under Sandboxing in DECISIONS.md.
 
 - Supervisor: confine `skl` itself after opening its paths (Landlock with
   the store, the package files and the image's parent directory).
+  `Workers` opens the `skl` binary and looks up `bwrap` in `PATH` at
+  each spawn (as does `run::run`); they would have to be opened once
+  beforehand, or be given as fds.
 - Package code has no limits on memory, processes or disk use in the
   image (it can fill the filesystem). Cgroups or btrfs qgroups would do.
+
+## Library API
+
+- Not worth doing yet: return proper error types from the library
+  instead of `anyhow` messages, and move all messages that mention CLI
+  commands or flags (e.g. ``run `skl arch sync` ``, `use --fetch`) to
+  the CLI, which would match on the errors to add them.
