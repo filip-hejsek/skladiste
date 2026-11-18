@@ -62,7 +62,10 @@ are in BUGS.md.
   and records the store format version. Until the format is stable,
   only the current version is accepted: no reading of older versions
   and no migration. Init writes the manifest first (an unnamed file
-  linked into place), so an interrupted init can be repeated.
+  linked into place), so an interrupted init can be repeated. Init and
+  open check whether the directory is empty before reading the
+  manifest, so a concurrent init can't make a directory look non-empty
+  without one.
   Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
   then linked into place unless an identical object already exists;
   linking fails if the name exists, so of concurrent adds of the same

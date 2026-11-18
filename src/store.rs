@@ -236,14 +236,18 @@ impl Store {
     /// already a store of [`FORMAT_VERSION`]; then the parts of the layout
     /// that are missing are created.
     pub fn init(dir: OwnedFd) -> Result<Store> {
-        if read_manifest(&dir)?.is_none() {
-            anyhow::ensure!(
-                is_empty(&dir)?,
-                "the directory isn't empty and has no {MANIFEST}, so it isn't a store"
-            );
+        // Emptiness is checked before the manifest: the manifest is the
+        // first entry an init creates, so a concurrent init can't make a
+        // directory found non-empty lack it.
+        if is_empty(&dir)? {
             // The manifest comes first, so an interrupted init can be
             // repeated; until the layout is complete, `open` fails.
             write_manifest(&dir)?;
+        } else {
+            anyhow::ensure!(
+                read_manifest(&dir)?.is_some(),
+                "the directory isn't empty and has no {MANIFEST}, so it isn't a store"
+            );
         }
         for sub in SUBDIRS {
             mkdir_exist_ok(&dir, sub).with_context(|| format!("creating {sub}/"))?;
@@ -255,13 +259,12 @@ impl Store {
     /// up. Fails with [`NotAStore`] if it hasn't, and also if the store
     /// isn't of [`FORMAT_VERSION`].
     pub fn open(dir: OwnedFd) -> Result<Store> {
+        // Emptiness first, as in `init`.
+        if is_empty(&dir)? {
+            return Err(NotAStore::Empty.into());
+        }
         if read_manifest(&dir)?.is_none() {
-            return Err(if is_empty(&dir)? {
-                NotAStore::Empty
-            } else {
-                NotAStore::NoManifest
-            }
-            .into());
+            return Err(NotAStore::NoManifest.into());
         }
         for sub in SUBDIRS {
             match rustix::fs::statat(&dir, sub, AtFlags::SYMLINK_NOFOLLOW) {
