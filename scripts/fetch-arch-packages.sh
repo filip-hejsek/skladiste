@@ -24,14 +24,14 @@ dest=$1
 shift
 mkdir -p "$dest/db"
 
-# Repo databases are cached in DEST/db; delete them to refresh.
+# Repo databases are cached in DEST/db (as downloaded and extracted);
+# delete it to refresh.
 for repo in "${repos[@]}"; do
 	db="$dest/db/$repo"
 	if [[ ! -d $db ]]; then
 		curl -fsSL "$mirror/$repo/os/x86_64/$repo.db" -o "$db.db"
 		mkdir -p "$db"
 		tar -xf "$db.db" -C "$db"
-		rm "$db.db"
 	fi
 done
 
@@ -39,8 +39,9 @@ done
 # repo/filename"), each of its dependencies ("D name dependency", without
 # version constraints) and each name it provides ("V provided name").
 index() {
+	# Relative paths, so that a long DEST doesn't exceed the argument limit.
 	for repo in "${repos[@]}"; do
-		awk -v repo="$repo" '
+		(cd "$dest/db/$repo" && awk -v repo="$repo" '
 			function flush() {
 				if (name != "") print "P", name, repo "/os/x86_64/" file
 				for (i = 1; i <= nd; i++) print "D", name, deps[i]
@@ -56,7 +57,7 @@ index() {
 			section == "%DEPENDS%" { deps[++nd] = v }
 			section == "%PROVIDES%" { provs[++np] = v }
 			END { flush() }
-		' "$dest/db/$repo"/*/desc
+		' ./*/desc)
 	done
 }
 

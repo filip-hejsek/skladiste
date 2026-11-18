@@ -34,14 +34,21 @@ If no btrfs is available, say that these tests didn't really run.
 `CARGO_TARGET_DIR` can point to a directory on btrfs.
 
 Changes to importing or installing also need a check with real Arch
-packages (downloaded from an Arch mirror). Use a directory on btrfs;
-`tmp/` in the repo is gitignored for this if the repo is on btrfs:
+packages. They come from a local repo: a pinned snapshot of the Arch
+Linux Archive in `tmp/test-cache` of the main checkout (shared by all
+worktrees), served by nginx over HTTP and HTTPS. Use a directory on
+btrfs for the store; `tmp/` in the repo is gitignored for this if the
+repo is on btrfs:
 
 ```sh
 dir=tmp  # any directory on btrfs
-export SKL_STORE=$dir/store SKL_KEYRING=/usr/share/pacman/keyrings/archlinux
+scripts/test-mirror.sh fetch  # once; does nothing if it is there
+# Starts nginx (or reloads it) and sets TEST_MIRROR (http),
+# TEST_MIRROR_TLS (https), SKL_CA_CERTS and SKL_KEYRING.
+eval "$(scripts/test-mirror.sh serve)"
+export SKL_STORE=$dir/store
 skl() { cargo run -q --release -- "$@"; }
-mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+mirror=$TEST_MIRROR_TLS  # or $TEST_MIRROR
 skl init && skl arch repo add core "$mirror" && skl arch repo add extra "$mirror"  # once
 # 42 packages with dependencies, downloaded into the store's downloads/.
 skl arch build --sync --fetch --repo core --repo extra -o $dir/img filesystem bash coreutils
@@ -49,11 +56,22 @@ unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img
 ```
 
-For importing package files (`skl arch import FILE...`, then `skl arch build
---repo @local`), `scripts/fetch-arch-packages.sh $dir/pkgs filesystem
-bash coreutils` downloads the packages and their dependencies (ignoring
-versions) and prints their paths; with `--urls` it prints their URLs
-instead.
+`scripts/test-mirror.sh stop` stops nginx. Its access log is
+`tmp/test-cache/nginx/access.log` in the main checkout. For importing
+package files (`skl arch import FILE...`, then `skl arch build --repo
+@local`), take them from `tmp/test-cache/arch/*/{core,extra}/os/x86_64/`.
+
+Changes to downloading or syncing also need an occasional check against
+a live mirror (`https://geo.mirror.pkgbuild.com/$repo/os/$arch`, with
+`SKL_KEYRING` set to the current keyring,
+`/usr/share/pacman/keyrings/archlinux`). The `SKL_CA_CERTS` that
+`serve` sets has the test CA added to the roots in use before (the
+`SKL_CA_CERTS` it found, e.g. a proxy's CA, or else the system's
+bundle), so it works for live mirrors too. For package files of other
+packages, `scripts/fetch-arch-packages.sh $dir/pkgs PKGNAME...`
+downloads their current versions and their dependencies (ignoring
+versions) from a live mirror and prints their paths; with `--urls` it
+prints their URLs instead.
 
 Without root, chown to other users fails; `skl arch build` reports how many
 entries kept the wrong owner. This is expected. If you have subordinate

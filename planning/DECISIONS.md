@@ -758,6 +758,22 @@ are in BUGS.md.
 
 - Integration tests build synthetic packages and skip themselves when
   the cargo target directory isn't on btrfs.
+- Checks with real packages use a local repo by default
+  (`scripts/test-mirror.sh`): a pinned day of the Arch Linux Archive
+  (`archive.archlinux.org/repos/YYYY/MM/DD/`), 42 packages and their
+  signatures plus that day's keyring, so results don't drift with the
+  live repos and runs don't download from public mirrors again. It is
+  fetched once into `tmp/test-cache` of the main checkout, shared by
+  all worktrees (cloud sessions fetch it in the setup script), and
+  served by one nginx over HTTP and HTTPS. Its test CA is added to the
+  roots in use before (`SKL_CA_CERTS`, which cloud sessions need for
+  their proxy, or the system's bundle), so one shell reaches both the
+  test repo and live mirrors. nginx is
+  what real mirrors run, with keep-alive, ranges and `ETag`/`If-Range`.
+  Rejected: `python -m http.server` (none of those), a test server of
+  our own (it would share skl's reading of HTTP, so it tests no
+  interop; fault injection stays in `tests/download.rs`), caddy (less
+  like real mirrors). The live mirror is still for occasional checks.
 
 ## Build
 
