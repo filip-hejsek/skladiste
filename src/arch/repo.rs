@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::arch::ArchSection;
 use crate::arch::IMPORT_MAX_MEMORY;
 use crate::arch::signature::MAX_SIGNATURE_SIZE;
 use crate::download::{self, Downloaded, Request};
@@ -225,12 +226,13 @@ impl DbEntry {
 pub fn package_candidate<F>(pkg: &Package<F>) -> Result<Candidate> {
     check_name(&pkg.name)?;
     check_version(&pkg.version).with_context(|| format!("package {}", pkg.name))?;
+    let section = ArchSection::of(pkg)?;
     candidate(
         &pkg.name,
         &pkg.version,
-        &pkg.depends,
-        &pkg.provides,
-        &pkg.conflicts,
+        &section.depends,
+        &section.provides,
+        &section.conflicts,
     )
 }
 
@@ -786,13 +788,19 @@ mod tests {
 
     #[test]
     fn imported_packages() {
-        let pkg = |name: &str, version: &str, depend: &str| Package::<()> {
-            name: name.into(),
-            version: version.into(),
-            depends: vec![depend.into()],
-            provides: vec!["sh".into(), "libfoo.so=1-64".into()],
-            conflicts: vec!["old<2".into()],
-            entries: vec![],
+        let pkg = |name: &str, version: &str, depend: &str| {
+            let section = ArchSection {
+                depends: vec![depend.into()],
+                provides: vec!["sh".into(), "libfoo.so=1-64".into()],
+                conflicts: vec!["old<2".into()],
+                install: None,
+            };
+            Package::<()> {
+                name: name.into(),
+                version: version.into(),
+                entries: vec![],
+                sections: [section.into_section(vec![]).unwrap()].into(),
+            }
         };
         let c = package_candidate(&pkg("bash", "5.3-1", "glibc>=2.40")).unwrap();
         assert_eq!((&*c.name, &*c.version), ("bash", "5.3-1"));

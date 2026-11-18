@@ -24,7 +24,7 @@ use crate::arch::{self, version};
 use crate::download::{Request, Sink, fetch_and_run};
 use crate::http::Url;
 use crate::jobs::par_map;
-use crate::manifest::{Package, hex_encode};
+use crate::manifest::{Hash, Package, hex_encode};
 use crate::resolve::{self, Candidate, Target};
 use crate::store::{Store, TmpFile, hash_reader};
 use crate::worker::{ImportStats, Workers};
@@ -183,9 +183,9 @@ pub fn import_local(ctx: &Context, packages: Vec<LocalPackage>) -> Result<()> {
                 LocalArchive::Kept(url) => (open_kept(ctx, url)?, url.to_string()),
                 LocalArchive::Fetched(url, file) => (file, url.to_string()),
             };
-            let (pkg, new) = import_archive(ctx, file, &what, LOCAL, None)?;
+            let (imported, new) = import_archive(ctx, file, &what, LOCAL, None)?;
             if !new {
-                (ctx.report)(Event::AlreadyImported(&pkg));
+                (ctx.report)(Event::AlreadyImported(&imported.package));
             }
             Ok(())
         },
@@ -193,11 +193,18 @@ pub fn import_local(ctx: &Context, packages: Vec<LocalPackage>) -> Result<()> {
     Ok(())
 }
 
+/// A package in the store: its id and its manifest.
+#[derive(Debug, Clone)]
+pub struct Imported {
+    pub id: Hash,
+    pub package: Package,
+}
+
 /// What a repo offers to a build.
 pub enum Source {
     /// The packages imported into `@local`, sorted by name, newest version
     /// first.
-    Local(Vec<Package>),
+    Local(Vec<Imported>),
     /// A configured repo's latest snapshot.
     Synced(Box<Snapshot>),
 }
@@ -219,16 +226,16 @@ pub fn load_sources(
     })
 }
 
-/// The manifests of all packages in `@local`, sorted by name, newest
-/// version first, so that the resolver prefers the newest that fits.
-pub fn load_local(store: &Store) -> Result<Vec<Package>> {
+/// All packages in `@local`'s index, sorted by name, newest version
+/// first, so that the resolver prefers the newest that fits.
+pub fn load_local(store: &Store) -> Result<Vec<Imported>> {
     let mut pkgs = Vec::new();
-    for hash in store.packages(LOCAL)? {
-        if let Some(pkg) = store.load_package(LOCAL, &hash)? {
-            pkgs.push(pkg);
-        }
+    for (_, id) in store.package_index(LOCAL)? {
+        let package = store.load_package(&id)?;
+        pkgs.push(Imported { id, package });
     }
     pkgs.sort_by(|a, b| {
+        let (a, b) = (&a.package, &b.package);
         a.name
             .cmp(&b.name)
             .then_with(|| version::vercmp(&b.version, &a.version))
@@ -239,7 +246,7 @@ pub fn load_local(store: &Store) -> Result<Vec<Package>> {
 /// A package chosen for a build.
 pub enum Chosen<'a> {
     /// An imported package.
-    Local(&'a Package),
+    Local(&'a Imported),
     Repo(RepoPackage<'a>),
 }
 
@@ -273,7 +280,7 @@ pub fn choose<'a>(sources: &'a [Source], targets: &[Target]) -> Result<Vec<Chose
         .map(|source| match source {
             Source::Local(pkgs) => pkgs
                 .iter()
-                .map(repo::package_candidate)
+                .map(|p| repo::package_candidate(&p.package))
                 .collect::<Result<Vec<_>>>()
                 .with_context(|| format!("in repo {LOCAL}")),
             Source::Synced(snapshot) => snapshot.candidates(),
@@ -305,31 +312,31 @@ pub fn choose<'a>(sources: &'a [Source], targets: &[Target]) -> Result<Vec<Chose
         .collect()
 }
 
-/// The manifests of `chosen` if all of them are imported packages, which
+/// The ids of `chosen` if all of them are imported packages, which
 /// [`get_packages`] needs no verifier for.
-pub fn all_local(chosen: &[Chosen]) -> Option<Vec<Package>> {
+pub fn all_local(chosen: &[Chosen]) -> Option<Vec<Hash>> {
     chosen
         .iter()
         .map(|c| match c {
-            Chosen::Local(pkg) => Some((*pkg).clone()),
+            Chosen::Local(pkg) => Some(pkg.id),
             Chosen::Repo(_) => None,
         })
         .collect()
 }
 
-/// The manifest of each of `chosen`, in the same order. Packages from
+/// The id of each of `chosen`, in the same order. Packages from
 /// repo snapshots are verified, and imported where needed. Those that the
 /// store has no download for are downloaded meanwhile, if `fetch` allows,
 /// largest first by the size in the repo's database. Of the archives that
 /// are there, the largest are imported first, as they take longest.
-pub fn get_packages(ctx: &Context, chosen: &[Chosen], fetch: bool) -> Result<Vec<Package>> {
-    let mut packages: Vec<Option<Package>> = Vec::new();
+pub fn get_packages(ctx: &Context, chosen: &[Chosen], fetch: bool) -> Result<Vec<Hash>> {
+    let mut packages: Vec<Option<Hash>> = Vec::new();
     let mut kept = Vec::new();
     let mut missing = Vec::new();
     for (i, chosen) in chosen.iter().enumerate() {
         let pkg = match chosen {
             Chosen::Local(pkg) => {
-                packages.push(Some((*pkg).clone()));
+                packages.push(Some(pkg.id));
                 continue;
             }
             Chosen::Repo(pkg) => pkg,
@@ -384,12 +391,12 @@ pub fn get_packages(ctx: &Context, chosen: &[Chosen], fetch: bool) -> Result<Vec
         .collect()
 }
 
-/// Load the manifest of a package from a repo's snapshot, importing its
+/// The id of a package from a repo's snapshot, importing its
 /// archive if needed: `fetched`, which was downloaded and verified just
 /// now, or else the download in the store, whose signature is checked
 /// first, every time. The archive must have the SHA-256, and the package
 /// the name and version, that the repo's database gives.
-fn get_repo_package(ctx: &Context, pkg: &RepoPackage, fetched: Option<File>) -> Result<Package> {
+fn get_repo_package(ctx: &Context, pkg: &RepoPackage, fetched: Option<File>) -> Result<Hash> {
     let RepoPackage { repo, entry, .. } = pkg;
     let name = &entry.filename;
     let file = match fetched {
@@ -406,15 +413,15 @@ fn get_repo_package(ctx: &Context, pkg: &RepoPackage, fetched: Option<File>) -> 
         }
     };
     let what = format!("{repo}/{name}");
-    let (pkg, _) = import_archive(ctx, file, &what, repo, Some(entry))?;
-    check_identity(&pkg, entry).with_context(|| format!("checking {what}"))?;
-    Ok(pkg)
+    let (imported, _) = import_archive(ctx, file, &what, repo, Some(entry))?;
+    check_identity(&imported.package, entry).with_context(|| format!("checking {what}"))?;
+    Ok(imported.id)
 }
 
-/// Load the manifest of the package in `file`, whose signature was
-/// verified, from the store, importing it if needed (the second value
-/// tells whether it was). Packages are identified by their repo and the
-/// hash of the archive file. With `entry`, the SHA-256 must be the one it
+/// The package in `file`, whose signature was verified, from the store,
+/// importing it if needed (the second value tells whether it was). The
+/// repo's index has packages by the hash of the archive file, so the same
+/// file is imported once per repo. With `entry`, the SHA-256 must be the one it
 /// gives. The file is the one that was verified (which the verification
 /// worker read through its own open file), so the parsed content is the
 /// content that was verified and hashed, unless the file is written to
@@ -426,7 +433,7 @@ fn import_archive(
     what: &str,
     repo: &str,
     entry: Option<&DbEntry>,
-) -> Result<(Package, bool)> {
+) -> Result<(Imported, bool)> {
     file.seek(SeekFrom::Start(0))?;
     let mut sha256 = entry.map(|_| Sha256::new());
     let hash = hash_reader(Tee {
@@ -437,8 +444,9 @@ fn import_archive(
     if let (Some(entry), Some(sha256)) = (entry, sha256) {
         check_sha256(sha256, entry).with_context(|| format!("checking {what}"))?;
     }
-    if let Some(pkg) = ctx.store.load_package(repo, &hash)? {
-        return Ok((pkg, false));
+    if let Some(id) = ctx.store.indexed_package(repo, &hash)? {
+        let package = ctx.store.load_package(&id)?;
+        return Ok((Imported { id, package }, false));
     }
     file.seek(SeekFrom::Start(0))?;
     let importing = || format!("importing {what}");
@@ -449,12 +457,13 @@ fn import_archive(
     if let Some(entry) = entry {
         check_identity(&pkg, entry).with_context(importing)?;
     }
-    ctx.store.save_package(repo, &hash, &pkg)?;
+    let id = ctx.store.add_package(&pkg)?;
+    ctx.store.index_package(repo, &hash, &id)?;
     (ctx.report)(Event::Imported {
         package: &pkg,
         stats: &stats,
     });
-    Ok((pkg, true))
+    Ok((Imported { id, package: pkg }, true))
 }
 
 /// `.PKGINFO`'s name and version must be those of the database entry.
@@ -632,6 +641,7 @@ fn read_signature(file: File) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::ArchSection;
 
     #[test]
     fn local_packages_newest_first() {
@@ -640,15 +650,18 @@ mod tests {
         let add = |name: &str, version: &str, depends: &[&str]| {
             let id = format!("{name} {version}");
             let hash = store.add_blob(&mut id.as_bytes()).unwrap().hash;
+            let section = ArchSection {
+                depends: depends.iter().map(|d| (*d).to_owned()).collect(),
+                ..ArchSection::default()
+            };
             let pkg = Package {
                 name: name.into(),
                 version: version.into(),
-                depends: depends.iter().map(|d| (*d).to_owned()).collect(),
-                provides: vec![],
-                conflicts: vec![],
                 entries: vec![],
+                sections: [section.into_section(vec![]).unwrap()].into(),
             };
-            store.save_package(LOCAL, &hash, &pkg).unwrap();
+            let id = store.add_package(&pkg).unwrap();
+            store.index_package(LOCAL, &hash, &id).unwrap();
         };
         add("lib", "1.9-1", &[]);
         add("lib", "1.10-1", &[]);
@@ -667,7 +680,10 @@ mod tests {
             all_local(&chosen)
                 .unwrap()
                 .iter()
-                .map(|pkg| format!("{} {}", pkg.name, pkg.version))
+                .map(|id| {
+                    let pkg = store.load_package(id).unwrap();
+                    format!("{} {}", pkg.name, pkg.version)
+                })
                 .collect()
         };
         assert_eq!(build(&["lib"]), ["lib 2.0-1"]);

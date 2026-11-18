@@ -6,9 +6,11 @@
 //! - `blobs/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `objects/ab/cdef…` — skl's own records ([`crate::object`]), named by
 //!   their address, read-only
-//! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
-//!   and the archive's hash (packages imported from files or URLs belong to
-//!   their format's pseudo-repo `@FORMAT/@local`, see [`repo::LOCAL`])
+//! - `packages/<repo>/<key>` — each repo's package index: the id of a
+//!   package (its manifest object, see [`Package`]) by a key of the
+//!   frontend's, e.g. the hash of the archive it was imported from
+//!   (packages imported from files or URLs belong to their format's
+//!   pseudo-repo `@FORMAT/@local`, see [`repo::LOCAL`])
 //! - `downloads/<repo>/<name>` — downloaded package archives (and their
 //!   signatures), by repo and file name
 //! - `repos/<repo>/config.json` — a repo's configuration (see
@@ -17,7 +19,8 @@
 //!   repo's database that was fetched ([`SyncRecord`]); the database
 //!   itself is a blob
 //! - `tmp/` — staging area for files being written: unnamed
-//!   (`O_TMPFILE`) until complete and checked, except manifests
+//!   (`O_TMPFILE`) until complete and checked, except files that are
+//!   replaced (index entries, the store manifest)
 //!
 //! `<repo>` is the repo's id `@FORMAT/NAME` (see [`repo::id`]), so it is
 //! two directory levels, e.g. `repos/@arch/core/`.
@@ -262,10 +265,10 @@ fn object_name(hash: &Hash) -> String {
 /// Largest object accepted when reading.
 const MAX_OBJECT: u64 = 1 << 30;
 
-/// `packages/<repo>/<hash>.json`.
-fn package_name(repo: &str, hash: &Hash) -> Result<String> {
+/// `packages/<repo>/<key>`.
+fn index_name(repo: &str, key: &Hash) -> Result<String> {
     repo::check_id(repo)?;
-    Ok(format!("packages/{repo}/{hash}.json"))
+    Ok(format!("packages/{repo}/{key}"))
 }
 
 impl Store {
@@ -575,37 +578,68 @@ impl Store {
         result
     }
 
-    /// The manifest of the package from `repo` whose archive has `hash`,
-    /// if it was imported.
-    pub fn load_package(&self, repo: &str, hash: &Hash) -> Result<Option<Package>> {
-        self.read_json(&package_name(repo, hash)?)
+    /// Add the package manifest `pkg` as an object, after checking it, and
+    /// return its address: the package's id.
+    pub fn add_package(&self, pkg: &Package) -> Result<Hash> {
+        pkg.validate()?;
+        let (refs, body) = pkg.to_object()?;
+        self.add_object(refs.as_slice(), &body)
     }
 
-    /// The archive hashes of the packages imported from `repo`, sorted.
-    pub fn packages(&self, repo: &str) -> Result<Vec<Hash>> {
+    /// The package with id `id`.
+    pub fn load_package(&self, id: &Hash) -> Result<Package> {
+        let obj = self.read_object(id)?;
+        let pkg = Package::from_object(&obj).with_context(|| format!("reading package {id}"))?;
+        pkg.validate()
+            .with_context(|| format!("checking package {id}"))?;
+        Ok(pkg)
+    }
+
+    /// The id of the package that `repo`'s index has under `key` (e.g.
+    /// the hash of the archive it was made from), if any.
+    pub fn indexed_package(&self, repo: &str, key: &Hash) -> Result<Option<Hash>> {
+        let name = index_name(repo, key)?;
+        let Some(data) = self.read_file(&name)? else {
+            return Ok(None);
+        };
+        let id = std::str::from_utf8(&data)
+            .ok()
+            .and_then(|s| s.trim_ascii_end().parse().ok())
+            .with_context(|| format!("{name} doesn't hold a package id"))?;
+        Ok(Some(id))
+    }
+
+    /// The keys in `repo`'s package index with the ids they hold, sorted
+    /// by key.
+    pub fn package_index(&self, repo: &str) -> Result<Vec<(Hash, Hash)>> {
         repo::check_id(repo)?;
         let dir = format!("packages/{repo}");
         if let Err(Errno::NOENT) = rustix::fs::statat(&self.dir, &dir, AtFlags::empty()) {
             return Ok(Vec::new());
         }
-        let mut hashes: Vec<Hash> = self
+        let mut keys: Vec<Hash> = self
             .list_dir(&dir)?
             .iter()
-            .filter_map(|n| n.strip_suffix(".json")?.parse().ok())
+            .filter_map(|n| n.parse().ok())
             .collect();
-        hashes.sort();
-        Ok(hashes)
+        keys.sort();
+        let mut index = Vec::new();
+        for key in keys {
+            if let Some(id) = self.indexed_package(repo, &key)? {
+                index.push((key, id));
+            }
+        }
+        Ok(index)
     }
 
-    /// Save the manifest of the package from `repo` whose archive has
-    /// `hash`, replacing any saved before. Concurrent saves of the same
-    /// package don't interfere; one of them wins.
-    pub fn save_package(&self, repo: &str, hash: &Hash, pkg: &Package) -> Result<()> {
-        let name = package_name(repo, hash)?;
+    /// Record the package `id` under `key` in `repo`'s package index,
+    /// replacing what was there. Concurrent writes of the same key don't
+    /// interfere; one of them wins.
+    pub fn index_package(&self, repo: &str, key: &Hash, id: &Hash) -> Result<()> {
+        let name = index_name(repo, key)?;
         mkdir_repo(&self.dir, "packages", repo)?;
-        self.write_replace(&name, &serde_json::to_vec(pkg)?)
+        self.write_replace(&name, format!("{id}\n").as_bytes())
     }
-
     /// Add the repo with id `name` with `config` (in the frontend's
     /// format). Fails if the repo exists, or is a pseudo-repo.
     pub fn add_repo(&self, name: &str, config: &impl Serialize) -> Result<()> {
@@ -988,29 +1022,38 @@ mod tests {
         let pkg = |version: &str| Package {
             name: "a".into(),
             version: version.into(),
-            depends: vec![],
-            provides: vec![],
-            conflicts: vec![],
             entries: vec![],
+            sections: [].into(),
         };
-        store
-            .save_package("@arch/@local", &hash, &pkg("1-1"))
-            .unwrap();
-        store
-            .save_package("@arch/core", &hash, &pkg("2-1"))
-            .unwrap();
-        let load = |repo| store.load_package(repo, &hash).unwrap().map(|p| p.version);
-        assert_eq!(load("@arch/@local").as_deref(), Some("1-1"));
-        assert_eq!(load("@arch/core").as_deref(), Some("2-1"));
-        assert_eq!(load("@arch/extra"), None);
-        assert_eq!(store.packages("@arch/core").unwrap(), [hash]);
-        assert_eq!(store.packages("@arch/extra").unwrap(), []);
-        assert!(store.save_package("../x", &hash, &pkg("1")).is_err());
-        assert!(
-            dir.path()
-                .join(format!("packages/@arch/core/{hash}.json"))
-                .exists()
+        let (one, two) = (pkg("1-1"), pkg("2-1"));
+        let (id1, id2) = (
+            store.add_package(&one).unwrap(),
+            store.add_package(&two).unwrap(),
         );
+        assert_ne!(id1, id2);
+        assert_eq!(store.load_package(&id1).unwrap(), one);
+        store.index_package("@arch/@local", &hash, &id1).unwrap();
+        store.index_package("@arch/core", &hash, &id1).unwrap();
+        store.index_package("@arch/core", &hash, &id2).unwrap();
+        let load = |repo| store.indexed_package(repo, &hash).unwrap();
+        assert_eq!(load("@arch/@local"), Some(id1));
+        assert_eq!(load("@arch/core"), Some(id2));
+        assert_eq!(load("@arch/extra"), None);
+        assert_eq!(store.package_index("@arch/core").unwrap(), [(hash, id2)]);
+        assert_eq!(store.package_index("@arch/extra").unwrap(), []);
+        assert!(store.index_package("../x", &hash, &id1).is_err());
+        let saved = dir.path().join(format!("packages/@arch/core/{hash}"));
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), format!("{id2}\n"));
+        // An invalid package isn't added.
+        let mut bad = pkg("1");
+        bad.sections.insert(
+            "Arch".into(),
+            crate::manifest::Section {
+                value: serde_json::json!({}),
+                blobs: vec![],
+            },
+        );
+        assert!(store.add_package(&bad).is_err());
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Arch Linux package frontend: reads `.pkg.tar.zst` archives into the store.
 //!
-//! Install scriptlets (`.INSTALL`), `.MTREE` and `.BUILDINFO` are ignored for now.
+//! What skl needs of `.PKGINFO` and the install scriptlet (`.INSTALL`)
+//! are kept in the manifest's Arch section ([`ArchSection`]); `.MTREE`,
+//! `.BUILDINFO` and `.CHANGELOG` are ignored.
 //!
 //! The archive is untrusted input, so [`import`] touches nothing but the
 //! stream it reads and the [`BlobSink`] it writes to; `skl` runs it in a
@@ -12,9 +14,11 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::fd::FromRawFd;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use tar::EntryType;
 
-use crate::manifest::{BlobId, Entry, EntryKind, Package, XattrValue, normalize_path};
+use crate::manifest::{BlobId, Entry, EntryKind, Package, Section, XattrValue, normalize_path};
+use crate::object::Index;
 use crate::sandbox::{self, Policy};
 use crate::store::{BlobSink, Store};
 use crate::worker::{self, Args, ImportStats, Kind, NO_CAPS, RemoteSink, Workers};
@@ -53,7 +57,7 @@ pub fn import_in_worker(
     let w = workers.spawn(&IMPORT_WORKER, archive.into(), theirs, &[], &[])?;
     let mut conn = worker::receiver(ours)?;
     let result = worker::receive_blobs(store, &mut conn).and_then(|(blobs, json, stats)| {
-        let pkg: Package<BlobId> =
+        let pkg: Package<BlobId, BlobId> =
             serde_json::from_slice(&json).context("parsing manifest from worker")?;
         let pkg = pkg.resolve(&blobs)?;
         pkg.validate()?;
@@ -77,12 +81,13 @@ fn import_main(args: Args) -> Result<Vec<u8>> {
 }
 
 /// Read a package archive, adding file contents to `blobs`.
-pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<BlobId>> {
+pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<BlobId, BlobId>> {
     let decoder = open_decoder(BufReader::new(archive))?;
     let mut archive = tar::Archive::new(decoder);
 
     let mut entries = Vec::new();
     let mut pkginfo = None;
+    let mut install = None;
 
     for tar_entry in archive.entries()? {
         let mut tar_entry = tar_entry?;
@@ -94,10 +99,17 @@ pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<Bl
 
         // Package metadata lives in dot-files at the archive root.
         if path.starts_with('.') && !path.contains('/') {
-            if path == ".PKGINFO" {
-                let mut s = String::new();
-                tar_entry.read_to_string(&mut s)?;
-                pkginfo = Some(parse_pkginfo(&s)?);
+            match path.as_str() {
+                ".PKGINFO" => {
+                    let mut s = String::new();
+                    tar_entry.read_to_string(&mut s)?;
+                    pkginfo = Some(parse_pkginfo(&s)?);
+                }
+                ".INSTALL" => {
+                    let size = tar_entry.size();
+                    install = Some(blobs.add_blob(size, &mut tar_entry)?);
+                }
+                _ => {}
             }
             continue;
         }
@@ -142,14 +154,54 @@ pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<Bl
     let Some(info) = pkginfo else {
         bail!("missing .PKGINFO");
     };
-    Ok(Package {
-        name: info.name,
-        version: info.version,
+    let section = ArchSection {
         depends: info.depends,
         provides: info.provides,
         conflicts: info.conflicts,
+        install: install.map(|_| Index { index: 0 }),
+    };
+    Ok(Package {
+        name: info.name,
+        version: info.version,
         entries,
+        sections: [section.into_section(install.into_iter().collect())?].into(),
     })
+}
+
+/// The name of Arch's section in package manifests.
+pub const SECTION: &str = "arch";
+
+/// What a package manifest keeps for Arch, as its section [`SECTION`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchSection {
+    /// Dependencies, provides and conflicts from `.PKGINFO`, in Arch's
+    /// syntax (e.g. `glibc>=2.40`), checked when importing.
+    pub depends: Vec<String>,
+    pub provides: Vec<String>,
+    pub conflicts: Vec<String>,
+    /// The install scriptlet (`.INSTALL`): a blob of the section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<Index>,
+}
+
+impl ArchSection {
+    /// The Arch section of `pkg`.
+    pub fn of<F>(pkg: &Package<F>) -> Result<ArchSection> {
+        let section = pkg
+            .sections
+            .get(SECTION)
+            .with_context(|| format!("package {} has no {SECTION} section", pkg.name))?;
+        serde_json::from_value(section.value.clone())
+            .with_context(|| format!("package {}: reading its {SECTION} section", pkg.name))
+    }
+
+    /// The section with this content, whose references are to `blobs`,
+    /// and its name.
+    pub fn into_section<F>(self, blobs: Vec<F>) -> Result<(String, Section<F>)> {
+        let value = serde_json::to_value(self)?;
+        Ok((SECTION.to_owned(), Section { value, blobs }))
+    }
 }
 
 fn open_decoder<'a>(mut reader: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {

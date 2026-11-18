@@ -89,10 +89,8 @@ scripts and hooks on top of them.
   full uid range in a user namespace (needs uids and capabilities
   granted to the container), or record ownership in the manifest only
   and apply it on export.
-- Split building into a frontend step that works out what an image
-  contains (a list of package ids) and a format-independent step that
-  builds an image from it (see Building in PACKAGES.md). `build` may
-  then become a core verb (see CLI in DECISIONS.md).
+- `build` may become a core verb now that the core builds from a list
+  of package ids (see Building in PACKAGES.md and CLI in DECISIONS.md).
 - Export to OCI images, or use podman's btrfs storage driver directly.
 - Upgrades and generations using subvolume snapshots, with rollback.
 

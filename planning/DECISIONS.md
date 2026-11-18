@@ -16,7 +16,8 @@ are in BUGS.md.
   packages are reused for now.
 - The core is independent of the source package format so that images
   from other distros can be built later. Format-specific code lives in
-  frontends (`src/arch.rs`) that produce a `manifest::Package`.
+  frontends (`src/arch.rs`) that produce a `manifest::Package` (see
+  PACKAGES.md for the native format).
 - Written in Rust.
 
 ## CLI
@@ -49,7 +50,7 @@ are in BUGS.md.
 - Layout: `blobs/ab/cdef…` (read-only, mode 0444) for file contents,
   `objects/ab/cdef…` (also read-only) for skl's own records (see
   PACKAGES.md: a header of references and a canonical JSON body),
-  `packages/<repo>/<hash>.json` for imported manifests,
+  `packages/<repo>/<key>` for each repo's index of imported packages,
   `downloads/<repo>/` for downloaded packages, `repos/<repo>/` for repos
   (see Repos), `tmp/` for blobs and manifests being written.
 - A store is set up explicitly (`skl init`, `Store::init`); other
@@ -106,24 +107,29 @@ are in BUGS.md.
   name while it's written. Linking goes through `/proc/self/fd/N`
   (`AT_SYMLINK_FOLLOW`), since `AT_EMPTY_PATH` needs
   `CAP_DAC_READ_SEARCH`; so writing to the store needs `/proc` (only the
-  supervisor writes). Manifests are written to a named file in `tmp/` and
-  renamed over any earlier one, which linking can't do.
-- An imported package is identified by its repo and the BLAKE3 hash of
-  its archive file (`<repo>/<hash>`), so re-importing the same file is
-  skipped. Blobs are shared, so a package in two repos costs only its
-  manifest twice. Packages imported from paths or URLs belong to their
-  format's pseudo-repo `@local` (`@arch/@local`).
-- Manifests are JSON; hashes and xattr values are hex strings.
+  supervisor writes). Objects are written the same way. Index entries
+  are written to a named file in `tmp/` and renamed over any earlier
+  one, which linking can't do.
+- A package's id is the address of its manifest, an object (see
+  PACKAGES.md). Each repo has an index of the packages imported from it,
+  `packages/<repo>/<archive-hash>` holding the package's id, so
+  re-importing the same file is skipped. Equal manifests are one object,
+  so a package in two repos costs two index entries. Packages imported
+  from paths or URLs belong to their format's pseudo-repo `@local`
+  (`@arch/@local`).
+- Manifests are canonical JSON (PACKAGES.md); hashes are in the
+  object's header, xattr values are hex strings.
 
 ## Arch frontend
 
 - Only zstd-compressed packages are supported, as current Arch packages
   use zstd.
-- Package name, version, dependencies, provides and conflicts come from
-  `.PKGINFO` and are kept in the manifest (dependencies as strings in
-  Arch's syntax; the supervisor checks them when importing, as for
-  database entries); other metadata files (`.MTREE`, `.BUILDINFO`,
-  `.INSTALL`, `.CHANGELOG`) are ignored for now.
+- Package name and version come from `.PKGINFO`; dependencies,
+  provides and conflicts too, kept in the manifest's Arch section
+  (`arch::ArchSection`, as strings in Arch's syntax; the supervisor
+  checks them when importing, as for database entries), with `.INSTALL`
+  as a blob of the section. Other metadata files (`.MTREE`,
+  `.BUILDINFO`, `.CHANGELOG`) are ignored.
 - Owner, mode and mtime come from the tar headers; xattrs come from
   `SCHILY.xattr.*` PAX records, as written by bsdtar.
 
@@ -215,7 +221,7 @@ are in BUGS.md.
   dependency excludes it. Signatures of local packages are checked when
   importing, not again by builds: the archive of a file isn't kept.
   All `@local` manifests are read for each build that uses it (not
-  measured); index them if this gets slow.
+  measured); keep their Arch sections apart if this gets slow.
 - The snapshot's entry gives the URL (`<server>/<FILENAME>`), the
   signature (`%PGPSIG%`, still saved as `.sig` next to the download;
   an entry without one is an error), the size limit and exact size

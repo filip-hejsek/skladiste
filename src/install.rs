@@ -19,7 +19,7 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::btrfs;
-use crate::manifest::{Content, Entry, EntryKind, Package};
+use crate::manifest::{Content, Entry, EntryKind, Hash, Package};
 use crate::sandbox::{self, Policy};
 use crate::store::Store;
 use crate::worker::{self, Args, Caps, Kind, Workers};
@@ -89,12 +89,14 @@ pub struct Report {
 }
 
 /// Create a new subvolume named `name` in the directory `parent` and
-/// install `packages` into it. The files are installed by a worker that
-/// can access only the store and the new subvolume.
+/// install the packages with ids `packages` into it, in that order: a
+/// path in two packages is an error, except directories, where the first
+/// wins. The files are installed by a worker that can access only the
+/// store and the new subvolume.
 pub fn build(
     workers: &Workers,
     store: &Store,
-    packages: &[Package],
+    packages: &[Hash],
     parent: BorrowedFd,
     name: &OsStr,
 ) -> Result<Report> {
@@ -102,7 +104,11 @@ pub fn build(
         !name.is_empty() && name != "." && name != ".." && !name.as_bytes().contains(&b'/'),
         "bad subvolume name {name:?}"
     );
-    let plan: Vec<&Entry> = merge(packages)?.into_values().collect();
+    let packages = packages
+        .iter()
+        .map(|id| store.load_package(id))
+        .collect::<Result<Vec<_>>>()?;
+    let plan: Vec<&Entry> = merge(&packages)?.into_values().collect();
     btrfs::create_subvolume_at(parent, name).context("creating subvolume")?;
     let root = rustix::fs::openat(
         parent,

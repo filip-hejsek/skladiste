@@ -6,7 +6,9 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use skladiste::{arch, install, manifest::Package, store::Store, worker::Workers};
+use skladiste::arch::{self, ArchSection};
+use skladiste::manifest::Hash;
+use skladiste::{install, store::Store, worker::Workers};
 use tar::{EntryType, Header};
 
 const BTRFS_SUPER_MAGIC: i64 = 0x9123683e;
@@ -88,16 +90,18 @@ fn workers() -> Workers {
 }
 
 /// Build the image `img`, whose parent directory exists.
-fn build(store: &Store, pkgs: &[Package], img: &Path) -> anyhow::Result<install::Report> {
+fn build(store: &Store, pkgs: &[Hash], img: &Path) -> anyhow::Result<install::Report> {
     let parent = File::open(img.parent().unwrap()).unwrap();
     let name = img.file_name().unwrap();
     install::build(&workers(), store, pkgs, parent.as_fd(), name)
 }
 
-fn import(store: &Store, path: &Path) -> Package {
-    arch::import_in_worker(&workers(), store, File::open(path).unwrap())
+/// Import the package file at `path`, returning the package's id.
+fn import(store: &Store, path: &Path) -> Hash {
+    let pkg = arch::import_in_worker(&workers(), store, File::open(path).unwrap())
         .unwrap()
-        .0
+        .0;
+    store.add_package(&pkg).unwrap()
 }
 
 #[test]
@@ -138,6 +142,7 @@ fn build_image() {
         arch::import_in_worker(&workers(), &store, File::open(&tools).unwrap()).unwrap();
     assert_eq!(stats.files, 4);
     assert_eq!(stats.new_blobs, 3, "identical files share one blob");
+    let tools = store.add_package(&tools).unwrap();
 
     let img = tmp.path().join("img");
     let report = build(&store, &[base, tools], &img).unwrap();
@@ -164,6 +169,32 @@ fn build_image() {
     let mut value = [0u8; 16];
     let n = rustix::fs::getxattr(img.join("usr/bin/tagged"), "user.skl.test", &mut value).unwrap();
     assert_eq!(&value[..n], b"value");
+}
+
+#[test]
+fn install_scriptlets_are_kept() {
+    let Some(tmp) = btrfs_tempdir() else { return };
+    let store = Store::init_path(&tmp.path().join("store")).unwrap();
+    let script = b"post_install() {\n\ttrue\n}\n";
+    let path = make_package(
+        tmp.path(),
+        "scripted",
+        &[
+            Item::File(".INSTALL", 0o644, script),
+            Item::Dir("etc/", 0o755),
+        ],
+    );
+    let id = import(&store, &path);
+    let pkg = store.load_package(&id).unwrap();
+    assert_eq!(pkg.entries.len(), 1, "metadata files aren't entries");
+    let section = ArchSection::of(&pkg).unwrap();
+    let blob = pkg.sections[arch::SECTION]
+        .blob(section.install.unwrap())
+        .unwrap();
+    let file = File::from(store.open_blob(blob).unwrap());
+    assert_eq!(std::io::read_to_string(file).unwrap().as_bytes(), script);
+    // Importing again gives the same id.
+    assert_eq!(import(&store, &path), id);
 }
 
 #[test]

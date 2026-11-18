@@ -3,9 +3,8 @@
 Design for skl's own package format: a manifest that refers to blobs
 in the store, without an archive for now. Frontends convert their
 packages to it, and the core builds images from a list of such
-packages. Nothing of this is implemented yet; the code still has
-`manifest::Package` with Arch's dependency fields, identified by the
-hash of its archive (see Store and Arch frontend in DECISIONS.md).
+packages. Implemented: blobs and objects, canonical JSON,
+manifests with sections, the Arch index and the build split.
 
 Decided: objects with a reference header, manifests as objects
 with untyped sections per format, the build split, one
@@ -122,25 +121,26 @@ questions are at the end.
 
   - `name` and `version`: opaque strings, for messages; the core
     doesn't compare versions.
-  - `entries`: as `manifest::Entry` now, with file contents as a header
-    index and size instead of a hash.
+  - `entries`: `manifest::Entry`, with file contents as a reference
+    and the size.
   - `sections`: one per format, by its name (`arch`), untyped JSON that
     the core keeps and doesn't read. Rejected: a generic type parameter
     for sections (it would leak into `install` and `store`, and the
-    stored form is JSON anyway).
+    stored form is JSON anyway). In memory a section
+    (`manifest::Section`) is its JSON with references as indices into
+    its own list of blobs, so that it stands alone; the core renumbers
+    them when writing the manifest and back when reading it. Sections
+    refer only to blobs for now, without their sizes.
   - Overlay packages (below) also have `"overlay": true` and `removed`.
-- Arch's section: `depends`, `provides`, `conflicts` (in Arch's syntax,
-  checked when importing as now), later `replaces`, and `install`, the
-  header index of `.INSTALL` if the package has one. `.MTREE`,
-  `.BUILDINFO` and `.CHANGELOG` stay ignored.
+- Arch's section (`arch::ArchSection`): `depends`, `provides`,
+  `conflicts` (in Arch's syntax, checked when importing as now), later
+  `replaces`, and `install`, the reference to `.INSTALL` if the package
+  has one. `.MTREE`, `.BUILDINFO` and `.CHANGELOG` stay ignored.
 - `skl arch import` and builds keep identifying archives by their hash,
   so importing the same file again is skipped: an Arch index
   `packages/@arch/<repo>/<archive-hash>` holds the id of the manifest
-  made from it. It also lists `@local`. It is a GC root and a cache:
-  a hash migration may drop it.
-- The store format changes, so the implementation gets a new
-  development version (`scripts/new-store-dev-version.sh`); there is no
-  stable version to migrate from yet.
+  made from it (`Store::index_package`). It also lists `@local`. It is
+  a GC root and a cache: a hash migration may drop it.
 
 ## Building
 
