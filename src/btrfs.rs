@@ -22,6 +22,13 @@ struct VolArgs {
 const SNAP_CREATE: rustix::ioctl::Opcode = opcode::write::<VolArgs>(BTRFS_IOCTL_MAGIC, 1);
 const SUBVOL_CREATE: rustix::ioctl::Opcode = opcode::write::<VolArgs>(BTRFS_IOCTL_MAGIC, 14);
 const SNAP_DESTROY: rustix::ioctl::Opcode = opcode::write::<VolArgs>(BTRFS_IOCTL_MAGIC, 15);
+// `struct btrfs_ioctl_vol_args_v2` has the same size (4096 bytes).
+const SNAP_CREATE_V2: rustix::ioctl::Opcode = opcode::write::<VolArgs>(BTRFS_IOCTL_MAGIC, 23);
+const SUBVOL_CREATE_V2: rustix::ioctl::Opcode = opcode::write::<VolArgs>(BTRFS_IOCTL_MAGIC, 24);
+
+/// The ioctls that create subvolumes or snapshots.
+pub(crate) const CREATE_IOCTLS: [rustix::ioctl::Opcode; 4] =
+    [SNAP_CREATE, SUBVOL_CREATE, SNAP_CREATE_V2, SUBVOL_CREATE_V2];
 
 /// Inode number of a subvolume's root directory.
 const FIRST_FREE_OBJECTID: u64 = 256;

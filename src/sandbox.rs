@@ -7,7 +7,7 @@
 //! only the system calls the worker needs and kills it on any other.
 //!
 //! Package code run in an image can't confine itself; bwrap loads the
-//! filters of [`no_userns_filters`] for it.
+//! filters of [`package_code_filters`] for it.
 
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -184,14 +184,18 @@ fn seccomp(policy: &Policy) -> Result<()> {
     Ok(())
 }
 
-/// Seccomp filters (raw BPF programs) that stop a process from creating
-/// user namespaces, for package code that bwrap runs in the supervisor's
-/// user namespace, where `--disable-userns` isn't available. `unshare` and
-/// `clone` with `CLONE_NEWUSER` fail with `EPERM`. `clone3` fails with
-/// `ENOSYS`, since its flags are behind a pointer; libc then falls back to
-/// `clone`. Everything else is allowed. A separate program per error,
-/// since a seccompiler filter has a single action on a match.
-pub(crate) fn no_userns_filters() -> Result<[Vec<u8>; 2]> {
+/// Seccomp filters (raw BPF programs) for package code. They stop it from
+/// creating user namespaces, since bwrap runs it in the supervisor's user
+/// namespace, where `--disable-userns` isn't available: `unshare` and
+/// `clone` with `CLONE_NEWUSER` fail with `EPERM`; `clone3` fails with
+/// `ENOSYS`, since its flags are behind a pointer, and libc then falls back
+/// to `clone`. Creating btrfs subvolumes and snapshots fails with `ENOTTY`,
+/// as on another filesystem, so that programs that create them if they can
+/// (`systemd-tmpfiles` for `/var/lib/machines`) make a directory instead:
+/// the changes package code makes can't contain subvolumes. Everything
+/// else is allowed. A separate program per error, since a seccompiler
+/// filter has a single action on a match.
+pub(crate) fn package_code_filters() -> Result<[Vec<u8>; 3]> {
     let arch = TargetArch::try_from(std::env::consts::ARCH)?;
     let newuser = || -> Result<Vec<SeccompRule>> {
         let flag = libc::CLONE_NEWUSER as u64;
@@ -211,6 +215,21 @@ pub(crate) fn no_userns_filters() -> Result<[Vec<u8>; 2]> {
     for nr in with_x32(libc::SYS_clone3) {
         whole.insert(nr, Vec::new());
     }
+    // The request is an unsigned int.
+    let ioctls = crate::btrfs::CREATE_IOCTLS
+        .iter()
+        .map(|&op| {
+            let cond =
+                SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, op.into())?;
+            Ok(SeccompRule::new(vec![cond])?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // x32 has its own number for `ioctl` (514), not that of x86_64.
+    #[cfg(target_arch = "x86_64")]
+    let ioctl_nrs = [libc::SYS_ioctl, 0x4000_0000 | 514];
+    #[cfg(not(target_arch = "x86_64"))]
+    let ioctl_nrs = [libc::SYS_ioctl];
+    let btrfs = ioctl_nrs.map(|nr| (nr, ioctls.clone())).into();
     let compile = |rules, errno: i32| -> Result<Vec<u8>> {
         let filter = SeccompFilter::new(
             rules,
@@ -234,6 +253,7 @@ pub(crate) fn no_userns_filters() -> Result<[Vec<u8>; 2]> {
     Ok([
         compile(flagged, libc::EPERM)?,
         compile(whole, libc::ENOSYS)?,
+        compile(btrfs, libc::ENOTTY)?,
     ])
 }
 

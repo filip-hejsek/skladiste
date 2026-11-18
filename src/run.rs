@@ -62,7 +62,7 @@ pub fn run(
     options: &Options,
 ) -> Result<ExitStatus> {
     let bwrap = bwrap::find()?;
-    let filters = sandbox::no_userns_filters()
+    let filters = sandbox::package_code_filters()
         .context("building seccomp filters")?
         .iter()
         .map(|program| pipe_holding(program))
@@ -338,6 +338,15 @@ mod tests {
         let errno = std::io::Error::last_os_error().raw_os_error();
         assert_eq!((r, errno), (-1, Some(libc::ENOSYS)));
         std::thread::spawn(|| ()).join().unwrap();
+        // No subvolumes or snapshots: the filter answers before the kernel
+        // looks at the fd (which would give EBADF).
+        for op in crate::btrfs::CREATE_IOCTLS {
+            let mut args = [0u8; 4096];
+            // SAFETY: fails before using `args`, or with EBADF.
+            let r = unsafe { libc::ioctl(-1, op.into(), args.as_mut_ptr()) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!((r, errno), (-1, Some(libc::ENOTTY)), "{op:#x}");
+        }
         // The host's filesystem isn't there.
         let err = std::fs::metadata(env!("CARGO_MANIFEST_PATH")).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);

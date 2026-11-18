@@ -804,7 +804,14 @@ are in BUGS.md.
   given to bwrap (`--add-seccomp-fd`) makes `unshare` and `clone` with
   `CLONE_NEWUSER` fail with `EPERM`, and `clone3` with `ENOSYS` (its
   flags are behind a pointer; libc falls back to `clone`); x32 numbers
-  are listed too. Otherwise package code has no seccomp filter.
+  are listed too. The same filters make the ioctls that create btrfs
+  subvolumes and snapshots fail with `ENOTTY`, as on another filesystem:
+  `systemd-tmpfiles` creates `/var/lib/machines` and `/var/lib/portables`
+  as subvolumes if it can, and falls back to `mkdir`. A subvolume in the
+  image would make the diff fail, and the manifest can't describe one.
+  Rejected: reading a nested subvolume in the diff as a directory (it
+  would still be one in the image the code ran in). Otherwise package
+  code has no seccomp filter.
 - In that `/proc`, paths showing host-wide information are hidden
   (`bwrap::MASKED_PROC`): runc's default masked paths, plus files of mode
   0400 that root reads without capabilities (`kpage*`, `slabinfo`,
