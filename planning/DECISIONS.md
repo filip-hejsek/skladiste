@@ -28,10 +28,10 @@ are in BUGS.md.
   build`), which give the generic verbs to Arch; core verbs that
   dispatch to a frontend by the repo's format, premature with one
   frontend (and a build can't mix formats).
-- Code: `src/main.rs` has the global options and core commands,
-  `src/cli.rs` helpers shared by commands, `src/cli/<frontend>.rs` a
-  frontend's commands (under `cli/`, since `mod arch` in `main.rs` would
-  be the library's `src/arch.rs`). The CLI parses arguments, opens paths
+- Code: `src/main.rs` only starts a worker or the CLI, `src/cli.rs` has
+  the global options, core commands and helpers shared by commands,
+  `src/cli/<frontend>.rs` a frontend's commands (under `cli/`, since
+  `mod arch` in `main.rs` would be the library's `src/arch.rs`). The CLI parses arguments, opens paths
   and prints; what the commands do is in the library (e.g.
   `arch::packages`, `arch::repo`), which reports progress through a
   callback (`arch::packages::Event`) rather than printing. Package files
