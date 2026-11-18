@@ -639,7 +639,7 @@ mod tests {
         let store = Store::init_path(dir.path()).unwrap();
         let add = |name: &str, version: &str, depends: &[&str]| {
             let id = format!("{name} {version}");
-            let hash = store.add_object(&mut id.as_bytes()).unwrap().hash;
+            let hash = store.add_blob(&mut id.as_bytes()).unwrap().hash;
             let pkg = Package {
                 name: name.into(),
                 version: version.into(),

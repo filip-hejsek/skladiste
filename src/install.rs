@@ -402,7 +402,7 @@ impl Installer<'_> {
         let EntryKind::File(Content { hash, .. }) = &entry.kind else {
             unreachable!()
         };
-        let src = self.store.open_object(hash)?;
+        let src = self.store.open_blob(hash)?;
         let (parent, name) = self.parent(&entry.path)?;
         let dst = rustix::fs::openat(
             parent,

@@ -279,11 +279,11 @@ fn report(event: Event) {
             eprintln!("downloaded {repo}/{name} ({:.1} MiB)", mib(size));
         }
         Event::Imported { package, stats } => eprintln!(
-            "imported {} {}: {} files, {} new objects ({:.1} MiB)",
+            "imported {} {}: {} files, {} new blobs ({:.1} MiB)",
             package.name,
             package.version,
             stats.files,
-            stats.new_objects,
+            stats.new_blobs,
             mib(stats.new_bytes)
         ),
         Event::AlreadyImported(package) => {

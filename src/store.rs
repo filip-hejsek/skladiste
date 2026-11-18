@@ -1,9 +1,9 @@
-//! Content-addressed object store.
+//! Content-addressed blob store.
 //!
 //! Layout:
 //! - `skl-store.json` — the store manifest ([`StoreManifest`]): marks the
 //!   directory as a store and records the version of the store format
-//! - `objects/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
+//! - `blobs/ab/cdef…` — file contents, named by BLAKE3 hash, read-only
 //! - `packages/<repo>/<hash>.json` — imported package manifests, by repo
 //!   and the archive's hash (packages imported from files or URLs belong to
 //!   their format's pseudo-repo `@FORMAT/@local`, see [`repo::LOCAL`])
@@ -13,7 +13,7 @@
 //!   [`crate::repo`]); its format is the frontend's
 //! - `repos/<repo>/syncs/<time>.json` — a record of each version of the
 //!   repo's database that was fetched ([`SyncRecord`]); the database
-//!   itself is an object
+//!   itself is a blob
 //! - `tmp/` — staging area for files being written: unnamed
 //!   (`O_TMPFILE`) until complete and checked, except manifests
 //!
@@ -39,7 +39,7 @@ use rustix::io::Errno;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{Hash, ObjectId, Package};
+use crate::manifest::{BlobId, Hash, Package};
 use crate::repo::{self, SyncRecord};
 
 pub mod format;
@@ -60,11 +60,11 @@ pub struct Migrated {
     pub to: FormatVersion,
 }
 
-/// Result of adding one object.
+/// Result of adding one blob.
 pub struct Added {
     pub hash: Hash,
     pub size: u64,
-    /// False if an identical object was already present.
+    /// False if an identical blob was already present.
     pub new: bool,
 }
 
@@ -75,14 +75,14 @@ pub struct Added {
 /// returns no hash, so a sink in another process needn't wait for the
 /// receiver: the receiver hashes the content and resolves the returned ids
 /// (see [`Package::resolve`](crate::manifest::Package::resolve)).
-pub trait ObjectSink {
-    /// Add an object of `size` bytes; `content` must yield exactly that.
-    fn add_object(&mut self, size: u64, content: &mut dyn Read) -> Result<ObjectId>;
+pub trait BlobSink {
+    /// Add a blob of `size` bytes; `content` must yield exactly that.
+    fn add_blob(&mut self, size: u64, content: &mut dyn Read) -> Result<BlobId>;
 }
 
-impl<T: ObjectSink + ?Sized> ObjectSink for &mut T {
-    fn add_object(&mut self, size: u64, content: &mut dyn Read) -> Result<ObjectId> {
-        (**self).add_object(size, content)
+impl<T: BlobSink + ?Sized> BlobSink for &mut T {
+    fn add_blob(&mut self, size: u64, content: &mut dyn Read) -> Result<BlobId> {
+        (**self).add_blob(size, content)
     }
 }
 
@@ -159,7 +159,7 @@ impl StoreManifest {
 }
 
 /// The directories of a store, see the module documentation.
-const SUBDIRS: [&str; 5] = ["objects", "packages", "downloads", "repos", "tmp"];
+const SUBDIRS: [&str; 5] = ["blobs", "packages", "downloads", "repos", "tmp"];
 
 fn mkdir_exist_ok(dir: impl AsFd, path: &str) -> Result<(), Errno> {
     match rustix::fs::mkdirat(dir, path, Mode::from_raw_mode(0o755)) {
@@ -246,9 +246,9 @@ fn link_unnamed(fd: impl AsFd, dir: impl AsFd, dest: &str) -> Result<(), Errno> 
     rustix::fs::linkat(rustix::fs::CWD, &path, dir, dest, AtFlags::SYMLINK_FOLLOW)
 }
 
-fn object_name(hash: &Hash) -> String {
+fn blob_name(hash: &Hash) -> String {
     let hex = hash.to_string();
-    format!("objects/{}/{}", &hex[..2], &hex[2..])
+    format!("blobs/{}/{}", &hex[..2], &hex[2..])
 }
 
 /// `packages/<repo>/<hash>.json`.
@@ -385,27 +385,27 @@ impl Store {
         )
     }
 
-    /// Open an object for reading.
-    pub fn open_object(&self, hash: &Hash) -> Result<OwnedFd> {
-        let name = object_name(hash);
+    /// Open a blob for reading.
+    pub fn open_blob(&self, hash: &Hash) -> Result<OwnedFd> {
+        let name = blob_name(hash);
         self.openat(&name, OFlags::RDONLY, 0)
-            .with_context(|| format!("opening store object {name}"))
+            .with_context(|| format!("opening store blob {name}"))
     }
 
     /// Stream `content` into the store, returning its hash.
     /// Safe to call from several threads and processes at once: if the
-    /// same object is added concurrently, one of them adds it and the
+    /// same blob is added concurrently, one of them adds it and the
     /// others report it as already present.
-    pub fn add_object(&self, content: &mut dyn Read) -> Result<Added> {
+    pub fn add_blob(&self, content: &mut dyn Read) -> Result<Added> {
         let mut file = File::from(self.unnamed_file(0o600)?);
         let mut writer = HashingWriter {
             inner: &mut file,
             hasher: blake3::Hasher::new(),
         };
-        let size = io::copy(content, &mut writer).context("writing object")?;
+        let size = io::copy(content, &mut writer).context("writing blob")?;
         let hash: Hash = writer.hasher.finalize().into();
 
-        let dest = object_name(&hash);
+        let dest = blob_name(&hash);
         match rustix::fs::statat(&self.dir, &dest, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => {
                 return Ok(Added {
@@ -420,12 +420,12 @@ impl Store {
         rustix::fs::fchmod(&file, Mode::from_raw_mode(0o444))?;
         let (subdir, _) = dest.rsplit_once('/').unwrap();
         mkdir_exist_ok(&self.dir, subdir).with_context(|| format!("creating {subdir}"))?;
-        // Another thread or process may have added the same object since
+        // Another thread or process may have added the same blob since
         // the check above; linking never replaces it.
         let new = match self.link(&file, &dest) {
             Ok(()) => true,
             Err(Errno::EXIST) => false,
-            Err(e) => return Err(e).with_context(|| format!("linking object to {dest}")),
+            Err(e) => return Err(e).with_context(|| format!("linking blob to {dest}")),
         };
         Ok(Added { hash, size, new })
     }
@@ -774,12 +774,12 @@ mod tests {
         let manifest: StoreManifest = serde_json::from_slice(&manifest).unwrap();
         assert_eq!(manifest.version, format_version());
         // Missing parts of the layout are reported.
-        std::fs::remove_dir(root.join("objects")).unwrap();
+        std::fs::remove_dir(root.join("blobs")).unwrap();
         let e = not_a_store(Store::open_path(&root));
-        assert_eq!(e, NotAStore::NoSubdir("objects"));
+        assert_eq!(e, NotAStore::NoSubdir("blobs"));
         Store::init_path(&root).unwrap();
         std::fs::remove_dir(root.join("tmp")).unwrap();
-        std::os::unix::fs::symlink("objects", root.join("tmp")).unwrap();
+        std::os::unix::fs::symlink("blobs", root.join("tmp")).unwrap();
         let e = not_a_store(Store::open(File::open(&root).unwrap().into()));
         assert_eq!(e, NotAStore::NoSubdir("tmp"));
         // Setting up an existing store again fills in what's missing.
@@ -893,13 +893,13 @@ mod tests {
     fn objects_are_linked_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::init_path(dir.path()).unwrap();
-        let a = store.add_object(&mut &b"hello"[..]).unwrap();
+        let a = store.add_blob(&mut &b"hello"[..]).unwrap();
         assert!(a.new);
         assert_eq!(a.size, 5);
-        let b = store.add_object(&mut &b"hello"[..]).unwrap();
+        let b = store.add_blob(&mut &b"hello"[..]).unwrap();
         assert!(!b.new);
         assert_eq!(a.hash, b.hash);
-        let path = dir.path().join(object_name(&a.hash));
+        let path = dir.path().join(blob_name(&a.hash));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o444);
@@ -910,7 +910,7 @@ mod tests {
     fn packages_by_repo() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::init_path(dir.path()).unwrap();
-        let hash = store.add_object(&mut &b"archive"[..]).unwrap().hash;
+        let hash = store.add_blob(&mut &b"archive"[..]).unwrap().hash;
         let pkg = |version: &str| Package {
             name: "a".into(),
             version: version.into(),
@@ -959,7 +959,7 @@ mod tests {
 
         assert_eq!(store.latest_sync("@arch/a").unwrap(), None);
         let record = |fetched: &str| SyncRecord {
-            hash: store.add_object(&mut fetched.as_bytes()).unwrap().hash,
+            hash: store.add_blob(&mut fetched.as_bytes()).unwrap().hash,
             size: 1,
             url: "http://x/a.db".into(),
             fetched: fetched.into(),

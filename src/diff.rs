@@ -14,7 +14,7 @@
 //!
 //! [`diff`] reads the image's contents, which are untrusted after package
 //! code ran there, so `skl` runs it in a worker that only reads both trees
-//! and streams new file contents to an [`ObjectSink`], like an import
+//! and streams new file contents to an [`BlobSink`], like an import
 //! ([`diff_in_worker`]). The supervisor [validates](validate) the result.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -29,16 +29,16 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{Content, Entry, EntryKind, ObjectId, XattrValue, is_normal_path};
+use crate::manifest::{BlobId, Content, Entry, EntryKind, XattrValue, is_normal_path};
 use crate::sandbox::{self, Policy};
-use crate::store::{ObjectSink, Store};
+use crate::store::{BlobSink, Store};
 use crate::worker::{self, Args, Caps, ImportStats, Kind, RemoteSink, Workers};
 
 /// The worker that compares trees: fd 0 is unused, fd 1 a socket, and the
 /// tree before (a snapshot) and after are bound read-only at `/old` and
 /// `/new`. It compares them with [`diff`] and streams the new contents to
 /// the supervisor like an import; `DONE` holds the changes, which refer to
-/// objects by position. Read access to both trees, no ioctls.
+/// blobs by position. Read access to both trees, no ioctls.
 pub(crate) const DIFF_WORKER: Kind = Kind {
     name: "diff",
     dirs: &[
@@ -88,12 +88,12 @@ pub fn diff_in_worker(
     let null = File::open("/dev/null").context("opening /dev/null")?;
     let w = workers.spawn(&DIFF_WORKER, null.into(), theirs, &[old, new], &[])?;
     let mut conn = worker::receiver(ours)?;
-    let result = worker::receive_objects(store, &mut conn).and_then(|(objects, json, stats)| {
-        let changes: Vec<Change<ObjectId>> =
+    let result = worker::receive_blobs(store, &mut conn).and_then(|(blobs, json, stats)| {
+        let changes: Vec<Change<BlobId>> =
             serde_json::from_slice(&json).context("parsing changes from worker")?;
         let changes = changes
             .into_iter()
-            .map(|c| c.resolve(&objects))
+            .map(|c| c.resolve(&blobs))
             .collect::<Result<Vec<_>>>()?;
         validate(&changes)?;
         Ok((changes, stats))
@@ -152,13 +152,13 @@ impl<F> Change<F> {
     }
 }
 
-impl Change<ObjectId> {
-    /// Replace object ids with the content they refer to; see
+impl Change<BlobId> {
+    /// Replace blob ids with the content they refer to; see
     /// [`Entry::resolve`].
-    pub fn resolve(self, objects: &[Content]) -> Result<Change> {
+    pub fn resolve(self, blobs: &[Content]) -> Result<Change> {
         Ok(match self {
-            Change::Added(e) => Change::Added(e.resolve(objects)?),
-            Change::Modified(e) => Change::Modified(e.resolve(objects)?),
+            Change::Added(e) => Change::Added(e.resolve(blobs)?),
+            Change::Modified(e) => Change::Modified(e.resolve(blobs)?),
             Change::Removed(path) => Change::Removed(path),
         })
     }
@@ -195,22 +195,18 @@ pub fn validate<F>(changes: &[Change<F>]) -> Result<()> {
 /// changed copy of `old`, e.g. a snapshot) and return the changes in
 /// path order (removals of a directory's entries after its other
 /// changes). The contents of added and modified files are added to
-/// `objects`. Hard links are reported as a file entry for the first path
+/// `blobs`. Hard links are reported as a file entry for the first path
 /// and hard link entries for the others. Symlinks aren't followed.
 ///
 /// Fails on file types the manifest can't describe (devices, FIFOs,
 /// sockets), on paths that aren't UTF-8, and on mount points or nested
 /// subvolumes in `new`. Changes to the root directory itself are not
 /// reported.
-pub fn diff(
-    old: OwnedFd,
-    new: OwnedFd,
-    objects: &mut impl ObjectSink,
-) -> Result<Vec<Change<ObjectId>>> {
+pub fn diff(old: OwnedFd, new: OwnedFd, blobs: &mut impl BlobSink) -> Result<Vec<Change<BlobId>>> {
     let old_root = rustix::fs::fstat(&old).context("stat")?;
     let new_root = rustix::fs::fstat(&new).context("stat")?;
     let mut walk = Walk {
-        objects,
+        blobs,
         changes: Vec::new(),
         links: HashMap::new(),
         old_dev: old_root.st_dev,
@@ -222,8 +218,8 @@ pub fn diff(
 }
 
 struct Walk<'a, S> {
-    objects: &'a mut S,
-    changes: Vec<Change<ObjectId>>,
+    blobs: &'a mut S,
+    changes: Vec<Change<BlobId>>,
     /// Inode numbers of the files with more than one link reported so far,
     /// and their first path.
     links: HashMap<u64, String>,
@@ -243,7 +239,7 @@ fn is_dir(stat: &Stat) -> bool {
     FileType::from_raw_mode(stat.st_mode) == FileType::Directory
 }
 
-impl<S: ObjectSink> Walk<'_, S> {
+impl<S: BlobSink> Walk<'_, S> {
     /// Compare the directory `new` at `path` with `old` (the directory at
     /// the same path before, if there was one). `changed`: whether
     /// entries may have been added or removed in it.
@@ -304,14 +300,14 @@ impl<S: ObjectSink> Walk<'_, S> {
     }
 
     /// The entry for `name` in `dir`, with the content of a file added to
-    /// the object sink.
+    /// the blob sink.
     fn entry(
         &mut self,
         dir: BorrowedFd,
         name: &OsStr,
         path: &str,
         stat: &Stat,
-    ) -> Result<Entry<ObjectId>> {
+    ) -> Result<Entry<BlobId>> {
         let mut xattrs = BTreeMap::new();
         let kind = match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory => {
@@ -332,11 +328,11 @@ impl<S: ObjectSink> Walk<'_, S> {
                     ensure!(opened.st_ino == stat.st_ino, "replaced while reading");
                     xattrs = read_xattrs(&fd)?;
                     let size = opened.st_size as u64;
-                    let object = self.objects.add_object(size, &mut File::from(fd))?;
+                    let blob = self.blobs.add_blob(size, &mut File::from(fd))?;
                     if stat.st_nlink > 1 {
                         self.links.insert(stat.st_ino, path.to_owned());
                     }
-                    EntryKind::File(object)
+                    EntryKind::File(blob)
                 }
             }
             FileType::Symlink => {
@@ -426,7 +422,7 @@ fn read_xattrs(fd: &OwnedFd) -> Result<BTreeMap<String, XattrValue>> {
 mod tests {
     use super::*;
 
-    fn entry(path: &str, kind: EntryKind<ObjectId>) -> Entry<ObjectId> {
+    fn entry(path: &str, kind: EntryKind<BlobId>) -> Entry<BlobId> {
         Entry {
             path: path.into(),
             kind,
@@ -440,7 +436,7 @@ mod tests {
 
     #[test]
     fn validate_changes() {
-        let file = |p| Change::Added(entry(p, EntryKind::File(ObjectId { object: 0 })));
+        let file = |p| Change::Added(entry(p, EntryKind::File(BlobId { blob: 0 })));
         let link = |p, t: &str| {
             Change::Added(entry(
                 p,

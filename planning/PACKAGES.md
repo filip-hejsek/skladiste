@@ -14,13 +14,11 @@ questions are at the end.
 
 ## Blobs and objects
 
-- The store has two kinds of content. Blobs are file contents, as the
-  store's objects are now. Objects are skl's own records (manifests,
-  image records, sync records), which refer to blobs and other objects.
-  Both are read-only and addressed by hash, in directories of their own
-  (`blobs/ab/cdef…`, `objects/ab/cdef…`). Implementing this renames
-  what the code calls objects now to blobs: the `objects/` directory,
-  `Store::add_object`, `ObjectSink`, `ObjectId`.
+- The store has two kinds of content. Blobs are file contents
+  (`Store::add_blob`, `BlobSink`, `BlobId`). Objects are skl's own
+  records (manifests, image records, sync records), which refer to
+  blobs and other objects. Both are read-only and addressed by hash, in
+  directories of their own (`blobs/ab/cdef…`, `objects/ab/cdef…`).
 - An object is a header followed by a body. The header lists
   everything the object refers to, one per line, after a first line
   with the format, the hash algorithm and the count:

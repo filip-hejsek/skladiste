@@ -333,7 +333,7 @@ pub fn db_record(
     downloaded: Downloaded,
 ) -> Result<SyncRecord> {
     let fetched = repo::timestamp(SystemTime::now());
-    let added = store.add_object(&mut data)?;
+    let added = store.add_blob(&mut data)?;
     Ok(SyncRecord {
         hash: added.hash,
         size: added.size,
@@ -356,7 +356,7 @@ pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<Syn
 /// Load the database that `record` refers to from the store, and read it
 /// in a worker.
 pub fn load_db(workers: &Workers, store: &Store, record: &SyncRecord) -> Result<Vec<DbEntry>> {
-    let db = File::from(store.open_object(&record.hash)?);
+    let db = File::from(store.open_blob(&record.hash)?);
     read_db_in_worker(workers, db).with_context(|| format!("reading database from {}", record.url))
 }
 

@@ -3,7 +3,7 @@
 //! Install scriptlets (`.INSTALL`), `.MTREE` and `.BUILDINFO` are ignored for now.
 //!
 //! The archive is untrusted input, so [`import`] touches nothing but the
-//! stream it reads and the [`ObjectSink`] it writes to; `skl` runs it in a
+//! stream it reads and the [`BlobSink`] it writes to; `skl` runs it in a
 //! sandboxed worker process with [`import_in_worker`].
 
 use std::collections::BTreeMap;
@@ -14,9 +14,9 @@ use std::os::fd::FromRawFd;
 use anyhow::{Context, Result, bail};
 use tar::EntryType;
 
-use crate::manifest::{Entry, EntryKind, ObjectId, Package, XattrValue, normalize_path};
+use crate::manifest::{BlobId, Entry, EntryKind, Package, XattrValue, normalize_path};
 use crate::sandbox::{self, Policy};
-use crate::store::{ObjectSink, Store};
+use crate::store::{BlobSink, Store};
 use crate::worker::{self, Args, ImportStats, Kind, NO_CAPS, RemoteSink, Workers};
 
 pub mod packages;
@@ -32,7 +32,7 @@ const IMPORT_MAX_MEMORY: u64 = 1 << 30;
 
 /// The worker that imports a package archive: fd 0 is the archive, fd 1 a
 /// socket. It parses the archive with [`import`] and streams each file's
-/// content to the supervisor, which stores and hashes the objects as they
+/// content to the supervisor, which stores and hashes the blobs as they
 /// arrive; `DONE` holds the manifest. Data flows only from the worker: it
 /// never waits for the supervisor. No filesystem access, no ioctls.
 pub(crate) const IMPORT_WORKER: Kind = Kind {
@@ -52,10 +52,10 @@ pub fn import_in_worker(
     let (ours, theirs) = worker::stream_socket()?;
     let w = workers.spawn(&IMPORT_WORKER, archive.into(), theirs, &[], &[])?;
     let mut conn = worker::receiver(ours)?;
-    let result = worker::receive_objects(store, &mut conn).and_then(|(objects, json, stats)| {
-        let pkg: Package<ObjectId> =
+    let result = worker::receive_blobs(store, &mut conn).and_then(|(blobs, json, stats)| {
+        let pkg: Package<BlobId> =
             serde_json::from_slice(&json).context("parsing manifest from worker")?;
-        let pkg = pkg.resolve(&objects)?;
+        let pkg = pkg.resolve(&blobs)?;
         pkg.validate()?;
         Ok((pkg, stats))
     });
@@ -76,8 +76,8 @@ fn import_main(args: Args) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&pkg)?)
 }
 
-/// Read a package archive, adding file contents to `objects`.
-pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Package<ObjectId>> {
+/// Read a package archive, adding file contents to `blobs`.
+pub fn import(archive: impl Read, mut blobs: impl BlobSink) -> Result<Package<BlobId>> {
     let decoder = open_decoder(BufReader::new(archive))?;
     let mut archive = tar::Archive::new(decoder);
 
@@ -117,7 +117,7 @@ pub fn import(archive: impl Read, mut objects: impl ObjectSink) -> Result<Packag
             EntryType::Directory => EntryKind::Dir,
             EntryType::Regular | EntryType::Continuous => {
                 let size = tar_entry.size();
-                EntryKind::File(objects.add_object(size, &mut tar_entry)?)
+                EntryKind::File(blobs.add_blob(size, &mut tar_entry)?)
             }
             EntryType::Symlink => EntryKind::Symlink {
                 target: link_name(&tar_entry, &path)?,

@@ -41,15 +41,15 @@ are in BUGS.md.
 
 ## Store
 
-- Objects are addressed by the BLAKE3 hash of their content: a modern
+- Blobs are addressed by the BLAKE3 hash of their content: a modern
   hash function considered secure. There was no strong preference over
   SHA-256.
 - Rejected for now: the fs-verity digest as the content address. fs-verity
   is left for later, so there's no need to tie the store to it now.
-- Layout: `objects/ab/cdef…` (read-only, mode 0444),
+- Layout: `blobs/ab/cdef…` (read-only, mode 0444),
   `packages/<repo>/<hash>.json` for imported manifests,
   `downloads/<repo>/` for downloaded packages, `repos/<repo>/` for repos
-  (see Repos), `tmp/` for objects and manifests being written.
+  (see Repos), `tmp/` for blobs and manifests being written.
 - A store is set up explicitly (`skl init`, `Store::init`); other
   commands only open an existing one and fail if it has no store
   manifest or a directory of the layout is missing, so a mistyped
@@ -91,15 +91,15 @@ are in BUGS.md.
     the directory is empty before reading the manifest, so a concurrent
     init can't make a directory look non-empty without one.
 
-  Objects are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
-  then linked into place unless an identical object already exists;
+  Blobs are written to an unnamed `O_TMPFILE` in `tmp/` while hashing,
+  then linked into place unless an identical blob already exists;
   linking fails if the name exists, so of concurrent adds of the same
-  object (threads or processes) exactly one counts it as new. The
-  existing object must be the one kept, with the new copy dropped:
+  blob (threads or processes) exactly one counts it as new. The
+  existing blob must be the one kept, with the new copy dropped:
   replacing it would leave images reflinked to the old extents, so the
-  same content would be stored twice. A future GC must not delete an
-  object between an add finding it present and the caller recording a
-  reference to it (e.g. by locking, or by sparing objects added during
+  same content would be stored twice. A future GC must not delete a
+  blob between an add finding it present and the caller recording a
+  reference to it (e.g. by locking, or by sparing blobs added during
   the GC). An unnamed file leaves nothing behind if skl is killed, and nobody can open it by
   name while it's written. Linking goes through `/proc/self/fd/N`
   (`AT_SYMLINK_FOLLOW`), since `AT_EMPTY_PATH` needs
@@ -108,7 +108,7 @@ are in BUGS.md.
   renamed over any earlier one, which linking can't do.
 - An imported package is identified by its repo and the BLAKE3 hash of
   its archive file (`<repo>/<hash>`), so re-importing the same file is
-  skipped. Objects are shared, so a package in two repos costs only its
+  skipped. Blobs are shared, so a package in two repos costs only its
   manifest twice. Packages imported from paths or URLs belong to their
   format's pseudo-repo `@local` (`@arch/@local`).
 - Manifests are JSON; hashes and xattr values are hex strings.
@@ -151,7 +151,7 @@ are in BUGS.md.
 - `skl arch sync` downloads each repo's database with the download stage
   (see Downloads; at most 64 MiB, held in memory) and keeps every
   version: the database
-  as a store object, and a record `repos/<repo>/syncs/<time>.json` with
+  as a store blob, and a record `repos/<repo>/syncs/<time>.json` with
   its hash, size, URL, the fetch time (supervisor's clock, UTC with
   microseconds; fixed width, so the names sort by time) and the server's
   `Last-Modified` and `ETag` (sent by the worker, so untrusted: at most
@@ -543,7 +543,7 @@ are in BUGS.md.
   new user namespace, where it covers only files whose owner and group
   are skl's. It streams contents as the import worker does; the
   supervisor validates the changes (normal paths, each once, hard links
-  only to a file changed earlier). New contents become store objects,
+  only to a file changed earlier). New contents become store blobs,
   not yet referenced by any manifest.
 - The snapshot is removed with `BTRFS_IOC_SNAP_DESTROY` (2 ms), which
   needs `CAP_SYS_ADMIN` or, for a user who can write to the subvolume's
@@ -564,7 +564,7 @@ are in BUGS.md.
   Sandboxing section of TODO.md for what isn't done yet.
 - Library code works on file descriptors, not paths: `Store` holds a
   directory fd, frontends read from a `Read` and write file contents to
-  an `ObjectSink`, and the installer uses only the store fd and the
+  an `BlobSink`, and the installer uses only the store fd and the
   image root fd. Only the CLI opens paths. Exceptions:
   `Store::init_path` and `Store::open_path`, conveniences for the CLI
   and tests that open the directory and call `Store::init` or
@@ -665,13 +665,13 @@ are in BUGS.md.
   filesystem access and no ioctls. It streams file contents to the
   supervisor without waiting for anything: data flows only from the
   worker (the supervisor shuts down its sending side), so neither side
-  can block the other. Each object is `BEGIN` with its size, then
+  can block the other. Each blob is `BEGIN` with its size, then
   `CHUNK`s of exactly that many bytes; an `ERROR` can come between
   chunks, e.g. when the archive is corrupt in the middle of a file.
-  The supervisor writes and hashes the objects as they arrive.
-- Frontends get no hashes: `ObjectSink::add_object` returns an
-  `ObjectId`, the object's position in the stream, and the manifest
-  (`Package<ObjectId>`) refers to files by id. The supervisor resolves
+  The supervisor writes and hashes the blobs as they arrive.
+- Frontends get no hashes: `BlobSink::add_blob` returns a
+  `BlobId`, the blob's position in the stream, and the manifest
+  (`Package<BlobId>`) refers to files by id. The supervisor resolves
   ids to hash and size (`Package::resolve`), validates the result
   (`Package::validate`) and counts the import statistics itself. Ids are
   explicit rather than implied by the order of file entries, so formats
@@ -683,7 +683,7 @@ are in BUGS.md.
   files of a package cost few system calls; chunks of 64 KiB bypass the
   buffer. The final `DONE` or `ERROR` goes through the same buffer, so
   it can't overtake earlier messages. Not done: a 64 KiB copy buffer in
-  `Store::add_object` instead of `io::copy`'s 8 KiB (0.75 s instead of
+  `Store::add_blob` instead of `io::copy`'s 8 KiB (0.75 s instead of
   0.77 s, close to noise).
 - File contents stay in the import socket; avoiding the copy isn't worth
   it. Importing 17 Arch packages (8,300 files, 185 MiB; 140 MiB in files

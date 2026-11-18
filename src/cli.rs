@@ -241,8 +241,8 @@ fn run_in_image(
     }
     let stats = &captured.stats;
     eprintln!(
-        "{added} added, {modified} modified, {removed} removed; {} new objects ({:.1} MiB)",
-        stats.new_objects,
+        "{added} added, {modified} modified, {removed} removed; {} new blobs ({:.1} MiB)",
+        stats.new_blobs,
         mib(stats.new_bytes)
     );
     if captured.snapshot_removal == btrfs::Removal::EntryByEntry {

@@ -137,7 +137,7 @@ fn build_image() {
     let (tools, stats) =
         arch::import_in_worker(&workers(), &store, File::open(&tools).unwrap()).unwrap();
     assert_eq!(stats.files, 4);
-    assert_eq!(stats.new_objects, 3, "identical files share one object");
+    assert_eq!(stats.new_blobs, 3, "identical files share one blob");
 
     let img = tmp.path().join("img");
     let report = build(&store, &[base, tools], &img).unwrap();
@@ -191,7 +191,7 @@ fn worker_errors_are_reported() {
 }
 
 #[test]
-fn concurrent_imports_share_objects() {
+fn concurrent_imports_share_blobs() {
     let Some(tmp) = btrfs_tempdir() else { return };
     let store = Store::init_path(&tmp.path().join("store")).unwrap();
     let files: Vec<Vec<u8>> = (0..200u32).map(|i| i.to_le_bytes().repeat(100)).collect();
@@ -215,12 +215,12 @@ fn concurrent_imports_share_objects() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut new_objects = 0;
+    let mut new_blobs = 0;
     for r in results {
         let (pkg, stats) = r.unwrap();
         assert_eq!(pkg.entries.len(), 200);
         assert_eq!(stats.files, 200);
-        new_objects += stats.new_objects;
+        new_blobs += stats.new_blobs;
     }
-    assert_eq!(new_objects, 200, "each object is new for one import only");
+    assert_eq!(new_blobs, 200, "each blob is new for one import only");
 }

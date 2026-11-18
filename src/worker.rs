@@ -38,9 +38,9 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::bwrap::{self, Mount, Namespaces};
 use crate::http::RootCerts;
-use crate::manifest::{Content, ObjectId};
+use crate::manifest::{BlobId, Content};
 use crate::sandbox::Layers;
-use crate::store::{ObjectSink, Store};
+use crate::store::{BlobSink, Store};
 use crate::{arch, diff, download, install};
 
 /// First argument that makes `skl` run as a worker. `main` must check for
@@ -146,7 +146,7 @@ pub(crate) const NO_CAPS: Caps = Caps {
 #[derive(Debug, Default)]
 pub struct ImportStats {
     pub files: u64,
-    pub new_objects: u64,
+    pub new_blobs: u64,
     pub new_bytes: u64,
 }
 
@@ -566,47 +566,47 @@ pub(crate) fn receiver(ours: OwnedFd) -> Result<BufReader<File>> {
     Ok(BufReader::with_capacity(BUF_SIZE, File::from(ours)))
 }
 
-/// Supervisor side of a [`RemoteSink`]: add the objects a worker streams
+/// Supervisor side of a [`RemoteSink`]: add the blobs a worker streams
 /// to `store` until its `DONE`. Returns
-/// the content of each object in the order received, the payload of
+/// the content of each blob in the order received, the payload of
 /// `DONE`, and statistics.
-pub(crate) fn receive_objects(
+pub(crate) fn receive_blobs(
     store: &Store,
     conn: &mut BufReader<File>,
 ) -> Result<(Vec<Content>, Vec<u8>, ImportStats)> {
     let mut stats = ImportStats::default();
-    // Content of each object, in the order received.
-    let mut objects: Vec<Content> = Vec::new();
+    // Content of each blob, in the order received.
+    let mut blobs: Vec<Content> = Vec::new();
     loop {
         let (tag, len) = read_header(&mut *conn).context("reading from worker")?;
         match tag {
             BEGIN if len == 8 => {
                 let mut size = [0u8; 8];
                 conn.read_exact(&mut size).context("reading from worker")?;
-                let mut reader = ObjectReader {
+                let mut reader = BlobReader {
                     conn: &mut *conn,
                     left: u64::from_le_bytes(size),
                     remaining: 0,
                     error: None,
                 };
-                let added = store.add_object(&mut reader);
+                let added = store.add_blob(&mut reader);
                 if let Some(e) = reader.error {
                     return Err(e.into());
                 }
                 let added = added?;
                 stats.files += 1;
                 if added.new {
-                    stats.new_objects += 1;
+                    stats.new_blobs += 1;
                     stats.new_bytes += added.size;
                 }
-                objects.push(Content {
+                blobs.push(Content {
                     hash: added.hash,
                     size: added.size,
                 });
             }
             DONE => {
                 let json = read_payload(&mut *conn, len, MAX_DONE)?;
-                return Ok((objects, json, stats));
+                return Ok((blobs, json, stats));
             }
             ERROR => return Err(read_error(conn, len)),
             _ => bail!("unexpected message {tag} from worker"),
@@ -614,18 +614,18 @@ pub(crate) fn receive_objects(
     }
 }
 
-/// Reads one object's content from `CHUNK` frames, up to its size.
-struct ObjectReader<'a> {
+/// Reads one blob's content from `CHUNK` frames, up to its size.
+struct BlobReader<'a> {
     conn: &'a mut BufReader<File>,
-    /// Bytes of the object not yet read.
+    /// Bytes of the blob not yet read.
     left: u64,
     /// Bytes left in the current chunk.
     remaining: usize,
-    /// An error the worker reported instead of finishing the object.
+    /// An error the worker reported instead of finishing the blob.
     error: Option<WorkerError>,
 }
 
-impl Read for ObjectReader<'_> {
+impl Read for BlobReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while self.remaining == 0 {
             if self.left == 0 {
@@ -775,16 +775,16 @@ fn close_other_fds(keep: &[RawFd]) -> Result<()> {
     close(first, u32::MAX)
 }
 
-/// Worker side of streaming objects: sends contents to the supervisor
+/// Worker side of streaming blobs: sends contents to the supervisor
 /// (`BEGIN` with the size, then `CHUNK`s with exactly that many bytes), which
-/// stores and hashes them as they arrive ([`receive_objects`]). Results
-/// refer to objects by their position in the stream ([`ObjectId`]), and the
+/// stores and hashes them as they arrive ([`receive_blobs`]). Results
+/// refer to blobs by their position in the stream ([`BlobId`]), and the
 /// supervisor fills in the hashes, so a compromised worker can't put content
 /// under the wrong hash.
 pub(crate) struct RemoteSink<'a> {
     conn: &'a mut BufWriter<File>,
     buf: Vec<u8>,
-    /// Id of the next object.
+    /// Id of the next blob.
     next: u64,
 }
 
@@ -798,8 +798,8 @@ impl<'a> RemoteSink<'a> {
     }
 }
 
-impl ObjectSink for RemoteSink<'_> {
-    fn add_object(&mut self, size: u64, content: &mut dyn Read) -> Result<ObjectId> {
+impl BlobSink for RemoteSink<'_> {
+    fn add_blob(&mut self, size: u64, content: &mut dyn Read) -> Result<BlobId> {
         write_frame(self.conn, BEGIN, &size.to_le_bytes())?;
         let mut left = size;
         loop {
@@ -815,7 +815,7 @@ impl ObjectSink for RemoteSink<'_> {
             write_frame(self.conn, CHUNK, &self.buf[..n])?;
         }
         anyhow::ensure!(left == 0, "content is shorter than its size");
-        let id = ObjectId { object: self.next };
+        let id = BlobId { blob: self.next };
         self.next += 1;
         Ok(id)
     }

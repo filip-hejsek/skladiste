@@ -10,7 +10,7 @@ use std::str::FromStr;
 use anyhow::Context as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// BLAKE3 hash of a file's content; the address of an object in the store.
+/// BLAKE3 hash of a file's content; the address of a blob in the store.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hash(pub [u8; 32]);
 
@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for Hash {
 /// A package as the core sees it: identity plus a list of filesystem entries.
 ///
 /// `F` is what file entries refer to: [`Content`] in the store, or
-/// [`ObjectId`] in a manifest that a frontend produced, before the
+/// [`BlobId`] in a manifest that a frontend produced, before the
 /// supervisor [resolves](Package::resolve) it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package<F = Content> {
@@ -82,22 +82,22 @@ pub struct Content {
     pub size: u64,
 }
 
-/// A file's content as a frontend refers to it: the position of the object
-/// among those it sent to its [`ObjectSink`](crate::store::ObjectSink),
+/// A file's content as a frontend refers to it: the position of the blob
+/// among those it sent to its [`BlobSink`](crate::store::BlobSink),
 /// counting from 0. Only the receiving side knows the hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectId {
-    pub object: u64,
+pub struct BlobId {
+    pub blob: u64,
 }
 
-impl Package<ObjectId> {
-    /// Replace object ids with the content they refer to; `objects` holds
-    /// the content of each object in the order they were received.
-    pub fn resolve(self, objects: &[Content]) -> anyhow::Result<Package> {
+impl Package<BlobId> {
+    /// Replace blob ids with the content they refer to; `blobs` holds
+    /// the content of each blob in the order they were received.
+    pub fn resolve(self, blobs: &[Content]) -> anyhow::Result<Package> {
         let entries = self
             .entries
             .into_iter()
-            .map(|e| e.resolve(objects))
+            .map(|e| e.resolve(blobs))
             .collect::<anyhow::Result<_>>()?;
         Ok(Package {
             name: self.name,
@@ -110,17 +110,17 @@ impl Package<ObjectId> {
     }
 }
 
-impl Entry<ObjectId> {
-    /// Replace the object id of a file with its content, as
+impl Entry<BlobId> {
+    /// Replace the blob id of a file with its content, as
     /// [`Package::resolve`] does.
-    pub fn resolve(self, objects: &[Content]) -> anyhow::Result<Entry> {
+    pub fn resolve(self, blobs: &[Content]) -> anyhow::Result<Entry> {
         let kind = match self.kind {
-            EntryKind::File(ObjectId { object }) => EntryKind::File(
-                usize::try_from(object)
+            EntryKind::File(BlobId { blob }) => EntryKind::File(
+                usize::try_from(blob)
                     .ok()
-                    .and_then(|i| objects.get(i))
+                    .and_then(|i| blobs.get(i))
                     .copied()
-                    .with_context(|| format!("/{}: no object {object}", self.path))?,
+                    .with_context(|| format!("/{}: no blob {blob}", self.path))?,
             ),
             EntryKind::Dir => EntryKind::Dir,
             EntryKind::Symlink { target } => EntryKind::Symlink { target },
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn resolve_object_ids() {
-        let pkg = |object| Package {
+        let pkg = |blob| Package {
             name: "p".into(),
             version: "1".into(),
             depends: vec!["d".into()],
@@ -313,7 +313,7 @@ mod tests {
             conflicts: vec![],
             entries: vec![Entry {
                 path: "f".into(),
-                kind: EntryKind::File(ObjectId { object }),
+                kind: EntryKind::File(BlobId { blob }),
                 mode: 0o644,
                 uid: 0,
                 gid: 0,

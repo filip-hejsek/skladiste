@@ -103,11 +103,11 @@ scripts and hooks on top of them.
 - Garbage collection of file contents no package or sync record
   references, and of old repo database snapshots; with blobs and
   objects (PACKAGES.md) it reads only objects' headers. Must not race
-  with `add_object` finding an object already present (see DECISIONS.md, store layout).
+  with `add_blob` finding a blob already present (see DECISIONS.md, store layout).
 - Detect modified files cheaply by comparing extents (FIEMAP) with the
-  store object; on a mismatch, rehash instead of reporting a
+  store blob; on a mismatch, rehash instead of reporting a
   modification, since defrag also breaks sharing.
-- Later: fs-verity on store objects to make them immutable and
+- Later: fs-verity on store blobs to make them immutable and
   tamper-evident. Needs a check that `FICLONE` from an fs-verity file
   is allowed. The fs-verity digest is a Merkle tree root, not a hash of
   the plain content, so it would be stored next to the BLAKE3 address.

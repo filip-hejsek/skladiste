@@ -114,8 +114,8 @@ fn captures_changes() {
     let EntryKind::File(content) = entry("etc/new").kind else {
         panic!("not a file");
     };
-    let object = store.open_object(&content.hash).unwrap();
-    assert_eq!(std::io::read_to_string(File::from(object)).unwrap(), "new");
+    let blob = store.open_blob(&content.hash).unwrap();
+    assert_eq!(std::io::read_to_string(File::from(blob)).unwrap(), "new");
     assert_eq!(
         entry("etc/new").xattrs.get("user.test"),
         Some(&XattrValue(b"v".to_vec()))
@@ -136,7 +136,7 @@ fn captures_changes() {
     // Contents of the files changed, new to the store: "new", "after" and
     // "before" (chmodded and renamed2).
     assert_eq!(captured.stats.files, 4);
-    assert_eq!(captured.stats.new_objects, 3);
+    assert_eq!(captured.stats.new_blobs, 3);
     // The snapshot is gone.
     assert_eq!(
         fs::read_dir(dir.path().join("store/tmp")).unwrap().count(),

@@ -84,10 +84,10 @@ pub fn check_name(name: &str) -> Result<()> {
 
 /// One fetched version of a repo's database (a snapshot), kept as
 /// `repos/<repo>/syncs/<fetched>.json`. The database itself is a store
-/// object.
+/// blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRecord {
-    /// The database's store object.
+    /// The database's store blob.
     pub hash: Hash,
     pub size: u64,
     /// Where it was downloaded from.
