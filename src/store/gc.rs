@@ -346,6 +346,7 @@ mod tests {
             fetched: fetched.to_owned(),
             last_modified: None,
             etag: None,
+            validator: None,
         };
         store.save_sync("@arch/core", &record).unwrap();
     }

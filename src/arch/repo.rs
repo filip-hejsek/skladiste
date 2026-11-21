@@ -113,18 +113,22 @@ pub fn list(store: &Store) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// A repo's new version, recorded by [`sync`].
+/// A repo after [`sync`].
 pub struct Synced {
     /// The repo's id.
     pub repo: String,
+    /// Its latest record: the one just written, or the one before if the
+    /// database didn't change.
     pub record: SyncRecord,
-    /// Number of packages in the database.
-    pub packages: usize,
+    /// Number of packages in the database, if it is a new version.
+    pub packages: Option<usize>,
 }
 
 /// Download the databases of the repos with ids `repos` (all Arch repos if
 /// empty), up to `jobs` at once, and record the new versions once all of
-/// them were downloaded and read. Returns them in the order of `repos`.
+/// them were downloaded and read. A database that the server still has
+/// as last synced isn't downloaded again, and gets no new record. Returns
+/// the repos in the order of `repos`.
 pub fn sync(
     workers: &Workers,
     store: &Store,
@@ -139,11 +143,14 @@ pub fn sync(
     if repos.is_empty() {
         bail!("no repos (add one with `skl arch repo add`)");
     }
-    let configs = repos
-        .iter()
-        .map(|name| store.repo_config(name))
-        .collect::<Result<Vec<Config>>>()?;
-    let requests = configs.iter().map(db_request).collect::<Result<Vec<_>>>()?;
+    let mut latest = Vec::new();
+    let mut requests = Vec::new();
+    for name in &repos {
+        let config: Config = store.repo_config(name)?;
+        let record = store.latest_sync(name)?;
+        requests.push(db_request(&config, record.as_ref())?);
+        latest.push(record);
+    }
     let urls: Vec<Url> = requests.iter().map(|r| r.url.clone()).collect();
     let mut synced = download::fetch_and_run(
         workers,
@@ -151,19 +158,37 @@ pub fn sync(
         Vec::new(),
         requests,
         |i, data, downloaded| {
+            if downloaded.not_modified {
+                return Ok(Some((i, None)));
+            }
             let record = db_record(store, &urls[i], &data, downloaded)?;
-            Ok(Some((i, record)))
+            Ok(Some((i, Some(record))))
         },
         |(i, record)| {
+            let Some(record) = record else {
+                return Ok((i, None));
+            };
             let entries = load_db(workers, store, &record)?;
-            Ok((i, record, entries.len()))
+            Ok((i, Some((record, entries.len()))))
         },
     )?;
-    synced.sort_by_key(|&(i, ..)| i);
+    synced.sort_by_key(|&(i, _)| i);
     synced
         .into_iter()
-        .map(|(i, record, packages)| {
-            store.save_sync(&repos[i], &record)?;
+        .map(|(i, new)| {
+            let (record, packages) = match new {
+                Some((record, packages)) => {
+                    store.save_sync(&repos[i], &record)?;
+                    (record, Some(packages))
+                }
+                None => {
+                    let record = latest[i].take();
+                    (
+                        record.context("server said that a database didn't change")?,
+                        None,
+                    )
+                }
+            };
             Ok(Synced {
                 repo: repos[i].clone(),
                 record,
@@ -316,12 +341,20 @@ fn check_dep_version(version: &str) -> Result<()> {
 
 /// A request for the database of the repo with `config`, to hold in
 /// memory. Databases aren't signed, so if one changes on the server while
-/// it is downloaded, the new one is as good.
-pub fn db_request(config: &Config) -> Result<Request<Vec<u8>>> {
+/// it is downloaded, the new one is as good. With `latest`, the repo's
+/// latest record, the database is downloaded only if the server has
+/// another version than that one, if the record is from the same URL and
+/// has a validator.
+pub fn db_request(config: &Config, latest: Option<&SyncRecord>) -> Result<Request<Vec<u8>>> {
+    let url = config.db_url()?;
+    let unless = latest
+        .filter(|record| record.url == url.to_string())
+        .and_then(|record| record.validator.clone());
     Ok(Request {
-        url: config.db_url()?,
+        url,
         max_size: MAX_DB_SIZE,
         restart_if_changed: true,
+        unless,
         sink: Vec::new(),
     })
 }
@@ -343,13 +376,14 @@ pub fn db_record(
         fetched,
         last_modified: downloaded.last_modified,
         etag: downloaded.etag,
+        validator: downloaded.validator,
     })
 }
 
 /// Download the database of the repo with `config` into the store, and
 /// return a record of it to save once it has been checked.
 pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<SyncRecord> {
-    let request = db_request(config)?;
+    let request = db_request(config, None)?;
     let (data, downloaded) =
         download::download(workers, &request.url, request.sink, request.max_size)?;
     db_record(store, &request.url, &data, downloaded)

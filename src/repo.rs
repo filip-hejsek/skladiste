@@ -101,6 +101,10 @@ pub struct SyncRecord {
     /// information only.
     pub last_modified: Option<String>,
     pub etag: Option<String>,
+    /// A value that only this version of the database has, if the server
+    /// gave one ([`crate::download::Downloaded::validator`]): the next
+    /// sync asks the same URL for the database only if it changed.
+    pub validator: Option<String>,
 }
 
 /// A sync record as an object's body stores it.
@@ -115,6 +119,8 @@ struct StoredSync {
     last_modified: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validator: Option<String>,
 }
 
 impl SyncRecord {
@@ -128,6 +134,7 @@ impl SyncRecord {
             fetched: self.fetched.clone(),
             last_modified: self.last_modified.clone(),
             etag: self.etag.clone(),
+            validator: self.validator.clone(),
         })?;
         Ok((refs, body))
     }
@@ -142,6 +149,7 @@ impl SyncRecord {
             fetched: s.fetched,
             last_modified: s.last_modified,
             etag: s.etag,
+            validator: s.validator,
         })
     }
 }

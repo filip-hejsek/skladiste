@@ -97,7 +97,8 @@ enum ArchCommand {
     ///
     /// Every version is kept; builds use the latest. Repos synced together
     /// get their new versions only once all of them were downloaded and
-    /// read.
+    /// read. A database that didn't change on the server since the last
+    /// sync isn't downloaded again.
     Sync {
         /// Repos to sync [default: all].
         repos: Vec<String>,
@@ -343,12 +344,17 @@ fn open_parent(path: &Path) -> Result<(OwnedFd, &OsStr)> {
 /// Sync the repos with ids `repos` (all if empty), see [`repo::sync`].
 fn sync(workers: &Workers, store: &Store, repos: Vec<String>, jobs: NonZeroUsize) -> Result<()> {
     for synced in repo::sync(workers, store, repos, jobs)? {
-        eprintln!(
-            "synced {}: {} packages ({:.1} MiB)",
-            synced.repo,
-            synced.packages,
-            mib(synced.record.size)
-        );
+        match synced.packages {
+            Some(packages) => eprintln!(
+                "synced {}: {packages} packages ({:.1} MiB)",
+                synced.repo,
+                mib(synced.record.size)
+            ),
+            None => eprintln!(
+                "{} is up to date (synced at {})",
+                synced.repo, synced.record.fetched
+            ),
+        }
     }
     Ok(())
 }

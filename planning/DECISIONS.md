@@ -195,8 +195,9 @@ are in BUGS.md.
   `repos/<repo>/syncs/<time>` holds, with its size, URL, the fetch time (supervisor's clock, UTC with
   microseconds; fixed width, so the names sort by time) and the server's
   `Last-Modified` and `ETag` (sent by the worker, so untrusted: at most
-  100 and 256 bytes, control characters escaped, for information only
-  until requests are conditional). The files with the ids are linked
+  100 and 256 bytes, control characters escaped, for information only)
+  and the response's validator, if it had one (see Downloads), for the
+  next sync. The files with the ids are linked
   into place from an unnamed file, so one is never replaced or seen
   half-written. Records of repos synced together are written only after
   all of them were downloaded. A repo's latest record is its current
@@ -224,8 +225,25 @@ are in BUGS.md.
   worker's start (`gzip -dc` alone takes 150 ms on the same machine).
   Encoding the signatures as hex with `write!` took 100 ms before it
   was replaced. Cache by database hash only if this matters.
-- No conditional requests yet: syncing core and extra (8.8 MiB) took
-  0.9 s, 1.35 s with reading them.
+- Conditional requests: a sync asks for a database only if the server
+  has another version than the latest record's, when that record is from
+  the same URL and has a validator. The validator is the one a broken
+  download is continued with (a strong `ETag`, or a `Last-Modified` at
+  least a second older than `Date`), sent as `If-None-Match` or
+  `If-Modified-Since`; a `304` ends the request without a body and keeps
+  the connection. A weak `ETag` isn't used: Apache, for one, makes it
+  weak when the file changed within the second, so it doesn't tell such
+  versions apart. An unchanged database gets no new record and isn't
+  read again (`skl arch sync` says it is up to date, with the latest
+  record's time), so records are the versions that were fetched. The
+  server is trusted as much as before: it could send the old database
+  again anyway. A continued download doesn't carry the condition, as a
+  new version was started already. Syncing core and extra (8.7 MiB) from
+  `geo.mirror.pkgbuild.com` took 3.5 s with reading them, then
+  0.28-0.35 s while they didn't change (before, every sync downloaded
+  them: 0.9 s, 1.35 s with reading them, on a faster link).
+  Rejected: a new record per check with the same blob (records would no
+  longer be the versions, and it means reading the database again).
 - The keyring is needed to import packages: by `import`, and by `build`
   when it uses packages from synced repos (their archives are verified
   again each time).
@@ -357,8 +375,8 @@ are in BUGS.md.
   to fail early when it is over the limit.
 - A worker lives as long as its connection. When the server closes it,
   or after a response that ends it (`Connection: close`, HTTP/1.0, a
-  body that runs until the close, or a status other than `200` and
-  `206`, whose body the worker doesn't read), the worker exits and the
+  body that runs until the close, or a status other than `200`, `206`
+  and `304`, whose body the worker doesn't read), the worker exits and the
   supervisor connects again and starts a new one for the files left. A
   worker start takes about 4 ms (bwrap, exec, Landlock and seccomp:
   4.0-4.6 ms for a 2-byte download from localhost, 3.7-3.9 ms for a
@@ -416,8 +434,8 @@ are in BUGS.md.
   either way.
 - HTTP/1.1 is written by hand on `httparse` for the response head:
   `Content-Length`, chunked or until close; `Accept-Encoding: identity`,
-  other encodings are rejected. Only `200` is accepted, and `206` for
-  a continuation; redirects are reported with their target and not
+  other encodings are rejected. Only `200` is accepted, `206` for
+  a continuation and `304` for a conditional request; redirects are reported with their target and not
   followed. A `408` counts as a connection that ended (some servers
   send it when they close an idle connection). Reads and writes time
   out after 30 s (`SO_RCVTIMEO`/`SO_SNDTIMEO` set by the supervisor,

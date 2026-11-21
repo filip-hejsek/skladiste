@@ -3,6 +3,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 use skladiste::arch::repo::{self, Config};
 use skladiste::store::Store;
@@ -113,4 +115,89 @@ fn sync_and_read() {
         repo::fetch_db(&workers, &store, &config).unwrap_err()
     );
     assert!(err.contains("404"), "{err}");
+}
+
+/// Serve one database, version by version as `current` holds them
+/// (`ETag`, content), honouring `If-None-Match`. Returns the base URL.
+fn serve_versions(current: Arc<Mutex<(String, Vec<u8>)>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let mut conn = conn.unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut unless = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("If-None-Match: ") {
+                    unless = Some(v.trim_end().to_owned());
+                }
+            }
+            let (etag, db) = current.lock().unwrap().clone();
+            let response = if unless.as_ref() == Some(&etag) {
+                format!("HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\n\r\n").into_bytes()
+            } else {
+                let mut r = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {etag}\r\n\r\n",
+                    db.len()
+                )
+                .into_bytes();
+                r.extend_from_slice(&db);
+                r
+            };
+            let _ = conn.write_all(&response);
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn sync_only_if_changed() {
+    let v1 = make_db(&[("glibc", "2.44-1")]);
+    let current = Arc::new(Mutex::new(("\"v1\"".to_owned(), v1)));
+    let base = serve_versions(current.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::init_path(tmp.path()).unwrap();
+    let workers = workers();
+    repo::add(&store, "main", &format!("{base}/$repo/$arch"), None).unwrap();
+    let id = "@arch/main".to_owned();
+    let sync = || {
+        let mut synced = repo::sync(&workers, &store, vec![id.clone()], NonZeroUsize::MIN).unwrap();
+        assert_eq!(synced.len(), 1);
+        let synced = synced.pop().unwrap();
+        assert_eq!(
+            store.latest_sync(&id).unwrap().as_ref(),
+            Some(&synced.record)
+        );
+        (synced.record, synced.packages)
+    };
+
+    let (first, packages) = sync();
+    assert_eq!(packages, Some(1));
+    assert_eq!(first.validator.as_deref(), Some("\"v1\""));
+    // Unchanged: no new record.
+    assert_eq!(sync(), (first.clone(), None));
+
+    let v2 = make_db(&[("glibc", "2.44-1"), ("bash", "5.3-1")]);
+    *current.lock().unwrap() = ("\"v2\"".to_owned(), v2);
+    let (second, packages) = sync();
+    assert_eq!(packages, Some(2));
+    assert_eq!(second.validator.as_deref(), Some("\"v2\""));
+    assert!(second.fetched > first.fetched);
+    assert_eq!(sync(), (second.clone(), None));
+
+    // A validator from another URL isn't sent.
+    let config = Config::new(&format!("{base}/$repo/$arch"), "main").unwrap();
+    let request = repo::db_request(&config, Some(&second)).unwrap();
+    assert_eq!(request.unless.as_deref(), Some("\"v2\""));
+    let elsewhere = skladiste::repo::SyncRecord {
+        url: "http://elsewhere/main/x86_64/main.db".to_owned(),
+        ..second
+    };
+    let request = repo::db_request(&config, Some(&elsewhere)).unwrap();
+    assert_eq!(request.unless, None);
 }

@@ -56,10 +56,12 @@ needed so far: the status mailbox.
   (keep-alive request limits, timeouts), the worker reports that as
   the result of the item in progress and exits. So it does after a
   response that ends the connection: one that says so, or one that
-  isn't a `200` or `206`, whose body the worker doesn't read. The
+  isn't a `200`, `206` or `304`, whose body the worker doesn't read. The
   supervisor connects again and starts a new worker.
 - An item is a path, and for a continuation also an offset, a
-  validator and the file's length, if known. The output for an item is
+  validator and the file's length, if known; or else, optionally, the
+  validator of a version the supervisor has, to get the file only if
+  the server has another (see Conditional requests in DECISIONS.md). The output for an item is
   start, chunks, end. The start message carries the length, if the
   response gives one, and a validator to resume with, if there is a
   usable one. The end says how the request ended: done, the connection

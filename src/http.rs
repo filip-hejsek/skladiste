@@ -5,7 +5,8 @@
 //! their [`Origin`] ([`connect`]); a download worker speaks TLS and HTTP
 //! over it (`Connection`), so it needs no network access, DNS or files of
 //! its own and can reach no other host. A file can be continued after its
-//! connection broke ([`Resume`]). Redirects are not followed. Server
+//! connection broke ([`Resume`]), and requested only if it changed since
+//! a version the client has. Redirects are not followed. Server
 //! certificates are checked against [`RootCerts`].
 
 use std::fmt;
@@ -313,6 +314,9 @@ pub enum End {
     Unresumable(String),
     /// The request failed for good, e.g. with `404 Not Found`.
     Failed(String),
+    /// The server still has the version of the file that the request
+    /// named (`304 Not Modified`); there is no body.
+    NotModified,
 }
 
 /// A piece of a response, as it arrives.
@@ -388,7 +392,12 @@ impl<'a> Connection<'a> {
     /// response to `out` as they arrive. With `resume`, ask for the rest
     /// of a file; if the server sends the whole file instead (it has
     /// another version of it now), take that if `restart`, else the
-    /// request fails. Any other status is a failure, including redirects.
+    /// request fails. With `unless`, a validator of a version of the file
+    /// that the caller has ([`Start::validator`]), ask for the file only
+    /// if the server has another version: `If-None-Match` for an `ETag`,
+    /// `If-Modified-Since` for a date; a `304` then ends the request with
+    /// [`End::NotModified`]. Any other status is a failure, including
+    /// redirects.
     ///
     /// Fails only if `out` does; what goes wrong with the connection or
     /// the response is in the returned [`End`].
@@ -397,11 +406,12 @@ impl<'a> Connection<'a> {
         path: &str,
         resume: Option<&Resume>,
         restart: bool,
+        unless: Option<&str>,
         out: &mut dyn FnMut(Event) -> io::Result<()>,
     ) -> io::Result<End> {
         // Until the response turns out complete.
         self.open = false;
-        match self.exchange(path, resume, restart, out) {
+        match self.exchange(path, resume, restart, unless, out) {
             Ok(end) => Ok(end),
             Err(Broken::Closed(reason)) => Ok(End::Closed(reason)),
             Err(Broken::Failed(reason)) => Ok(End::Failed(reason)),
@@ -414,6 +424,7 @@ impl<'a> Connection<'a> {
         path: &str,
         resume: Option<&Resume>,
         restart: bool,
+        unless: Option<&str>,
         out: &mut dyn FnMut(Event) -> io::Result<()>,
     ) -> Exchange<End> {
         let mut request = format!(
@@ -426,6 +437,15 @@ impl<'a> Connection<'a> {
                 "Range: bytes={}-\r\nIf-Range: {}\r\n",
                 resume.offset, resume.validator
             );
+        }
+        if let Some(validator) = unless {
+            // An entity tag is quoted; a date isn't.
+            let header = if validator.starts_with('"') {
+                "If-None-Match"
+            } else {
+                "If-Modified-Since"
+            };
+            request += &format!("{header}: {validator}\r\n");
         }
         request += "\r\n";
         let stream = self.stream.get_mut();
@@ -477,6 +497,11 @@ impl<'a> Connection<'a> {
                 (head.start(true, total), framing, Some(count))
             }
             (416, Some(_)) => return Ok(End::Unresumable(status)),
+            // Never has a body, so the connection can take another request.
+            (304, _) if unless.is_some() => {
+                self.open = persistent && self.stream.buffer().is_empty();
+                return Ok(End::NotModified);
+            }
             // Sent by some servers when they close a connection that was
             // idle, which then meets the next request.
             (408, _) => return Err(Broken::Closed(status)),
@@ -644,9 +669,7 @@ impl Head {
 
     /// A value for `If-Range` that only this version of the file has.
     fn validator(&self) -> Option<String> {
-        let usable = |v: &str| {
-            v.len() <= MAX_VALIDATOR && v.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
-        };
+        let usable = is_validator;
         // With an entity tag, the date isn't used, also if the tag is weak
         // (`W/"…"`): the server says that versions can't be told apart.
         if let Some(etag) = self.get("etag") {
@@ -669,6 +692,13 @@ impl Head {
             etag: self.get("etag").map(str::to_owned),
         }
     }
+}
+
+/// Whether `v` can be a validator ([`Start::validator`]): at most
+/// [`MAX_VALIDATOR`] printable ASCII characters, so that it can go into a
+/// request head.
+pub(crate) fn is_validator(v: &str) -> bool {
+    v.len() <= MAX_VALIDATOR && v.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
 }
 
 /// A number written with digits only.
@@ -947,7 +977,7 @@ mod tests {
     type Got = (Option<Start>, Vec<u8>, End);
 
     /// One request to make: a path, and what [`Connection::get`] takes.
-    type Request<'a> = (&'a str, Option<Resume>, bool);
+    type Request<'a> = (&'a str, Option<Resume>, bool, Option<&'a str>);
 
     /// Make `requests` over one connection to a server with `responses`,
     /// as long as the connection stays open. Also returns what was sent.
@@ -960,13 +990,13 @@ mod tests {
         let origin = Origin::parse("http://example.org:8080").unwrap();
         let mut conn = Connection::new(&mut fake, &origin, &RootCerts::default()).unwrap();
         let mut got = Vec::new();
-        for (path, resume, restart) in requests {
+        for (path, resume, restart, unless) in requests {
             if !conn.is_open() {
                 break;
             }
             let (mut start, mut body) = (None, Vec::new());
             let end = conn
-                .get(path, resume.as_ref(), *restart, &mut |event| {
+                .get(path, resume.as_ref(), *restart, *unless, &mut |event| {
                     match event {
                         Event::Start(s) => {
                             assert!(start.is_none() && body.is_empty());
@@ -988,7 +1018,7 @@ mod tests {
 
     /// Request a file from a server with `response`.
     fn fetch(response: &[u8]) -> Got {
-        let (mut got, sent) = exchange(&[("/x/y.zst", None, false)], &[response]);
+        let (mut got, sent) = exchange(&[("/x/y.zst", None, false, None)], &[response]);
         assert_eq!(
             sent.split_once("User-Agent").unwrap().0,
             "GET /x/y.zst HTTP/1.1\r\nHost: example.org:8080\r\n"
@@ -1183,9 +1213,9 @@ mod tests {
         };
         let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\ntwo\r\n0\r\n\r\n";
         let requests = [
-            ("/1", None, false),
-            ("/2", None, false),
-            ("/3", None, false),
+            ("/1", None, false, None),
+            ("/2", None, false, None),
+            ("/3", None, false, None),
         ];
         let (got, sent) = exchange(&requests, &[&ok("one"), chunked, &ok("three")]);
         let bodies: Vec<&[u8]> = got.iter().map(|(_, body, _)| &body[..]).collect();
@@ -1230,7 +1260,10 @@ mod tests {
             length,
         };
         let get = |length, restart, response: &[u8]| {
-            let requests = [("/f", Some(resume(length)), restart), ("/g", None, false)];
+            let requests = [
+                ("/f", Some(resume(length)), restart, None),
+                ("/g", None, false, None),
+            ];
             let (mut got, sent) = exchange(&requests, &[response, b""]);
             assert!(
                 sent.contains("\r\nRange: bytes=3-\r\nIf-Range: \"v1\"\r\n\r\n"),
@@ -1335,5 +1368,44 @@ mod tests {
             }
             got => panic!("{got:?}"),
         }
+    }
+
+    #[test]
+    fn conditional() {
+        let date = "Mon, 16 Nov 2026 08:00:00 GMT";
+        let not_modified = b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n";
+        let get = |unless, response: &[u8]| {
+            let requests = [("/f", None, true, Some(unless)), ("/g", None, false, None)];
+            let two = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+            let (mut got, sent) = exchange(&requests, &[response, two]);
+            let open = got.len() == 2;
+            (got.swap_remove(0), open, sent)
+        };
+
+        let (got, open, sent) = get("\"v1\"", not_modified);
+        assert!(sent.contains("\r\nIf-None-Match: \"v1\"\r\n\r\n"), "{sent}");
+        assert!(!sent.contains("If-Modified-Since"), "{sent}");
+        assert_eq!(got, (None, vec![], End::NotModified));
+        assert!(open);
+        let (got, _, sent) = get(date, not_modified);
+        assert!(
+            sent.contains(&format!("\r\nIf-Modified-Since: {date}\r\n\r\n")),
+            "{sent}"
+        );
+        assert!(!sent.contains("If-None-Match"), "{sent}");
+        assert_eq!(got.2, End::NotModified);
+        // A new version.
+        let (got, open, _) = get("\"v1\"", b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nnew");
+        assert_eq!((&got.1[..], got.2, open), (&b"new"[..], End::Done, true));
+        // Bytes after the answer aren't an answer to the next request.
+        let (got, open, _) = get("\"v1\"", b"HTTP/1.1 304 Not Modified\r\n\r\nextra");
+        assert_eq!((got.2, open), (End::NotModified, false));
+        let (got, open, _) = get(
+            "\"v1\"",
+            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!((got.2, open), (End::NotModified, false));
+        // Not asked for.
+        assert!(failure(not_modified).contains("304"));
     }
 }

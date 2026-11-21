@@ -10,10 +10,11 @@
 //! access, no ioctls, and no other host can be reached.
 //!
 //! The worker handles a queue: the supervisor sends `ITEM`s (a path each,
-//! and what continues a file that an earlier connection began) and the
-//! worker answers each, in order, with `START` (what the response head
-//! says), the body in `CHUNK`s and `END` (how the request ended:
-//! [`http::End`]). It makes one request at a time over the connection,
+//! what continues a file that an earlier connection began, and the
+//! version the file is wanted only if it isn't) and the worker answers
+//! each, in order, with `START` (what the response head says), the body
+//! in `CHUNK`s and `END` (how the request ended: [`http::End`]); for a
+//! file that didn't change, only `END`. It makes one request at a time over the connection,
 //! which is kept open in between. Each direction of the socket flows one
 //! way, and the worker never asks the supervisor for anything.
 //!
@@ -100,6 +101,9 @@ struct Item {
     /// (it has another version of it now): take that from the beginning
     /// instead of failing the request.
     restart: bool,
+    /// A validator: ask for the file only if the server has another
+    /// version.
+    unless: Option<String>,
 }
 
 /// Where the body of a download goes.
@@ -135,6 +139,11 @@ pub struct Request<S> {
     /// content is known beforehand (e.g. by a hash), as another version
     /// can't be the one wanted.
     pub restart_if_changed: bool,
+    /// The validator of a version of the file that the caller has
+    /// ([`Downloaded::validator`] of an earlier download): if the server
+    /// still has that version, the download ends without a body, as
+    /// [`Downloaded::not_modified`].
+    pub unless: Option<String>,
     pub sink: S,
 }
 
@@ -148,6 +157,14 @@ pub struct Downloaded {
     pub last_modified: Option<String>,
     /// The server's `ETag` header, likewise.
     pub etag: Option<String>,
+    /// A value that only this version of the file has, if the server gave
+    /// one (see [`http::Start::validator`]), for [`Request::unless`]: at
+    /// most 256 printable ASCII characters. Untrusted like the headers it
+    /// comes from.
+    pub validator: Option<String>,
+    /// The server still has the version [`Request::unless`] named, so
+    /// there is no body, and nothing else here applies.
+    pub not_modified: bool,
 }
 
 /// A file being downloaded, on the supervisor's side.
@@ -157,6 +174,7 @@ struct Job<S> {
     url: Url,
     max_size: u64,
     restart_if_changed: bool,
+    unless: Option<String>,
     sink: S,
     /// Bytes of the file in the sink.
     received: u64,
@@ -171,6 +189,9 @@ struct Job<S> {
     etag: Option<String>,
     /// Whether the request sent last asked for the rest of the file.
     resuming: bool,
+    /// Whether the request sent last asked for the file only if it
+    /// changed.
+    conditional: bool,
     /// Whether the worker has started the body for that request.
     started: bool,
 }
@@ -182,6 +203,7 @@ impl<S: Sink> Job<S> {
             url: request.url,
             max_size: request.max_size,
             restart_if_changed: request.restart_if_changed,
+            unless: request.unless,
             sink: request.sink,
             received: 0,
             most: 0,
@@ -190,12 +212,14 @@ impl<S: Sink> Job<S> {
             last_modified: None,
             etag: None,
             resuming: false,
+            conditional: false,
             started: false,
         }
     }
 
     /// The next request for this file: for the rest of it, if there is
-    /// something to continue with.
+    /// something to continue with, else for the file only if it isn't the
+    /// version the caller has, as long as no other version was started.
     fn item(&mut self) -> Item {
         let resume = match &self.validator {
             Some(validator) if self.received > 0 => Some(Resume {
@@ -205,12 +229,15 @@ impl<S: Sink> Job<S> {
             }),
             _ => None,
         };
+        let unless = self.unless.clone().filter(|_| self.most == 0);
         self.resuming = resume.is_some();
+        self.conditional = unless.is_some();
         self.started = false;
         Item {
             path: self.url.path.clone(),
             resume,
             restart: self.restart_if_changed,
+            unless,
         }
     }
 
@@ -240,11 +267,7 @@ impl<S: Sink> Job<S> {
         }
         // The validator goes into a request head later.
         if let Some(v) = &start.validator {
-            ensure!(
-                v.len() <= http::MAX_VALIDATOR
-                    && v.bytes().all(|b| b == b' ' || b.is_ascii_graphic()),
-                "worker sent a bad validator"
-            );
+            ensure!(http::is_validator(v), "worker sent a bad validator");
         }
         let keep = |value: Option<String>, max| {
             value
@@ -288,6 +311,24 @@ impl<S: Sink> Job<S> {
             size: self.received,
             last_modified: self.last_modified,
             etag: self.etag,
+            validator: self.validator,
+            not_modified: false,
+        };
+        Ok((self.index, self.sink, downloaded))
+    }
+
+    /// The server still has the version the caller has.
+    fn not_modified(self) -> Result<(usize, S, Downloaded)> {
+        ensure!(
+            self.conditional && !self.started,
+            "worker said that a file didn't change where it wasn't asked"
+        );
+        let downloaded = Downloaded {
+            size: 0,
+            last_modified: None,
+            etag: None,
+            validator: None,
+            not_modified: true,
         };
         Ok((self.index, self.sink, downloaded))
     }
@@ -348,6 +389,14 @@ pub fn download_all<S: Sink>(
 ) -> Result<()> {
     let mut origins: Vec<(Origin, VecDeque<Job<S>>)> = Vec::new();
     for (index, request) in requests.into_iter().enumerate() {
+        // It goes into a request head.
+        if let Some(v) = &request.unless {
+            ensure!(
+                http::is_validator(v),
+                "downloading {}: bad validator {v:?}",
+                request.url
+            );
+        }
         let origin = &request.url.origin;
         let queue = match origins.iter().position(|(o, _)| o == origin) {
             Some(i) => &mut origins[i].1,
@@ -376,6 +425,7 @@ pub fn download<S: Sink>(
         url: url.clone(),
         max_size,
         restart_if_changed: true,
+        unless: None,
         sink,
     };
     let result = Mutex::new(None);
@@ -543,6 +593,11 @@ fn serve<S: Sink>(
                         done(index, sink, downloaded)?;
                         progress = true;
                     }
+                    End::NotModified => {
+                        let (index, sink, downloaded) = job.not_modified().context(context)?;
+                        done(index, sink, downloaded)?;
+                        progress = true;
+                    }
                     End::Closed(why) => {
                         // The worker exits now. The file is continued
                         // over the next connection.
@@ -670,6 +725,7 @@ fn worker(args: Args) -> Result<Vec<u8>> {
                 &item.path,
                 item.resume.as_ref(),
                 item.restart,
+                item.unless.as_deref(),
                 &mut |event| match event {
                     Event::Start(start) => write_frame(out, START, &serde_json::to_vec(start)?),
                     Event::Data(data) => write_frame(out, CHUNK, data),

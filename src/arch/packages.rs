@@ -132,12 +132,14 @@ pub fn import_local(ctx: &Context, packages: Vec<LocalPackage>) -> Result<()> {
                     url: url.with_suffix(".sig"),
                     max_size: MAX_SIGNATURE_SIZE,
                     restart_if_changed: true,
+                    unless: None,
                     sink: LocalSink::Signature(Vec::new()),
                 },
                 Request {
                     url: (*url).clone(),
                     max_size: u64::MAX,
                     restart_if_changed: true,
+                    unless: None,
                     sink: LocalSink::Archive(ArchiveSink::new(ctx.store)),
                 },
             ]
@@ -466,6 +468,7 @@ pub fn get_packages(ctx: &Context, chosen: &[Chosen], fetch: bool) -> Result<Vec
             url: pkg.url.clone(),
             max_size: pkg.entry.csize,
             restart_if_changed: false,
+            unless: None,
             sink: ArchiveSink::new(ctx.store),
         })
         .collect();

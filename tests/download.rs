@@ -32,6 +32,8 @@ struct Req {
     path: String,
     range: Option<String>,
     if_range: Option<String>,
+    /// `If-None-Match` or `If-Modified-Since`, with its name.
+    unless: Option<String>,
 }
 
 /// What a test server does with a request.
@@ -117,6 +119,7 @@ fn read_request(reader: &mut impl BufRead, conn: usize) -> Option<Req> {
         path: line.split(' ').nth(1)?.to_owned(),
         range: None,
         if_range: None,
+        unless: None,
     };
     loop {
         let mut line = String::new();
@@ -129,6 +132,7 @@ fn read_request(reader: &mut impl BufRead, conn: usize) -> Option<Req> {
         match name.to_ascii_lowercase().as_str() {
             "range" => req.range = Some(value.to_owned()),
             "if-range" => req.if_range = Some(value.to_owned()),
+            "if-none-match" | "if-modified-since" => req.unless = Some(line.trim_end().to_owned()),
             _ => {}
         }
     }
@@ -247,6 +251,7 @@ fn download_all(urls: &[String], restart_if_changed: bool) -> anyhow::Result<Vec
             url: Url::parse(url).unwrap(),
             max_size: u64::MAX,
             restart_if_changed,
+            unless: None,
             sink: Body::default(),
         })
         .collect();
@@ -341,6 +346,7 @@ fn https_with_custom_roots() {
             url: Url::parse(&format!("{base}/{i}")).unwrap(),
             max_size: u64::MAX,
             restart_if_changed: true,
+            unless: None,
             sink: Vec::new(),
         })
         .collect();
@@ -561,6 +567,113 @@ fn starts_again_without_a_validator() {
     }
 }
 
+/// Download `(path, unless)` from `server` over one worker; returns each
+/// body, or `None` where it didn't change.
+fn download_unless(server: &Server, files: &[(&str, Option<&str>)]) -> Vec<Option<Vec<u8>>> {
+    let requests = files
+        .iter()
+        .map(|(path, unless)| Request {
+            url: Url::parse(&server.url(path)).unwrap(),
+            max_size: u64::MAX,
+            restart_if_changed: true,
+            unless: unless.map(str::to_owned),
+            sink: Vec::new(),
+        })
+        .collect();
+    let bodies: Vec<Mutex<Option<Option<Vec<u8>>>>> =
+        files.iter().map(|_| Mutex::default()).collect();
+    let failed = AtomicBool::new(false);
+    download::download_all(
+        &workers(),
+        requests,
+        NonZeroUsize::MIN,
+        &failed,
+        |i, body, d| {
+            let body = if d.not_modified {
+                assert!(body.is_empty() && d.size == 0 && d.validator.is_none());
+                None
+            } else {
+                assert_eq!(d.validator.as_deref(), Some("\"v2\""));
+                Some(body)
+            };
+            assert!(bodies[i].lock().unwrap().replace(body).is_none());
+            Ok(())
+        },
+    )
+    .unwrap();
+    bodies
+        .into_iter()
+        .map(|body| body.into_inner().unwrap().expect("a download is missing"))
+        .collect()
+}
+
+#[test]
+fn only_if_changed() {
+    // The server has version v2 of each file.
+    let server = serve(|req| {
+        let headers = ["ETag: \"v2\""];
+        let body = content(1 << 20);
+        match req.unless.as_deref() {
+            Some("If-None-Match: \"v2\"") => {
+                Reply::Keep(b"HTTP/1.1 304 Not Modified\r\nETag: \"v2\"\r\n\r\n".to_vec())
+            }
+            // Broken once, then continued.
+            _ if req.path == "/cut" => match rest(req, &headers, &body) {
+                Some(rest) => Reply::Keep(rest),
+                None => cut(response("200 OK", &headers, &body), &body, 500_000),
+            },
+            _ => Reply::Keep(response("200 OK", &headers, &body)),
+        }
+    });
+    let got = download_unless(
+        &server,
+        &[
+            ("/a", Some("\"v2\"")),
+            ("/b", Some("\"v1\"")),
+            ("/c", None),
+            ("/d", Some("\"v2\"")),
+            ("/cut", Some("\"v1\"")),
+        ],
+    );
+    let body = Some(content(1 << 20));
+    assert_eq!(got, [None, body.clone(), body.clone(), None, body]);
+    let got: Vec<_> = server
+        .requests()
+        .into_iter()
+        .map(|r| (r.conn, r.path, r.unless, r.range))
+        .collect();
+    let s = |s: &str| s.to_owned();
+    let unless = |etag: &str| Some(format!("If-None-Match: {etag}"));
+    assert_eq!(
+        got,
+        [
+            // Files that didn't change keep the connection.
+            (0, s("/a"), unless("\"v2\""), None),
+            (0, s("/b"), unless("\"v1\""), None),
+            (0, s("/c"), None, None),
+            (0, s("/d"), unless("\"v2\""), None),
+            (0, s("/cut"), unless("\"v1\""), None),
+            // The rest of the new version isn't asked for conditionally.
+            (1, s("/cut"), None, Some(s("bytes=500000-"))),
+        ]
+    );
+
+    // A date is sent as such.
+    let server = serve(|req| match req.unless.as_deref() {
+        Some("If-Modified-Since: Mon, 16 Nov 2026 08:00:00 GMT") => {
+            Reply::Keep(b"HTTP/1.1 304 Not Modified\r\n\r\n".to_vec())
+        }
+        _ => ok(b"new"),
+    });
+    let got = download_unless(&server, &[("/a", Some("Mon, 16 Nov 2026 08:00:00 GMT"))]);
+    assert_eq!(got, [None]);
+
+    // Not asked for.
+    let server = serve(|_| Reply::Keep(b"HTTP/1.1 304 Not Modified\r\n\r\n".to_vec()));
+    let err = format!("{:#}", download(&server.url("/a"), 100).unwrap_err());
+    assert!(err.contains("304"), "{err}");
+}
+
 /// A server whose file changes after the first connection, which breaks.
 fn serve_changing(new: &'static [u8]) -> Server {
     serve(move |req| {
@@ -675,6 +788,7 @@ fn stops_after_a_failure() {
         url: Url::parse(&server.url(path)).unwrap(),
         max_size: u64::MAX,
         restart_if_changed: true,
+        unless: None,
         sink: Vec::new(),
     };
     let failed = AtomicBool::new(true);
