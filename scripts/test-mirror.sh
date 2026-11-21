@@ -24,7 +24,9 @@
 # Environment:
 #   SKL_TEST_CACHE  cache directory (default: tmp/test-cache in the main
 #                   checkout, shared by all git worktrees)
-#   SKL_TEST_PORT   HTTP port (default 8480); HTTPS uses the next one
+#   SKL_TEST_PORT   HTTP port (default 8480); HTTPS uses the next one.
+#                   Each port has its own nginx (in nginx/PORT/ of the
+#                   cache), which serve and stop act on.
 #   ARCH_ARCHIVE    the Arch Linux Archive or a mirror of it (default
 #                   https://archive.archlinux.org)
 set -euo pipefail
@@ -43,7 +45,9 @@ port=${SKL_TEST_PORT:-8480}
 # Every file fetched, named by its SHA-256 and read-only; snapshots are
 # trees of hard links to them.
 pool=$cache/arch/files
-run=$cache/nginx
+# One nginx per port, each with its own config, pid file and logs, so
+# that serving on another port leaves the others alone.
+run=$cache/nginx/$port
 
 # Read the lockfile: the day it pins, and the snapshot's directory, named
 # by the day and the lockfile's hash, so that a changed lockfile is
@@ -368,6 +372,13 @@ EOF
 	if running; then
 		nginx_cmd -s reload
 	else
+		local p
+		for p in "$port" $((port + 1)); do
+			if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+				echo "port $p is in use, but not by nginx from $run; set SKL_TEST_PORT" >&2
+				exit 1
+			fi
+		done
 		nginx_cmd
 	fi
 	local roots

@@ -58,8 +58,9 @@ unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
 rm -rf $dir/img
 ```
 
-`scripts/test-mirror.sh stop` stops nginx. Its access log is
-`tmp/test-cache/nginx/access.log` in the main checkout. For importing
+`scripts/test-mirror.sh stop` stops nginx. Each port
+(`SKL_TEST_PORT`) has its own; the default one's access log is
+`tmp/test-cache/nginx/8480/access.log` in the main checkout. For importing
 package files (`skl arch import FILE...`, then `skl arch build --repo
 @local`), take them from `tmp/test-cache/arch/*/{core,extra}/os/x86_64/`.
 

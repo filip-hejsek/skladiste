@@ -975,7 +975,9 @@ are in BUGS.md.
   archive's layout, and nothing checked what was downloaded). It
   is fetched once into `tmp/test-cache` of the main checkout, shared by
   all worktrees (cloud sessions fetch it in the setup script), and
-  served by one nginx over HTTP and HTTPS. Its test CA is added to the
+  served by one nginx over HTTP and HTTPS (one per `SKL_TEST_PORT`,
+  each in its own run directory, so that one on another port doesn't
+  take over the default one's pid file). Its test CA is added to the
   roots in use before (`SKL_CA_CERTS`, which cloud sessions need for
   their proxy, or the system's bundle), so one shell reaches both the
   test repo and live mirrors. nginx is
