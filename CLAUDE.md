@@ -70,11 +70,16 @@ a store whose keyring is current: `skl arch keyring init
 --sync --fetch --repo core`). The `SKL_CA_CERTS` that
 `serve` sets has the test CA added to the roots in use before (the
 `SKL_CA_CERTS` it found, e.g. a proxy's CA, or else the system's
-bundle), so it works for live mirrors too. For package files of other
-packages, `scripts/fetch-arch-packages.sh $dir/pkgs PKGNAME...`
-downloads their current versions and their dependencies (ignoring
-versions) from a live mirror and prints their paths; with `--urls` it
-prints their URLs instead.
+bundle), so it works for live mirrors too.
+
+Other packages, for a one-off test, come from skl itself (a repo on a
+live mirror, `skl arch build --sync --fetch`). Packages that tests use
+repeatedly belong in the snapshot: it is pinned by
+`scripts/test-mirror.lock` (the day and package list are in its
+header), so add them to those and run `scripts/test-mirror.sh lock
+DAY PACKAGE...`; `fetch` then downloads only the new files.
+`ARCH_ARCHIVE` picks a mirror of the archive for both (such as
+`https://umea.archive.pkgbuild.com`).
 
 Without root, chown to other users fails; `skl arch build` reports how many
 entries kept the wrong owner. This is expected. If you have subordinate

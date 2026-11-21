@@ -954,8 +954,25 @@ are in BUGS.md.
   `bash`, `coreutils` and `systemd`, whose hooks are the ones most
   images run, with dependencies) and their signatures plus that day's
   keyring, so results don't drift with the live repos and runs don't
-  download from public mirrors again. Its directory is named by the day
-  and a hash of the package list, so a changed list is fetched anew. It
+  download from public mirrors again. `scripts/test-mirror.lock` pins
+  it: the day and package list as a comment (one package per line, for
+  diffs), and the SHA-256 of every file (the repo databases, packages,
+  signatures), which `fetch` checks. `lock` takes the day and packages
+  as arguments and downloads only the two databases: they hold the
+  packages' SHA-256 and signatures (`%PGPSIG%`). Packages and signatures
+  are fetched from the archive's pool (`packages/b/bash/…`), since
+  mirrors of the archive may redirect the files under a day elsewhere
+  (umea.archive.pkgbuild.com to archive.org, which lacks recent
+  packages). Fetched files are kept read-only under their hash
+  (`arch/files/`), and each lockfile's snapshot is a tree of hard links
+  to them, named by the day and the lockfile's hash: a changed lockfile
+  downloads only new files, and worktrees with different lockfiles are
+  served side by side. This is a small content-addressed store in bash
+  on purpose: the mirror is the reference skl's downloading, syncing
+  and verification are tested against, so filling it with skl would
+  let a bug there also corrupt what it is checked against. Rejected:
+  resolving dependencies on every fetch (results depended on the
+  archive's layout, and nothing checked what was downloaded). It
   is fetched once into `tmp/test-cache` of the main checkout, shared by
   all worktrees (cloud sessions fetch it in the setup script), and
   served by one nginx over HTTP and HTTPS. Its test CA is added to the

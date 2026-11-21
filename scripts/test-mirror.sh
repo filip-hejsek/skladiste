@@ -2,8 +2,15 @@
 # A local Arch repo for testing: a pinned snapshot of a few packages from
 # the Arch Linux Archive, served by nginx over HTTP and HTTPS.
 #
-# Usage: test-mirror.sh fetch|serve|stop
-#   fetch  Download the snapshot into the cache, unless it is there.
+# Usage: test-mirror.sh lock DAY PACKAGE...|fetch|serve|stop
+#   lock   Pin the snapshot in test-mirror.lock: the repo databases of
+#          DAY (YYYY/MM/DD) in the archive, the named packages with their
+#          dependencies and archlinux-keyring, with signatures, and the
+#          SHA-256 of each file. Downloads only the databases: they have
+#          the hashes of the packages and their signatures.
+#   fetch  Download the snapshot pinned by test-mirror.lock into the
+#          cache, unless it is there, and check the hashes. Files that
+#          an earlier snapshot already had are reused.
 #   serve  Start nginx (or reload it if it runs) and print export lines
 #          for eval: the mirror URLs TEST_MIRROR (http) and
 #          TEST_MIRROR_TLS (https), and what skl needs for them:
@@ -18,61 +25,239 @@
 #   SKL_TEST_CACHE  cache directory (default: tmp/test-cache in the main
 #                   checkout, shared by all git worktrees)
 #   SKL_TEST_PORT   HTTP port (default 8480); HTTPS uses the next one
+#   ARCH_ARCHIVE    the Arch Linux Archive or a mirror of it (default
+#                   https://archive.archlinux.org)
 set -euo pipefail
 
-# The snapshot: a day of the Arch Linux Archive, and the packages taken
-# from it with their dependencies, plus archlinux-keyring without them.
-# systemd for its hooks (tmpfiles, sysusers) and what they make.
-snapshot=2026/11/15
-packages=(filesystem bash coreutils systemd)
-archive=https://archive.archlinux.org/repos/$snapshot
-
 scripts=$(dirname "$(realpath "$0")")
+lockfile=$scripts/test-mirror.lock
+archive=${ARCH_ARCHIVE:-https://archive.archlinux.org}
+archive=${archive%/}
+repos=(core extra)
 if [[ -z ${SKL_TEST_CACHE:-} ]]; then
 	common=$(git -C "$scripts" rev-parse --path-format=absolute --git-common-dir)
 	SKL_TEST_CACHE=$(dirname "$common")/tmp/test-cache
 fi
 cache=$SKL_TEST_CACHE
 port=${SKL_TEST_PORT:-8480}
-# The directory is named by the day and the package list, so that a
-# changed list is fetched anew.
-name=${snapshot//\//-}-$(printf '%s\n' "${packages[@]}" | sha256sum | head -c 8)
-snap=$cache/arch/$name
+# Every file fetched, named by its SHA-256 and read-only; snapshots are
+# trees of hard links to them.
+pool=$cache/arch/files
 run=$cache/nginx
 
+# Read the lockfile: the day it pins, and the snapshot's directory, named
+# by the day and the lockfile's hash, so that a changed lockfile is
+# fetched anew.
+load() {
+	if [[ ! -f $lockfile ]]; then
+		echo "$lockfile missing; run $0 lock DAY PACKAGE..." >&2
+		exit 1
+	fi
+	day=$(sed -n 's/^# snapshot //p' "$lockfile")
+	name=${day//\//-}-$(sha256sum <"$lockfile" | head -c 8)
+	snap=$cache/arch/$name
+}
+
+# The archive's URL of a file of the snapshot. Repo databases are under
+# the day; packages and their signatures are taken from the pool
+# (packages/b/bash/...), since mirrors of the archive may redirect the
+# files under the day elsewhere (umea.archive.pkgbuild.com to archive.org,
+# which lacks recent ones).
+url() {
+	local path=$1
+	local file=${path##*/} repo=${path%%/*}
+	if [[ $file == "$repo.db" ]]; then
+		echo "$archive/repos/$day/$path"
+		return
+	fi
+	# The name precedes the version, release and architecture, none of
+	# which contain a dash.
+	local name=${file%.sig}
+	name=${name%-*-*-*}
+	echo "$archive/packages/${name:0:1}/$name/$file"
+}
+
+lock() {
+	if (($# < 2)); then
+		echo "usage: $0 lock DAY PACKAGE..." >&2
+		exit 1
+	fi
+	day=$1
+	shift
+	if [[ ! $day =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]]; then
+		echo "not a day (YYYY/MM/DD): $day" >&2
+		exit 1
+	fi
+	mkdir -p "$pool"
+	local work
+	work=$(mktemp -d "$cache/arch/.lock.XXXXXX")
+	# shellcheck disable=SC2064 # expand $work now
+	trap "rm -rf '$work'" EXIT
+	local repo
+	for repo in "${repos[@]}"; do
+		curl -fsSL "$(url "$repo/os/x86_64/$repo.db")" -o "$work/$repo.db"
+		mkdir "$work/$repo"
+		tar -xf "$work/$repo.db" -C "$work/$repo"
+	done
+
+	# Every package in the databases ("P name path sha256 pgpsig"), each
+	# of its dependencies ("D name dependency", without version
+	# constraints) and each name it provides ("V provided name").
+	# Relative paths, so that the desc files don't exceed the argument
+	# limit.
+	local index
+	index=$(for repo in "${repos[@]}"; do
+		(cd "$work/$repo" && awk -v repo="$repo" '
+			function flush() {
+				if (pkg != "") print "P", pkg, repo "/os/x86_64/" file, sum, sig
+				for (i = 1; i <= nd; i++) print "D", pkg, deps[i]
+				for (i = 1; i <= np; i++) print "V", provs[i], pkg
+				pkg = ""; sum = ""; sig = ""; nd = 0; np = 0
+			}
+			FNR == 1 { flush() }
+			/^%.*%$/ { section = $0; next }
+			$0 == "" { section = ""; next }
+			{ v = $0; sub(/[<>=].*/, "", v) }
+			section == "%NAME%" { pkg = $0 }
+			section == "%FILENAME%" { file = $0 }
+			section == "%SHA256SUM%" { sum = $0 }
+			section == "%PGPSIG%" { sig = $0 }
+			section == "%DEPENDS%" { deps[++nd] = v }
+			section == "%PROVIDES%" { provs[++np] = v }
+			END { flush() }
+		' ./*/desc)
+	done)
+	local -A path sum sig depends provider
+	local kind a b c d
+	while read -r kind a b c d; do
+		case $kind in
+		P)
+			if [[ -z ${path[$a]:-} ]]; then
+				path[$a]=$b sum[$a]=$c sig[$a]=$d
+			fi
+			;;
+		D) depends[$a]+=" $b" ;;
+		V) [[ -n ${provider[$a]:-} ]] || provider[$a]=$b ;;
+		esac
+	done <<<"$index"
+
+	# The named packages and their dependencies, transitively, ignoring
+	# versions. A dependency is a package name or, failing that,
+	# something a package provides (the first one found).
+	# archlinux-keyring is added without its dependencies.
+	local -A wanted
+	local queue=("$@") order=() pkg deps
+	while ((${#queue[@]})); do
+		pkg=${queue[0]}
+		queue=("${queue[@]:1}")
+		if [[ -z ${path[$pkg]:-} ]]; then
+			if [[ -z ${provider[$pkg]:-} ]]; then
+				echo "package not found: $pkg" >&2
+				exit 1
+			fi
+			pkg=${provider[$pkg]}
+		fi
+		[[ -z ${wanted[$pkg]:-} ]] || continue
+		wanted[$pkg]=1
+		order+=("$pkg")
+		read -ra deps <<<"${depends[$pkg]:-}"
+		queue+=("${deps[@]}")
+	done
+	pkg=archlinux-keyring
+	[[ -n ${wanted[$pkg]:-} ]] || order+=("$pkg")
+
+	local hash
+	{
+		cat <<-EOF
+			# The test repo of scripts/test-mirror.sh: its files and their SHA-256.
+			# Written by \`scripts/test-mirror.sh lock DAY PACKAGE...\` from the
+			# day and packages below (with their dependencies, and
+			# archlinux-keyring for its keyring); run it again to change them.
+		EOF
+		printf '# snapshot %s\n' "$day"
+		printf '# package %s\n' "$@"
+		{
+			for repo in "${repos[@]}"; do
+				hash=$(sha256sum <"$work/$repo.db" | head -c 64)
+				printf '%s  %s\n' "$hash" "$repo/os/x86_64/$repo.db"
+				# Downloaded already; keep it for fetch.
+				chmod a-w "$work/$repo.db"
+				mv "$work/$repo.db" "$pool/$hash"
+			done
+			for pkg in "${order[@]}"; do
+				if [[ ! ${sum[$pkg]} =~ ^[0-9a-f]{64}$ || -z ${sig[$pkg]} ]]; then
+					echo "no SHA-256 or signature for $pkg in the database" >&2
+					exit 1
+				fi
+				hash=$(base64 -d <<<"${sig[$pkg]}" | sha256sum | head -c 64)
+				printf '%s  %s\n' "${sum[$pkg]}" "${path[$pkg]}"
+				printf '%s  %s\n' "$hash" "${path[$pkg]}.sig"
+			done
+		} | sort -k 2
+	} >"$work/lock"
+	mv "$work/lock" "$lockfile"
+	rm -rf "$work"
+	trap - EXIT
+}
+
 fetch() {
+	load
 	if [[ -d $snap ]]; then
 		return
 	fi
-	mkdir -p "$cache/arch"
+	mkdir -p "$pool"
 	local work
-	work=$(mktemp -d "$cache/arch/.$name.XXXXXX")
+	work=$(mktemp -d "$cache/arch/.fetch.XXXXXX")
 	# shellcheck disable=SC2064 # expand $work now
 	trap "rm -rf '$work'" EXIT
-	echo "fetching snapshot $snapshot" >&2
-	local urls keyring
-	urls=$(ARCH_MIRROR=$archive "$scripts/fetch-arch-packages.sh" --urls "$work/resolve" "${packages[@]}")
-	keyring=$(ARCH_MIRROR=$archive "$scripts/fetch-arch-packages.sh" --urls "$work/resolve" archlinux-keyring |
-		grep /archlinux-keyring-)
-	urls+=$'\n'$keyring
-	local repo
-	for repo in core extra; do
-		mkdir -p "$work/$repo/os/x86_64"
-		mv "$work/resolve/db/$repo.db" "$work/$repo/os/x86_64/$repo.db"
-	done
-	local url path
-	while read -r url; do
-		path=${url#"$archive/"}
-		curl -fsSL "$url" -o "$work/$path"
-		curl -fsSL "$url.sig" -o "$work/$path.sig"
-	done <<<"$urls"
-	rm -rf "$work/resolve"
+	local files
+	files=$(grep -v '^#' "$lockfile")
+
+	# The files not in the pool yet, downloaded by one curl.
+	local hash path n=0
+	while read -r hash path; do
+		if [[ ! -f $pool/$hash ]]; then
+			printf 'url = "%s"\noutput = "%s"\n' "$(url "$path")" "$work/$hash"
+			n=$((n + 1))
+		fi
+	done <<<"$files" >"$work/curl.conf"
+	if ((n)); then
+		echo "fetching $n files of snapshot $day" >&2
+		curl -fsSL --parallel --parallel-max 4 -K "$work/curl.conf" || true
+	fi
+	local failed=0
+	while read -r hash path; do
+		if [[ -f $pool/$hash ]]; then
+			continue
+		fi
+		if [[ ! -f $work/$hash ]]; then
+			echo "failed to download $path from $(url "$path")" >&2
+			failed=1
+		elif [[ $(sha256sum <"$work/$hash" | head -c 64) != "$hash" ]]; then
+			echo "wrong SHA-256 of $path from $(url "$path")" >&2
+			failed=1
+		else
+			chmod a-w "$work/$hash"
+			mv "$work/$hash" "$pool/$hash"
+		fi
+	done <<<"$files"
+	if ((failed)); then
+		exit 1
+	fi
+
+	local tree=$work/tree
+	while read -r hash path; do
+		mkdir -p "$tree/${path%/*}"
+		ln "$pool/$hash" "$tree/$path"
+	done <<<"$files"
 	# The snapshot's keyring, for SKL_KEYRING=$snap/keyring/archlinux.
-	mkdir "$work/keyring"
-	tar -xf "$work/${keyring#"$archive/"}" -C "$work/keyring" \
+	local keyring
+	keyring=$(awk '$2 ~ /\/archlinux-keyring-[^\/]*\.pkg\.tar\.[^.\/]*$/ { print $2 }' <<<"$files")
+	mkdir "$tree/keyring"
+	tar -xf "$tree/$keyring" -C "$tree/keyring" \
 		--strip-components=4 usr/share/pacman/keyrings
 	# Another fetch may have finished meanwhile; then keep that one.
-	mv -T "$work" "$snap" 2>/dev/null || [[ -d $snap ]]
+	mv -T "$tree" "$snap" 2>/dev/null || [[ -d $snap ]]
 	rm -rf "$work"
 	trap - EXIT
 }
@@ -140,8 +325,9 @@ nginx_cmd() {
 }
 
 serve() {
+	load
 	if [[ ! -d $snap ]]; then
-		echo "snapshot $snapshot not fetched; run $0 fetch" >&2
+		echo "snapshot $day not fetched; run $0 fetch" >&2
 		exit 1
 	fi
 	certs
@@ -201,11 +387,15 @@ stop() {
 }
 
 case ${1:-} in
+lock)
+	shift
+	lock "$@"
+	;;
 fetch) fetch ;;
 serve) serve ;;
 stop) stop ;;
 *)
-	echo "usage: $0 fetch|serve|stop" >&2
+	echo "usage: $0 lock DAY PACKAGE...|fetch|serve|stop" >&2
 	exit 1
 	;;
 esac
