@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
+use std::io::Read as _;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -130,20 +131,29 @@ enum LocalCommand {
 #[derive(Subcommand)]
 enum RepoCommand {
     /// Add an Arch repo.
+    ///
+    /// A repo has one or more servers: mirrors, in order of preference.
+    /// Files are downloaded from the first two that work, and a file that
+    /// one of them fails goes to the next.
     Add {
         /// Name of the repo in skl.
         name: String,
-        /// Server URL in the format of pacman's `Server`, e.g.
-        /// `https://geo.mirror.pkgbuild.com/$repo/os/$arch` ($arch is
-        /// x86_64).
-        server: String,
+        #[command(flatten)]
+        servers: Servers,
         /// Name of the database on the server (`core` for core.db)
         /// [default: NAME].
         #[arg(long)]
         db: Option<String>,
     },
-    /// List Arch repos with their server and the time of their latest
-    /// sync.
+    /// Replace the servers of an Arch repo. Its synced databases stay.
+    SetServers {
+        /// The repo, by name or id.
+        repo: String,
+        #[command(flatten)]
+        servers: Servers,
+    },
+    /// List Arch repos with their database name, the time of their latest
+    /// sync and their servers.
     List,
 }
 
@@ -181,6 +191,50 @@ enum KeyringCommand {
     },
     /// Show where the store's keyring is from.
     Show,
+}
+
+/// The servers of a repo: those given, then those of the mirror list.
+#[derive(Args)]
+struct Servers {
+    /// Server URLs in the format of pacman's `Server`, e.g.
+    /// `https://geo.mirror.pkgbuild.com/$repo/os/$arch` ($arch is
+    /// x86_64), in order of preference.
+    #[arg(value_name = "SERVER")]
+    servers: Vec<String>,
+    /// Also take the servers of a pacman mirror list, e.g.
+    /// /etc/pacman.d/mirrorlist: its `Server = URL` lines, in their
+    /// order, after any SERVER.
+    #[arg(long, value_name = "FILE")]
+    mirrorlist: Option<PathBuf>,
+}
+
+/// Largest mirror list read.
+const MAX_MIRRORLIST: u64 = 1 << 20;
+
+impl Servers {
+    fn read(self) -> Result<Vec<String>> {
+        let mut servers = self.servers;
+        if let Some(path) = &self.mirrorlist {
+            let reading = || format!("reading {}", path.display());
+            let mut text = String::new();
+            File::open(path)
+                .and_then(|f| f.take(MAX_MIRRORLIST + 1).read_to_string(&mut text))
+                .with_context(reading)?;
+            ensure!(
+                text.len() as u64 <= MAX_MIRRORLIST,
+                "{} is larger than {MAX_MIRRORLIST} bytes",
+                path.display()
+            );
+            let list = repo::parse_mirrorlist(&text).with_context(reading)?;
+            ensure!(!list.is_empty(), "{} has no servers", path.display());
+            servers.extend(list);
+        }
+        ensure!(
+            !servers.is_empty(),
+            "no servers given (SERVER or --mirrorlist)"
+        );
+        Ok(servers)
+    }
 }
 
 /// Run `skl arch`.
@@ -290,8 +344,11 @@ pub(crate) fn run(
             eprintln!("`skl gc` removes their contents from the store");
         }
         ArchCommand::Repo {
-            command: RepoCommand::Add { name, server, db },
-        } => repo::add(store, &name, &server, db.as_deref())?,
+            command: RepoCommand::Add { name, servers, db },
+        } => repo::add(store, &name, &servers.read()?, db.as_deref())?,
+        ArchCommand::Repo {
+            command: RepoCommand::SetServers { repo, servers },
+        } => repo::set_servers(store, &repo_id(&repo)?, &servers.read()?)?,
         ArchCommand::Repo {
             command: RepoCommand::List,
         } => {
@@ -302,7 +359,8 @@ pub(crate) fn run(
                     Some(record) => record.fetched,
                     None => "never synced".to_owned(),
                 };
-                println!("{name}\t{}\t{}\t{synced}", config.db, config.server);
+                let servers = config.servers.join(" ");
+                println!("{name}\t{}\t{synced}\t{servers}", config.db);
             }
         }
         ArchCommand::Keyring { command } => run_keyring(command, workers, store, jobs)?,

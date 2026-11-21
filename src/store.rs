@@ -810,6 +810,14 @@ impl Store {
         self.write_replace(&format!("{dir}/config.json"), &serde_json::to_vec(config)?)
     }
 
+    /// Replace the configuration of repo `name`, which must exist.
+    pub fn set_repo_config(&self, name: &str, config: &impl Serialize) -> Result<()> {
+        repo::check_id(name)?;
+        let path = format!("repos/{name}/config.json");
+        ensure!(self.read_file(&path)?.is_some(), "no repo {name}");
+        self.write_replace(&path, &serde_json::to_vec(config)?)
+    }
+
     /// Configuration of repo `name`, which must exist.
     pub fn repo_config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
         repo::check_id(name)?;

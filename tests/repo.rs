@@ -82,7 +82,7 @@ fn sync_and_read() {
     let store = Store::init_path(tmp.path()).unwrap();
     let workers = workers();
 
-    let config = Config::new(&format!("{base}/$repo/$arch"), "main").unwrap();
+    let config = Config::new(&[format!("{base}/$repo/$arch")], "main").unwrap();
     let record = repo::fetch_db(&workers, &store, &config).unwrap();
     assert_eq!(record.size, db.len() as u64);
     assert_eq!(record.url, format!("{base}/main/x86_64/main.db"));
@@ -101,7 +101,7 @@ fn sync_and_read() {
         ]
     );
 
-    let config = Config::new(&format!("{base}/$repo/$arch"), "bad").unwrap();
+    let config = Config::new(&[format!("{base}/$repo/$arch")], "bad").unwrap();
     let record = repo::fetch_db(&workers, &store, &config).unwrap();
     let err = format!(
         "{:#}",
@@ -109,7 +109,7 @@ fn sync_and_read() {
     );
     assert!(err.contains("unsupported compression"), "{err}");
 
-    let config = Config::new(&format!("{base}/$repo/$arch"), "missing").unwrap();
+    let config = Config::new(&[format!("{base}/$repo/$arch")], "missing").unwrap();
     let err = format!(
         "{:#}",
         repo::fetch_db(&workers, &store, &config).unwrap_err()
@@ -163,7 +163,7 @@ fn sync_only_if_changed() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::init_path(tmp.path()).unwrap();
     let workers = workers();
-    repo::add(&store, "main", &format!("{base}/$repo/$arch"), None).unwrap();
+    repo::add(&store, "main", &[format!("{base}/$repo/$arch")], None).unwrap();
     let id = "@arch/main".to_owned();
     let sync = || {
         let mut synced = repo::sync(&workers, &store, vec![id.clone()], NonZeroUsize::MIN).unwrap();
@@ -190,14 +190,18 @@ fn sync_only_if_changed() {
     assert!(second.fetched > first.fetched);
     assert_eq!(sync(), (second.clone(), None));
 
-    // A validator from another URL isn't sent.
-    let config = Config::new(&format!("{base}/$repo/$arch"), "main").unwrap();
+    // A validator is sent only to the URL it came from, which must be
+    // one of the repo's.
+    let other = "http://elsewhere/$repo/$arch".to_owned();
+    let config = Config::new(&[other, format!("{base}/$repo/$arch")], "main").unwrap();
     let request = repo::db_request(&config, Some(&second)).unwrap();
-    assert_eq!(request.unless.as_deref(), Some("\"v2\""));
+    let unless = request.unless.unwrap();
+    assert_eq!(unless.url.to_string(), second.url);
+    assert_eq!(unless.validator, "\"v2\"");
     let elsewhere = skladiste::repo::SyncRecord {
-        url: "http://elsewhere/main/x86_64/main.db".to_owned(),
+        url: "http://unknown/main/x86_64/main.db".to_owned(),
         ..second
     };
     let request = repo::db_request(&config, Some(&elsewhere)).unwrap();
-    assert_eq!(request.unless, None);
+    assert!(request.unless.is_none());
 }

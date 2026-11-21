@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use skladiste::download::{self, Request, Sink};
+use skladiste::download::{self, Request, Sink, Unless};
 use skladiste::http::{RootCerts, Url};
 use skladiste::worker::Workers;
 
@@ -248,7 +248,7 @@ fn download_all(urls: &[String], restart_if_changed: bool) -> anyhow::Result<Vec
     let requests = urls
         .iter()
         .map(|url| Request {
-            url: Url::parse(url).unwrap(),
+            urls: vec![Url::parse(url).unwrap()],
             max_size: u64::MAX,
             restart_if_changed,
             unless: None,
@@ -343,7 +343,7 @@ fn https_with_custom_roots() {
     // Several files over one TLS connection.
     let requests = (0..3)
         .map(|i| Request {
-            url: Url::parse(&format!("{base}/{i}")).unwrap(),
+            urls: vec![Url::parse(&format!("{base}/{i}")).unwrap()],
             max_size: u64::MAX,
             restart_if_changed: true,
             unless: None,
@@ -573,10 +573,13 @@ fn download_unless(server: &Server, files: &[(&str, Option<&str>)]) -> Vec<Optio
     let requests = files
         .iter()
         .map(|(path, unless)| Request {
-            url: Url::parse(&server.url(path)).unwrap(),
+            urls: vec![Url::parse(&server.url(path)).unwrap()],
             max_size: u64::MAX,
             restart_if_changed: true,
-            unless: unless.map(str::to_owned),
+            unless: unless.map(|validator| Unless {
+                url: Url::parse(&server.url(path)).unwrap(),
+                validator: validator.to_owned(),
+            }),
             sink: Vec::new(),
         })
         .collect();
@@ -785,7 +788,7 @@ fn stops_after_a_failure() {
     // Something else failed before: nothing is downloaded.
     let server = serve_files();
     let request = |path: &str| Request {
-        url: Url::parse(&server.url(path)).unwrap(),
+        urls: vec![Url::parse(&server.url(path)).unwrap()],
         max_size: u64::MAX,
         restart_if_changed: true,
         unless: None,
@@ -831,4 +834,157 @@ fn stops_after_a_failure() {
     let urls: Vec<String> = urls.iter().map(|path| server.url(path)).collect();
     let err = format!("{:#}", download_all(&urls, true).unwrap_err());
     assert!(err.contains("/missing: server responded 404"), "{err}");
+}
+
+/// Download files from mirrors: each request lists a file's URLs, in
+/// order of preference. Returns each body with the URL it came from.
+fn download_mirrored(requests: &[Vec<String>]) -> anyhow::Result<Vec<(Body, String)>> {
+    let bodies: Vec<Mutex<Option<(Body, String)>>> =
+        requests.iter().map(|_| Mutex::default()).collect();
+    let requests = requests
+        .iter()
+        .map(|urls| Request {
+            urls: urls.iter().map(|url| Url::parse(url).unwrap()).collect(),
+            max_size: 1000,
+            restart_if_changed: true,
+            unless: None,
+            sink: Body::default(),
+        })
+        .collect();
+    let failed = AtomicBool::new(false);
+    let jobs = NonZeroUsize::new(4).unwrap();
+    download::download_all(&workers(), requests, jobs, &failed, |i, body, d| {
+        let done = (body, d.url.to_string());
+        assert!(bodies[i].lock().unwrap().replace(done).is_none());
+        Ok(())
+    })?;
+    Ok(bodies
+        .into_iter()
+        .map(|body| body.into_inner().unwrap().expect("a download is missing"))
+        .collect())
+}
+
+/// The URLs of `path` on each of `servers`.
+fn on(servers: &[&str], path: &str) -> Vec<String> {
+    servers.iter().map(|base| format!("{base}{path}")).collect()
+}
+
+#[test]
+fn mirrors_share_files() {
+    let (a, b) = (serve_files(), serve_files());
+    let mirrors = [&*a.base, &*b.base];
+    let requests: Vec<_> = (0..20)
+        .map(|i| on(&mirrors, &format!("/small/{i}")))
+        .collect();
+    let bodies = download_mirrored(&requests).unwrap();
+    for (i, (body, url)) in bodies.iter().enumerate() {
+        assert_eq!(body.data, i.to_string().as_bytes());
+        assert!(url.ends_with(&format!("/small/{i}")), "{url}");
+    }
+    // Both mirrors took files, each over one connection, and no file was
+    // downloaded twice.
+    for server in [&a, &b] {
+        assert_eq!(server.connections(), 1);
+        assert!(!server.requests().is_empty());
+    }
+    assert_eq!(a.requests().len() + b.requests().len(), 20);
+    let from_a = bodies.iter().filter(|(_, url)| url.starts_with(&a.base));
+    assert_eq!(from_a.count(), a.requests().len());
+}
+
+#[test]
+fn falls_back_to_another_mirror() {
+    // Of two mirrors, one has only some of the files.
+    let full = serve_files();
+    let partial = serve(|req| match req.path.as_str() {
+        "/small/1" | "/small/3" => ok(b"partial"),
+        _ => Reply::Keep(response("404 Not Found", &[], b"")),
+    });
+    for mirrors in [[&*partial.base, &*full.base], [&*full.base, &*partial.base]] {
+        let requests: Vec<_> = (0..6)
+            .map(|i| on(&mirrors, &format!("/small/{i}")))
+            .collect();
+        for (i, (body, url)) in download_mirrored(&requests).unwrap().iter().enumerate() {
+            match url.starts_with(&partial.base) {
+                true => assert_eq!(body.data, b"partial"),
+                false => assert_eq!(body.data, i.to_string().as_bytes()),
+            }
+        }
+    }
+
+    // A mirror that can't be reached, or whose connections get nothing,
+    // is given up; then a third one takes its place.
+    let silent = serve(|_| Reply::Close(Vec::new()));
+    let down = "http://127.0.0.1:1";
+    let full = serve_files();
+    let mirrors = [down, &*silent.base, &*full.base];
+    let requests: Vec<_> = (0..4)
+        .map(|i| on(&mirrors, &format!("/small/{i}")))
+        .collect();
+    for (i, (body, url)) in download_mirrored(&requests).unwrap().iter().enumerate() {
+        assert_eq!(body.data, i.to_string().as_bytes());
+        assert!(url.starts_with(&full.base), "{url}");
+    }
+    assert_eq!(silent.connections(), 3);
+
+    // As is one that serves more than a file may have.
+    let big = serve_files();
+    let full = serve_files();
+    let requests = [vec![big.url("/big.zst"), full.url("/small/x")]];
+    let (body, url) = download_mirrored(&requests).unwrap().pop().unwrap();
+    assert_eq!((&*body.data, url), (&b"x"[..], full.url("/small/x")));
+}
+
+#[test]
+fn fails_when_every_mirror_fails() {
+    let (a, b) = (serve_files(), serve_files());
+    let requests = [on(&[&a.base, &b.base], "/missing")];
+    let err = format!("{:#}", download_mirrored(&requests).unwrap_err());
+    assert!(err.contains("every mirror failed"), "{err}");
+    for server in [&a, &b] {
+        assert!(err.contains(&server.url("/missing")), "{err}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    // The error says why each failed: one couldn't be reached, the other
+    // hasn't the file.
+    let one = serve_files();
+    let down = "http://127.0.0.1:1";
+    let requests = [on(&[down, &one.base], "/missing")];
+    let err = format!("{:#}", download_mirrored(&requests).unwrap_err());
+    assert!(err.contains("connecting to 127.0.0.1:1"), "{err}");
+    assert!(err.contains("404"), "{err}");
+}
+
+#[test]
+fn validator_only_for_its_mirror() {
+    // The version the caller has came from a mirror that is down now: the
+    // other mirror isn't asked whether it has that version.
+    let (down, other) = ("http://127.0.0.1:1", serve_files());
+    let urls = on(&[down, &other.base], "/small/x");
+    let request = Request {
+        urls: urls.iter().map(|url| Url::parse(url).unwrap()).collect(),
+        max_size: u64::MAX,
+        restart_if_changed: true,
+        unless: Some(Unless {
+            url: Url::parse(&urls[0]).unwrap(),
+            validator: "\"v1\"".to_owned(),
+        }),
+        sink: Vec::new(),
+    };
+    let failed = AtomicBool::new(false);
+    download::download_all(
+        &workers(),
+        vec![request],
+        NonZeroUsize::MIN,
+        &failed,
+        |_, body, d| {
+            assert!(!d.not_modified);
+            assert_eq!(body, b"x");
+            Ok(())
+        },
+    )
+    .unwrap();
+    let unless: Vec<_> = other.requests().into_iter().map(|r| r.unless).collect();
+    assert_eq!(unless, [None]);
 }

@@ -129,14 +129,14 @@ pub fn import_local(ctx: &Context, packages: Vec<LocalPackage>) -> Result<()> {
         .flat_map(|url| {
             [
                 Request {
-                    url: url.with_suffix(".sig"),
+                    urls: vec![url.with_suffix(".sig")],
                     max_size: MAX_SIGNATURE_SIZE,
                     restart_if_changed: true,
                     unless: None,
                     sink: LocalSink::Signature(Vec::new()),
                 },
                 Request {
-                    url: (*url).clone(),
+                    urls: vec![(*url).clone()],
                     max_size: u64::MAX,
                     restart_if_changed: true,
                     unless: None,
@@ -352,12 +352,13 @@ pub enum Chosen<'a> {
     Repo(RepoPackage<'a>),
 }
 
-/// A package from a repo's snapshot, downloaded from `url`.
+/// A package from a repo's snapshot, downloaded from one of `urls`.
 pub struct RepoPackage<'a> {
     /// The repo's id.
     pub repo: &'a str,
     pub entry: &'a DbEntry,
-    pub url: Url,
+    /// The package on each of the repo's servers, in order of preference.
+    pub urls: Vec<Url>,
 }
 
 impl RepoPackage<'_> {
@@ -434,7 +435,7 @@ fn repo_package(snapshot: &Snapshot, i: usize) -> Result<Chosen<'_>> {
     );
     Ok(Chosen::Repo(RepoPackage {
         repo: &snapshot.repo,
-        url: snapshot.config.package_url(&entry.filename)?,
+        urls: snapshot.config.package_urls(&entry.filename)?,
         entry,
     }))
 }
@@ -490,7 +491,7 @@ pub fn get_packages(ctx: &Context, chosen: &[Chosen], fetch: bool) -> Result<Vec
     let requests = missing
         .iter()
         .map(|&(_, pkg)| Request {
-            url: pkg.url.clone(),
+            urls: pkg.urls.clone(),
             max_size: pkg.entry.csize,
             restart_if_changed: false,
             unless: None,
@@ -502,10 +503,10 @@ pub fn get_packages(ctx: &Context, chosen: &[Chosen], fetch: bool) -> Result<Vec
         ctx.jobs,
         ready,
         requests,
-        |n, archive, _| {
+        |n, archive, downloaded| {
             let (i, pkg) = missing[n];
-            let (name, sig) = (&pkg.entry.filename, pkg.signature()?);
-            let file = keep_download(ctx, pkg.repo, name, &pkg.url, sig, archive, Some(pkg.entry))?;
+            let (name, sig, url) = (&pkg.entry.filename, pkg.signature()?, &downloaded.url);
+            let file = keep_download(ctx, pkg.repo, name, url, sig, archive, Some(pkg.entry))?;
             Ok(Some((i, pkg, Some(file))))
         },
         |(i, pkg, fetched)| Ok((i, get_repo_package(ctx, pkg, fetched)?)),

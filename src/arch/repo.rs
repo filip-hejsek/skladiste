@@ -14,6 +14,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
 use std::os::fd::FromRawFd;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -22,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::arch::ArchSection;
 use crate::arch::IMPORT_MAX_MEMORY;
 use crate::arch::signature::MAX_SIGNATURE_SIZE;
-use crate::download::{self, Downloaded, Request};
+use crate::download::{self, Downloaded, Request, Unless};
 use crate::http::Url;
 use crate::manifest::Package;
 use crate::repo::{self, SyncRecord};
@@ -58,52 +60,106 @@ pub fn repo_id(arg: &str) -> Result<String> {
 
 /// Configuration of an Arch repo, kept in the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Where the repo's files are, in the format of pacman's `Server`:
-    /// `$repo` stands for [`Config::db`] and `$arch` for [`ARCH`].
-    pub server: String,
+    /// Where the repo's files are, in order of preference: mirrors, each
+    /// in the format of pacman's `Server`, where `$repo` stands for
+    /// [`Config::db`] and `$arch` for [`ARCH`]. At least one.
+    pub servers: Vec<String>,
     /// Name of the database on the server: `core` for `core.db`.
     pub db: String,
 }
 
+/// Most servers a repo may have.
+pub const MAX_SERVERS: usize = 64;
+
 impl Config {
-    /// Check that `db` is a plain name and `server` gives valid URLs.
-    pub fn new(server: &str, db: &str) -> Result<Config> {
+    /// Check that `db` is a plain name and that `servers` (at least one, at
+    /// most [`MAX_SERVERS`], none twice) give valid URLs.
+    pub fn new(servers: &[String], db: &str) -> Result<Config> {
         repo::check_name(db).context("bad database name")?;
+        ensure!(!servers.is_empty(), "a repo needs a server");
+        ensure!(
+            servers.len() <= MAX_SERVERS,
+            "{} servers are too many (at most {MAX_SERVERS})",
+            servers.len()
+        );
         let config = Config {
-            server: server.to_owned(),
+            servers: servers.to_vec(),
             db: db.to_owned(),
         };
-        config.db_url()?;
+        let urls = config.db_urls()?;
+        for (i, url) in urls.iter().enumerate() {
+            ensure!(
+                !urls[..i].contains(url),
+                "server {} is given twice",
+                servers[i]
+            );
+        }
         Ok(config)
     }
 
-    /// `server` with `$repo` and `$arch` replaced.
-    fn base(&self) -> String {
-        let base = self
-            .server
-            .replace("$repo", &self.db)
-            .replace("$arch", ARCH);
-        base.trim_end_matches('/').to_owned()
+    /// The servers with `$repo` and `$arch` replaced.
+    fn bases(&self) -> impl Iterator<Item = String> {
+        self.servers.iter().map(|server| {
+            let base = server.replace("$repo", &self.db).replace("$arch", ARCH);
+            base.trim_end_matches('/').to_owned()
+        })
     }
 
-    /// URL of the database, `<server>/<db>.db`.
-    pub fn db_url(&self) -> Result<Url> {
-        Url::parse(&format!("{}/{}.db", self.base(), self.db))
+    /// URLs of the database, `<server>/<db>.db`, one per server.
+    pub fn db_urls(&self) -> Result<Vec<Url>> {
+        let name = format!("{}.db", self.db);
+        self.bases()
+            .map(|base| Url::parse(&format!("{base}/{name}")))
+            .collect()
     }
 
-    /// URL of a package file, `<server>/<file name>`.
-    pub fn package_url(&self, file_name: &str) -> Result<Url> {
-        Url::parse(&format!("{}/{file_name}", self.base()))
+    /// URLs of a package file, `<server>/<file name>`, one per server.
+    pub fn package_urls(&self, file_name: &str) -> Result<Vec<Url>> {
+        self.bases()
+            .map(|base| Url::parse(&format!("{base}/{file_name}")))
+            .collect()
     }
 }
 
-/// Add the Arch repo `name` with `server` (see [`Config::server`]) and the
+/// The servers of a pacman mirror list (as `/etc/pacman.d/mirrorlist`), in
+/// their order: the values of its `Server = URL` lines. Blank lines and
+/// comments (`#`) are skipped; anything else is an error.
+pub fn parse_mirrorlist(text: &str) -> Result<Vec<String>> {
+    let mut servers = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let server = line
+            .split_once('=')
+            .filter(|(key, _)| key.trim_end() == "Server")
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty());
+        match server {
+            Some(server) => servers.push(server.to_owned()),
+            None => bail!("line {}: not `Server = URL`: {line:?}", n + 1),
+        }
+    }
+    Ok(servers)
+}
+
+/// Add the Arch repo `name` with `servers` (see [`Config::servers`]) and the
 /// database `db` (see [`Config::db`]; `name` if `None`).
-pub fn add(store: &Store, name: &str, server: &str, db: Option<&str>) -> Result<()> {
+pub fn add(store: &Store, name: &str, servers: &[String], db: Option<&str>) -> Result<()> {
     repo::check_name(name)?;
-    let config = Config::new(server, db.unwrap_or(name))?;
+    let config = Config::new(servers, db.unwrap_or(name))?;
     store.add_repo(&repo_id(name)?, &config)
+}
+
+/// Replace the servers of the Arch repo with id `repo`. Its snapshots stay:
+/// mirrors serve the same files.
+pub fn set_servers(store: &Store, repo: &str, servers: &[String]) -> Result<()> {
+    let config: Config = store.repo_config(repo)?;
+    let config = Config::new(servers, &config.db)?;
+    store.set_repo_config(repo, &config)
 }
 
 /// The ids of the configured Arch repos, sorted.
@@ -151,7 +207,6 @@ pub fn sync(
         requests.push(db_request(&config, record.as_ref())?);
         latest.push(record);
     }
-    let urls: Vec<Url> = requests.iter().map(|r| r.url.clone()).collect();
     let mut synced = download::fetch_and_run(
         workers,
         jobs,
@@ -161,7 +216,7 @@ pub fn sync(
             if downloaded.not_modified {
                 return Ok(Some((i, None)));
             }
-            let record = db_record(store, &urls[i], &data, downloaded)?;
+            let record = db_record(store, &data, downloaded)?;
             Ok(Some((i, Some(record))))
         },
         |(i, record)| {
@@ -340,18 +395,25 @@ fn check_dep_version(version: &str) -> Result<()> {
 }
 
 /// A request for the database of the repo with `config`, to hold in
-/// memory. Databases aren't signed, so if one changes on the server while
-/// it is downloaded, the new one is as good. With `latest`, the repo's
-/// latest record, the database is downloaded only if the server has
-/// another version than that one, if the record is from the same URL and
-/// has a validator.
+/// memory, from the first of its servers that has it. Databases aren't
+/// signed, so if one changes on the server while it is downloaded, the
+/// new one is as good. With `latest`, the repo's latest record, the
+/// database is downloaded only if the server has another version than
+/// that one, if the record has a validator and the database is
+/// requested from the URL the record names.
 pub fn db_request(config: &Config, latest: Option<&SyncRecord>) -> Result<Request<Vec<u8>>> {
-    let url = config.db_url()?;
-    let unless = latest
-        .filter(|record| record.url == url.to_string())
-        .and_then(|record| record.validator.clone());
+    let urls = config.db_urls()?;
+    let unless = latest.and_then(|record| {
+        Some(Unless {
+            url: urls
+                .iter()
+                .find(|url| url.to_string() == record.url)?
+                .clone(),
+            validator: record.validator.clone()?,
+        })
+    });
     Ok(Request {
-        url,
+        urls,
         max_size: MAX_DB_SIZE,
         restart_if_changed: true,
         unless,
@@ -359,20 +421,15 @@ pub fn db_request(config: &Config, latest: Option<&SyncRecord>) -> Result<Reques
     })
 }
 
-/// Add the database `data`, downloaded from `url` just now, to the store,
-/// and return a record of it to save once it has been checked.
-pub fn db_record(
-    store: &Store,
-    url: &Url,
-    mut data: &[u8],
-    downloaded: Downloaded,
-) -> Result<SyncRecord> {
+/// Add the database `data`, downloaded just now, to the store, and return a
+/// record of it to save once it has been checked.
+pub fn db_record(store: &Store, mut data: &[u8], downloaded: Downloaded) -> Result<SyncRecord> {
     let fetched = repo::timestamp(SystemTime::now());
     let added = store.add_blob(&mut data)?;
     Ok(SyncRecord {
         hash: added.hash,
         size: added.size,
-        url: url.to_string(),
+        url: downloaded.url.to_string(),
         fetched,
         last_modified: downloaded.last_modified,
         etag: downloaded.etag,
@@ -380,13 +437,23 @@ pub fn db_record(
     })
 }
 
-/// Download the database of the repo with `config` into the store, and
-/// return a record of it to save once it has been checked.
+/// Download the database of the repo with `config` into the store, from the
+/// first of its servers that has it, and return a record of it to save
+/// once it has been checked.
 pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<SyncRecord> {
-    let request = db_request(config, None)?;
-    let (data, downloaded) =
-        download::download(workers, &request.url, request.sink, request.max_size)?;
-    db_record(store, &request.url, &data, downloaded)
+    let result = Mutex::new(None);
+    download::download_all(
+        workers,
+        vec![db_request(config, None)?],
+        NonZeroUsize::MIN,
+        &AtomicBool::new(false),
+        |_, data, downloaded| {
+            *result.lock().unwrap() = Some(db_record(store, &data, downloaded)?);
+            Ok(())
+        },
+    )?;
+    let record = result.into_inner().unwrap();
+    record.context("downloading the database didn't finish")
 }
 
 /// Load the database that `record` refers to from the store, and read it
@@ -888,21 +955,63 @@ mod tests {
 
     #[test]
     fn urls() {
-        let c = Config::new("https://mirror.example/$repo/os/$arch/", "core").unwrap();
+        let servers = |s: &[&str]| s.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let strings = |urls: Vec<Url>| urls.iter().map(Url::to_string).collect::<Vec<_>>();
+        let c = Config::new(
+            &servers(&["https://mirror.example/$repo/os/$arch/"]),
+            "core",
+        )
+        .unwrap();
         assert_eq!(
-            c.db_url().unwrap().to_string(),
-            "https://mirror.example/core/os/x86_64/core.db"
+            strings(c.db_urls().unwrap()),
+            ["https://mirror.example/core/os/x86_64/core.db"]
         );
-        let c = Config::new("http://example.org/fixed", "custom").unwrap();
+        let c = Config::new(
+            &servers(&["http://example.org/fixed", "https://b.example/$repo"]),
+            "custom",
+        )
+        .unwrap();
         assert_eq!(
-            c.db_url().unwrap().to_string(),
-            "http://example.org/fixed/custom.db"
+            strings(c.db_urls().unwrap()),
+            [
+                "http://example.org/fixed/custom.db",
+                "https://b.example/custom/custom.db"
+            ]
         );
         assert_eq!(
-            c.package_url("a-1-1-any.pkg.tar.zst").unwrap().to_string(),
-            "http://example.org/fixed/a-1-1-any.pkg.tar.zst"
+            strings(c.package_urls("a-1-1-any.pkg.tar.zst").unwrap()),
+            [
+                "http://example.org/fixed/a-1-1-any.pkg.tar.zst",
+                "https://b.example/custom/a-1-1-any.pkg.tar.zst"
+            ]
         );
-        assert!(Config::new("ftp://x/$repo", "core").is_err());
-        assert!(Config::new("https://x/$repo", "a/b").is_err());
+        assert!(Config::new(&servers(&["ftp://x/$repo"]), "core").is_err());
+        assert!(Config::new(&servers(&["https://x/$repo"]), "a/b").is_err());
+        assert!(Config::new(&[], "core").is_err());
+        // The same server twice, also when written differently.
+        let twice = servers(&["https://x/$repo", "https://x/core/"]);
+        assert!(Config::new(&twice, "core").is_err());
+    }
+
+    #[test]
+    fn mirrorlists() {
+        let text = "\
+            ## Worldwide\n\
+            Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n\
+            #Server = https://commented.example/$repo/os/$arch\n\
+            \n\
+            Server=http://b.example/$repo/os/$arch  \n";
+        assert_eq!(
+            parse_mirrorlist(text).unwrap(),
+            [
+                "https://geo.mirror.pkgbuild.com/$repo/os/$arch",
+                "http://b.example/$repo/os/$arch"
+            ]
+        );
+        assert!(parse_mirrorlist("").unwrap().is_empty());
+        for bad in ["[core]", "Include = /etc/x", "Server =", "Server https://x"] {
+            let e = parse_mirrorlist(bad).unwrap_err().to_string();
+            assert!(e.contains("line 1"), "{e}");
+        }
     }
 }

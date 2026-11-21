@@ -22,20 +22,23 @@ left of that design: image records (see Images).
   of its own), so a package signed by a new packager key fails until it
   is run. `build --sync` could update it first from the same repos.
   Keys aren't refreshed from WKD as `archlinux-keyring-wkd-sync` does.
-- Downloads from a mirror list. Now a repo has one server, and each
-  origin one worker with one connection (see Downloads in
-  DECISIONS.md), so the packages of repos on one host are downloaded
-  one after another.
+- Downloads from mirrors (see Mirrors under Downloads in DECISIONS.md):
   - Download order: this is a two-stage flow shop, where Johnson's rule
     is optimal for one downloader and one importer. Downloading is
     usually slower, which gives largest import first. Sizes are known
     beforehand from the repo database (`%CSIZE%`, `%ISIZE%`). Now the
-    order is largest `%CSIZE%` first.
-  - Fall back to the next mirror when a download fails or is slow, and
-    download from several mirrors at once: sketched in WORKERS.md,
-    where the scheduling across mirrors and most limits are still open.
+    order is largest `%CSIZE%` first, across all mirrors.
+  - Fall back when a download is slow: sketched in WORKERS.md
+    (Fallback). Now only failures move a file to another mirror.
+  - Measure how many mirrors should share a repo's files (now 2) on a
+    fast link.
   - Fetch a file again when it fails validation, from another mirror if
-    there is one; now that fails the run.
+    there is one; now that fails the run. Needs `done` to hand back
+    the sink, or a way to get a new one.
+  - A mirror that isn't in sync answers `404` for each newer file, and
+    each costs a reconnect (the worker exits after a status other than
+    `200`/`206`). Reading the body of short error responses would keep
+    the connection.
 - Mirror trust: packages are signed, but Arch's repo databases aren't,
   so a malicious mirror (or anyone impersonating one; TLS stops only
   that) can't be fully defended against. It can:

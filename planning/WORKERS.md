@@ -8,10 +8,11 @@ items, but one at a time, as each caller waits for its verdict (see
 Package signatures in DECISIONS.md).
 
 Implemented: the queues and the window, a worker's lifetime, how a
-download resumes, and a first limit on connections that get nowhere.
-Open: the other limits, fallback to another mirror and scheduling
-across mirrors, which is where the remaining design work is. Not
-needed so far: the status mailbox.
+download resumes, a first limit on connections that get nowhere, and
+moving files to another mirror when one fails (Mirrors under Downloads
+in DECISIONS.md). Open: the other limits and fallback when a download
+is slow, which is where the remaining design work is. Not needed so
+far: the status mailbox.
 
 ## Queues
 
@@ -25,7 +26,8 @@ needed so far: the status mailbox.
   supervisor for anything. When it can't go on with what it has, it
   reports where it stopped and exits, and the supervisor starts a new
   worker. Items that got no result go back to the scheduler (now: to
-  the front of their origin's queue, in their order).
+  the front of what that origin's thread holds, in their order; when
+  the origin is given up, to the shared pool).
 - The supervisor never blocks writing input. It keeps at most a small
   window of items outstanding per worker (two: the worker has the next
   item at hand while the supervisor reacts to a result, so there is no
@@ -178,10 +180,10 @@ Implemented:
   waits: 1 s, doubled with each strike.
 - Strikes are capped per origin (3 in a run) and aren't reset by
   results that passed in between; at the cap the origin isn't used
-  further, which fails the run while a repo has one server. This keeps
-  a worker from making `skl` hammer a mirror.
-- A connection that can't be opened fails the run at once, as does a
-  file that fails validation.
+  further, and its files go to other mirrors, if they have any. This
+  keeps a worker from making `skl` hammer a mirror.
+- A connection that can't be opened gives the origin up at once. A
+  file that fails validation fails the run.
 
 Not settled; a sketch:
 
@@ -196,11 +198,10 @@ Not settled; a sketch:
   bounds those is open: now any new byte is progress, so a worker can
   still have `skl` connect once for each.
 - Whether a connection that can't be opened should be a strike, and
-  tried again.
+  tried again, instead of giving the origin up.
 
-Scheduling across mirrors (which mirror gets which file, when to fall
-back, how this meets largest-import-first) is open too; see Downloads
-in TODO.md.
+Scheduling across mirrors is decided (DECISIONS.md, Mirrors); what is
+open there is in TODO.md under Downloads from mirrors.
 
 ## Rejected
 

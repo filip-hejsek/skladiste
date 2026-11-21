@@ -22,7 +22,9 @@ formats can be added as frontends.
 - Keeps Arch repo databases (`skl arch repo add`, `skl arch sync`), every
   version
 - Downloads over one connection per server, kept open between files, and
-  continues a file after a broken connection where the server allows
+  continues a file after a broken connection where the server allows; a
+  repo can have several mirrors, of which two share the downloads, and a
+  file or mirror that fails is replaced by the next
 - Resolves dependencies pacman-style (versioned dependencies, provides,
   conflicts)
 - Runs the packages' install scripts and the alpm hooks they trigger in
@@ -50,6 +52,8 @@ skl arch keyring init /usr/share/pacman/keyrings/archlinux  # from archlinux-key
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
 skl arch repo add core "$mirror"
 skl arch repo add extra "$mirror"
+# Or with mirrors, in order of preference:
+# skl arch repo add core --mirrorlist /etc/pacman.d/mirrorlist
 skl arch sync
 skl arch keyring update --fetch --repo core
 skl arch build --fetch --repo core --repo extra -o image filesystem bash coreutils

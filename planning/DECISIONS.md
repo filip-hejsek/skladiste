@@ -184,16 +184,25 @@ are in BUGS.md.
   before the namespaces need their repos moved under `@arch/` by hand
   (repos, packages and downloads directories).
 - Configuration is in the store, `repos/<repo>/config.json`, written by
-  `skl arch repo add NAME SERVER [--db DB]`. For Arch: a URL template in the
+  `skl arch repo add NAME [SERVER...] [--mirrorlist FILE] [--db DB]` and
+  `skl arch repo set-servers`. For Arch: a list of servers (mirrors, in
+  order of preference; 1 to 64, none twice), each a URL template in the
   format of pacman's `Server` (`…/$repo/os/$arch`, `$arch` is always
-  `x86_64`) and the remote database name (`core` for `core.db`; default
-  the repo's name). The store doesn't interpret it; frontend-specific
+  `x86_64`), and the remote database name (`core` for `core.db`; default
+  the repo's name). `--mirrorlist` reads a pacman mirror list's
+  `Server = URL` lines after any SERVER arguments; other lines than
+  those, comments and blank ones are an error, so `Include` isn't
+  followed. Mirrors of a repo share its snapshots: changing the list
+  keeps them. Rejected: one server per repo with a repo per mirror (a
+  build would treat them as different repos), keeping the path of a
+  mirror list in the config (the store would read files it doesn't
+  own). The store doesn't interpret the config; frontend-specific
   configuration may move out of the store later.
 - `skl arch sync` downloads each repo's database with the download stage
   (see Downloads; at most 64 MiB, held in memory) and keeps every
   version: the database
   as a store blob, and a record, an object referring to it, whose id
-  `repos/<repo>/syncs/<time>` holds, with its size, URL, the fetch time (supervisor's clock, UTC with
+  `repos/<repo>/syncs/<time>` holds, with its size, URL (on the mirror it came from), the fetch time (supervisor's clock, UTC with
   microseconds; fixed width, so the names sort by time) and the server's
   `Last-Modified` and `ETag` (sent by the worker, so untrusted: at most
   100 and 256 bytes, control characters escaped, for information only)
@@ -227,8 +236,12 @@ are in BUGS.md.
   Encoding the signatures as hex with `write!` took 100 ms before it
   was replaced. Cache by database hash only if this matters.
 - Conditional requests: a sync asks for a database only if the server
-  has another version than the latest record's, when that record is from
-  the same URL and has a validator. The validator is the one a broken
+  has another version than the latest record's, when that record has a
+  validator and the database is requested from the record's URL (with
+  mirrors: only of that mirror, `download::Unless`; another mirror is
+  asked for the whole file, as a validator means nothing to it, and an
+  `If-Modified-Since` to a mirror that is behind would keep a database
+  it never served). The validator is the one a broken
   download is continued with (a strong `ETag`, or a `Last-Modified` at
   least a second older than `Date`), sent as `If-None-Match` or
   `If-Modified-Since`; a `304` ends the request without a body and keeps
@@ -284,7 +297,8 @@ are in BUGS.md.
   removed before the index entries, so an interrupted removal can be
   repeated. Contents stay until `skl gc`. Rejected: removing by
   pacman's `NAME-VERSION` (ambiguous, names contain `-`).
-- The snapshot's entry gives the URL (`<server>/<FILENAME>`), the
+- The snapshot's entry gives the URL (`<server>/<FILENAME>` on each
+  server), the
   signature (`%PGPSIG%`, still saved as `.sig` next to the download;
   an entry without one is an error), the size limit and exact size
   (`%CSIZE%`) and `%SHA256SUM%`, checked while downloading, before the
@@ -355,6 +369,38 @@ are in BUGS.md.
   one after another, in the order given. Parallelism comes from
   downloading from several origins at once (at most `-j`), not from
   several connections to one host, which is gentler on mirrors.
+- Mirrors: a request has a list of URLs, the same file on each mirror,
+  in order of preference. The files wait in one pool, in request order
+  (largest first), and each origin's thread takes the first file it
+  may serve: one whose first two usable mirrors include it (usable:
+  not given up, and not failed that file). So two mirrors of a repo
+  share its files, a third is used only once one of them drops out,
+  and `-j` still caps the origins at once. A thread starts for an
+  origin that a waiting file may go to, and ends when none may; a
+  coordinator in `download_all` starts them and fails the stage when a
+  file has no usable mirror left. A file that fails for good on a
+  mirror (`End::Failed`, e.g. `404` on a mirror that isn't in sync)
+  goes back to the pool for the others. A mirror is given up when it
+  can't be connected to, reaches 3 strikes, serves more than a file's
+  size limit, or its worker fails or exits abnormally (a server can
+  cause all of these); its files go back to the pool. These print a
+  warning when another mirror takes over; when none is left, the error
+  is the one cause, or all of them. Protocol violations by a worker
+  and local errors (writing the file, what the caller does with it)
+  still fail the run. A file cut off mid-body stays with its mirror to
+  be continued: a validator means nothing to another mirror, where the
+  file starts again, and progress (for strikes) is counted per mirror.
+  Rejected: all mirrors at once up to `-j` (a mirror list of 50 would
+  open up to `-j` connections to hosts further down the list, for a
+  few files each); falling back only after the first mirror failed, as
+  pacman does (one connection, see the numbers below). Measured with
+  `build --fetch` of the 42 packages below (downloads emptied, packages
+  already imported), from `geo.mirror.pkgbuild.com` alone 9.6-10.1 s,
+  with `london.mirror.pkgbuild.com` as the second mirror 9.1-9.2 s, on
+  a link that is bandwidth-bound at about 4.5 MB/s; two is not
+  measured on a faster link. Not done: starting a
+  slow file on a second mirror (WORKERS.md, Fallback) and fetching a
+  file that fails validation again elsewhere (TODO.md).
   Requests aren't pipelined: the worker waits for each response before
   the next request (a round trip with the server, not between
   processes), as some servers and CDNs handle pipelining badly.
@@ -401,9 +447,10 @@ are in BUGS.md.
   under way further than any connection before is a strike. The next
   connection to that origin then waits 1 s, doubled with each strike,
   and at 3 strikes (per origin and run, not reset by progress in
-  between) the download fails. A read or write that times out counts
-  as a connection that ended. A connection that can't be opened fails
-  the download at once, as before. Other limits are open (WORKERS.md).
+  between) the origin is given up. A read or write that times out
+  counts as a connection that ended. A request that fails for good
+  (e.g. `404`) is no strike, as each file fails at most once per
+  mirror. Other limits are open (WORKERS.md).
 - The download stage runs next to the import jobs
   (`download::fetch_and_run`) instead of within them. The thread of an origin checks
   each finished file (size and SHA-256 from the database, then the
