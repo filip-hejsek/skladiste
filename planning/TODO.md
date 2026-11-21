@@ -32,6 +32,9 @@ left of that design: image records (see Images).
     (Fallback). Now only failures move a file to another mirror.
   - Measure how many mirrors should share a repo's files (now 2) on a
     fast link.
+  - A sync's database can go to the other of the two mirrors than the
+    one its latest record is from, which then sends all of it instead
+    of a `304`. The record's mirror should get it first.
   - Fetch a file again when it fails validation, from another mirror if
     there is one; now that fails the run. Needs `done` to hand back
     the sink, or a way to get a new one.
