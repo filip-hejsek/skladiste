@@ -254,6 +254,17 @@ are in BUGS.md.
   importing, not again by builds: the archive of a file isn't kept.
   All `@local` manifests are read for each build that uses it (not
   measured); keep their Arch sections apart if this gets slow.
+- `skl arch local list` prints `@local`'s packages (name, version, id;
+  by name, newest first). `skl arch local remove NAME|NAME=VERSION...`
+  removes their index entries (all versions for a bare name; the
+  version is compared as a string, as listed) and fails without
+  removing anything if one matches none. The kept downloads of URL
+  imports go with them, found by hashing the archives in
+  `downloads/@arch/@local/` (their names don't say which entry they
+  belong to), so importing the URL again downloads it again; they are
+  removed before the index entries, so an interrupted removal can be
+  repeated. Contents stay until `skl gc`. Rejected: removing by
+  pacman's `NAME-VERSION` (ambiguous, names contain `-`).
 - The snapshot's entry gives the URL (`<server>/<FILENAME>`), the
   signature (`%PGPSIG%`, still saved as `.sig` next to the download;
   an entry without one is an error), the size limit and exact size

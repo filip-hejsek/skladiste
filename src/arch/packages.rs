@@ -229,18 +229,118 @@ pub fn load_sources(
 /// All packages in `@local`'s index, sorted by name, newest version
 /// first, so that the resolver prefers the newest that fits.
 pub fn load_local(store: &Store) -> Result<Vec<Imported>> {
-    let mut pkgs = Vec::new();
-    for (_, id) in store.package_index(LOCAL)? {
+    Ok(list_local(store)?.into_iter().map(|e| e.imported).collect())
+}
+
+/// An entry of `@local`'s index.
+#[derive(Debug, Clone)]
+pub struct LocalEntry {
+    /// The hash of the archive the package was imported from.
+    pub archive: Hash,
+    pub imported: Imported,
+}
+
+/// The entries of `@local`'s index, sorted by name, newest version first
+/// (then by archive hash).
+pub fn list_local(store: &Store) -> Result<Vec<LocalEntry>> {
+    let mut entries = Vec::new();
+    for (archive, id) in store.package_index(LOCAL)? {
         let package = store.load_package(&id)?;
-        pkgs.push(Imported { id, package });
+        let imported = Imported { id, package };
+        entries.push(LocalEntry { archive, imported });
     }
-    pkgs.sort_by(|a, b| {
-        let (a, b) = (&a.package, &b.package);
+    // Stable, so equal versions stay in archive order.
+    entries.sort_by(|a, b| {
+        let (a, b) = (&a.imported.package, &b.imported.package);
         a.name
             .cmp(&b.name)
             .then_with(|| version::vercmp(&b.version, &a.version))
     });
-    Ok(pkgs)
+    Ok(entries)
+}
+
+/// Which packages of `@local` to remove: all versions of `name`, or only
+/// `version` (compared as a string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selector {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+impl Selector {
+    fn matches(&self, package: &Package) -> bool {
+        package.name == self.name && self.version.as_ref().is_none_or(|v| *v == package.version)
+    }
+}
+
+impl std::fmt::Display for Selector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.version {
+            Some(version) => write!(f, "{}={version}", self.name),
+            None => f.write_str(&self.name),
+        }
+    }
+}
+
+/// What [`remove_local`] removed.
+#[derive(Debug, Default)]
+pub struct Removed {
+    /// The removed entries, in the order of [`list_local`].
+    pub entries: Vec<LocalEntry>,
+    /// The kept downloads removed with them (archives and signatures).
+    pub downloads: Vec<String>,
+}
+
+/// Remove the packages that `selectors` match from `@local`, failing
+/// without removing anything if one matches none. The downloads kept
+/// for them (by `skl arch import URL`) are removed too, found by hashing
+/// the archives in `downloads/@arch/@local/`, so importing the URL again
+/// downloads it again. Their contents stay in the store until it is
+/// garbage collected (and longer if something else refers to them).
+pub fn remove_local(store: &Store, selectors: &[Selector]) -> Result<Removed> {
+    let entries = list_local(store)?;
+    let unmatched: Vec<String> = selectors
+        .iter()
+        .filter(|s| !entries.iter().any(|e| s.matches(&e.imported.package)))
+        .map(Selector::to_string)
+        .collect();
+    ensure!(
+        unmatched.is_empty(),
+        "not in {LOCAL}: {}",
+        unmatched.join(", ")
+    );
+    let entries: Vec<LocalEntry> = entries
+        .into_iter()
+        .filter(|e| selectors.iter().any(|s| s.matches(&e.imported.package)))
+        .collect();
+    // Downloads first: once the index entries are gone, nothing finds
+    // them, so an interrupted removal can be repeated.
+    let mut downloads = Vec::new();
+    for name in store.downloads(LOCAL)? {
+        if name.ends_with(".sig") {
+            continue;
+        }
+        let Some(file) = store.open_download(LOCAL, &name)? else {
+            continue;
+        };
+        let hash = hash_reader(file).with_context(|| format!("reading {LOCAL}/{name}"))?;
+        if !entries.iter().any(|e| e.archive == hash) {
+            continue;
+        }
+        // The signature first: a download counts as kept only with it
+        // (see `import_local`).
+        let sig = format!("{name}.sig");
+        if store.remove_download(LOCAL, &sig)? {
+            downloads.push(sig);
+        }
+        if store.remove_download(LOCAL, &name)? {
+            downloads.push(name);
+        }
+    }
+    for entry in &entries {
+        store.unindex_package(LOCAL, &entry.archive)?;
+    }
+    Ok(Removed { entries, downloads })
 }
 
 /// A package chosen for a build.
@@ -689,5 +789,75 @@ mod tests {
         };
         assert_eq!(build(&["lib"]), ["lib 2.0-1"]);
         assert_eq!(build(&["app"]), ["app 1-1", "lib 1.10-1"]);
+    }
+
+    #[test]
+    fn removing_local_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::init_path(dir.path()).unwrap();
+        // A package imported from an archive with content `archive`, kept
+        // as download `download` if given.
+        let add = |name: &str, version: &str, archive: &str, download: Option<&str>| {
+            let hash = hash_reader(archive.as_bytes()).unwrap();
+            let pkg = Package {
+                name: name.into(),
+                version: version.into(),
+                entries: vec![],
+                sections: [ArchSection::default().into_section(vec![]).unwrap()].into(),
+                overlay: None,
+            };
+            let id = store.add_package(&pkg).unwrap();
+            store.index_package(LOCAL, &hash, &id).unwrap();
+            if let Some(name) = download {
+                let mut tmp = store.tmp_file().unwrap();
+                tmp.file().write_all(archive.as_bytes()).unwrap();
+                tmp.save_download(LOCAL, name).unwrap();
+                store
+                    .tmp_file()
+                    .unwrap()
+                    .save_download(LOCAL, &format!("{name}.sig"))
+                    .unwrap();
+            }
+        };
+        add("lib", "1-1", "lib 1", Some("lib-1.pkg"));
+        add("lib", "2-1", "lib 2", Some("lib-2.pkg"));
+        add("lib", "2-1", "lib 2 again", None);
+        add("app", "1-1", "app 1", Some("app-1.pkg"));
+        let listed = |store: &Store| -> Vec<String> {
+            list_local(store)
+                .unwrap()
+                .iter()
+                .map(|e| format!("{} {}", e.imported.package.name, e.imported.package.version))
+                .collect()
+        };
+        assert_eq!(listed(&store), ["app 1-1", "lib 2-1", "lib 2-1", "lib 1-1"]);
+        let select = |name: &str, version: Option<&str>| Selector {
+            name: name.into(),
+            version: version.map(Into::into),
+        };
+
+        // Nothing is removed if a selector matches nothing.
+        let e = remove_local(&store, &[select("lib", None), select("app", Some("2-1"))])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("app=2-1"), "{e}");
+        assert_eq!(listed(&store).len(), 4);
+
+        let removed = remove_local(&store, &[select("lib", Some("2-1"))]).unwrap();
+        assert_eq!(removed.entries.len(), 2);
+        assert_eq!(removed.downloads, ["lib-2.pkg.sig", "lib-2.pkg"]);
+        assert_eq!(listed(&store), ["app 1-1", "lib 1-1"]);
+        assert_eq!(
+            store.downloads(LOCAL).unwrap(),
+            ["app-1.pkg", "app-1.pkg.sig", "lib-1.pkg", "lib-1.pkg.sig"]
+        );
+
+        let removed = remove_local(&store, &[select("lib", None)]).unwrap();
+        assert_eq!(removed.downloads, ["lib-1.pkg.sig", "lib-1.pkg"]);
+        assert_eq!(listed(&store), ["app 1-1"]);
+        assert_eq!(
+            store.downloads(LOCAL).unwrap(),
+            ["app-1.pkg", "app-1.pkg.sig"]
+        );
     }
 }

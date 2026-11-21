@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use clap::{Args, Subcommand};
 use rustix::fs::{Mode, OFlags};
 
-use skladiste::arch::packages::{self, Context, Event, LocalFile, LocalPackage, Source};
+use skladiste::arch::packages::{self, Context, Event, Imported, LocalFile, LocalPackage, Source};
 use skladiste::arch::repo::{self, LOCAL_REPO as LOCAL, repo_id};
 use skladiste::arch::scripts::{self, Code};
 use skladiste::arch::verify::{self, KeyringError, KeyringFiles, Verifier};
@@ -83,6 +83,11 @@ enum ArchCommand {
         #[arg(required = true, value_name = "PACKAGE")]
         packages: Vec<String>,
     },
+    /// Manage the packages imported into `@local`.
+    Local {
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
     /// Manage Arch repos.
     Repo {
         #[command(subcommand)]
@@ -96,6 +101,22 @@ enum ArchCommand {
     Sync {
         /// Repos to sync [default: all].
         repos: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalCommand {
+    /// List the packages imported into `@local`: name, version and id,
+    /// sorted by name, newest version first.
+    List,
+    /// Remove packages from `@local`, with the downloads kept for them.
+    ///
+    /// Their contents stay in the store until `skl gc`. Fails without
+    /// removing anything if a package isn't in `@local`.
+    Remove {
+        /// Packages: `NAME` for all its versions, or `NAME=VERSION`.
+        #[arg(required = true, value_name = "PACKAGE")]
+        packages: Vec<String>,
     },
 }
 
@@ -217,6 +238,31 @@ pub(crate) fn run(
                 eprintln!("warning: could not set {} xattrs", r.xattr_failures);
             }
             report_code(&built.code);
+        }
+        ArchCommand::Local {
+            command: LocalCommand::List,
+        } => {
+            for entry in packages::list_local(store)? {
+                let Imported { id, package } = &entry.imported;
+                println!("{}\t{}\t{id}", package.name, package.version);
+            }
+        }
+        ArchCommand::Local {
+            command: LocalCommand::Remove { packages },
+        } => {
+            let selectors = packages
+                .iter()
+                .map(|arg| parse_selector(arg))
+                .collect::<Result<Vec<_>>>()?;
+            let removed = packages::remove_local(store, &selectors)?;
+            for entry in &removed.entries {
+                let package = &entry.imported.package;
+                eprintln!("removed {} {}", package.name, package.version);
+            }
+            for name in &removed.downloads {
+                eprintln!("removed download {LOCAL}/{name}");
+            }
+            eprintln!("`skl gc` removes their contents from the store");
         }
         ArchCommand::Repo {
             command: RepoCommand::Add { name, server, db },
@@ -392,6 +438,22 @@ fn parse_target(arg: &str, repos: &[String]) -> Result<Target> {
     })
 }
 
+/// Read a package argument of `local remove`: `NAME` or `NAME=VERSION`.
+fn parse_selector(arg: &str) -> Result<packages::Selector> {
+    let (name, version) = match arg.split_once('=') {
+        Some((name, version)) => (name, Some(version)),
+        None => (arg, None),
+    };
+    ensure!(
+        repo::check_name(name).is_ok() && version.is_none_or(|v| !v.is_empty()),
+        "{arg:?} is not NAME or NAME=VERSION"
+    );
+    Ok(packages::Selector {
+        name: name.to_owned(),
+        version: version.map(str::to_owned),
+    })
+}
+
 /// Run `f` with a verifier that checks signatures with the keyring
 /// `PREFIX.gpg`, `PREFIX-trusted`, `PREFIX-revoked`, in up to `jobs`
 /// workers at once.
@@ -458,6 +520,16 @@ mod tests {
         ] {
             let e = parse(bad).unwrap_err().to_string();
             assert!(e.contains("skl arch import"), "{e}");
+        }
+    }
+
+    #[test]
+    fn remove_arguments() {
+        let parse = |s: &str| parse_selector(s).map(|s| s.to_string());
+        assert_eq!(parse("bash").unwrap(), "bash");
+        assert_eq!(parse("bash=1:5.3.3-1").unwrap(), "bash=1:5.3.3-1");
+        for bad in ["", "=1", "bash=", "a/b", "./bash-5.3-1-x86_64.pkg.tar.zst"] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
     }
 }

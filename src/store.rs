@@ -743,6 +743,31 @@ impl Store {
         mkdir_repo(&self.dir, "packages", repo)?;
         self.write_replace(&name, format!("{id}\n").as_bytes())
     }
+
+    /// Remove `key` from `repo`'s package index. Returns whether it was
+    /// there. The package's contents stay until [`Store::gc`].
+    pub fn unindex_package(&self, repo: &str, key: &Hash) -> Result<bool> {
+        let name = index_name(repo, key)?;
+        remove_file(&self.dir, &name)
+    }
+
+    /// The names in `downloads/<repo>/`, sorted.
+    pub fn downloads(&self, repo: &str) -> Result<Vec<String>> {
+        repo::check_id(repo)?;
+        let dir = format!("downloads/{repo}");
+        if let Err(Errno::NOENT) = rustix::fs::statat(&self.dir, &dir, AtFlags::empty()) {
+            return Ok(Vec::new());
+        }
+        let mut names = self.list_dir(&dir)?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// Remove `downloads/<repo>/<name>`. Returns whether it was there.
+    pub fn remove_download(&self, repo: &str, name: &str) -> Result<bool> {
+        remove_file(&self.dir, &download_path(repo, name)?)
+    }
+
     /// Add the repo with id `name` with `config` (in the frontend's
     /// format). Fails if the repo exists, or is a pseudo-repo.
     pub fn add_repo(&self, name: &str, config: &impl Serialize) -> Result<()> {
@@ -844,6 +869,15 @@ impl Store {
         let obj = self.read_object(&id)?;
         let record = SyncRecord::from_object(&obj).with_context(|| format!("reading {path}"))?;
         Ok(Some(record))
+    }
+}
+
+/// Remove the file `name` in `dir`; returns whether it was there.
+fn remove_file(dir: impl AsFd, name: &str) -> Result<bool> {
+    match rustix::fs::unlinkat(dir, name, AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {name}")),
     }
 }
 
@@ -1156,6 +1190,11 @@ mod tests {
         assert!(store.index_package("../x", &hash, &id1).is_err());
         let saved = dir.path().join(format!("packages/@arch/core/{hash}"));
         assert_eq!(std::fs::read_to_string(saved).unwrap(), format!("{id2}\n"));
+        assert!(store.unindex_package("@arch/@local", &hash).unwrap());
+        assert!(!store.unindex_package("@arch/@local", &hash).unwrap());
+        assert_eq!(load("@arch/@local"), None);
+        assert_eq!(load("@arch/core"), Some(id2));
+        assert!(store.unindex_package("../x", &hash).is_err());
         // An invalid package isn't added.
         let mut bad = pkg("1");
         bad.sections.insert(
@@ -1240,5 +1279,16 @@ mod tests {
         let saved = std::fs::read(dir.path().join("downloads/@arch/core/a.pkg")).unwrap();
         assert_eq!(saved, b"new");
         assert!(tmp_is_empty(dir.path()));
+        assert_eq!(store.downloads("@arch/extra").unwrap(), [""; 0]);
+        let tmp = store.tmp_file().unwrap();
+        tmp.save_download("@arch/core", "a.pkg.sig").unwrap();
+        assert_eq!(
+            store.downloads("@arch/core").unwrap(),
+            ["a.pkg", "a.pkg.sig"]
+        );
+        assert!(store.remove_download("@arch/core", "a.pkg").unwrap());
+        assert!(!store.remove_download("@arch/core", "a.pkg").unwrap());
+        assert!(store.remove_download("@arch/core", "../x").is_err());
+        assert_eq!(store.downloads("@arch/core").unwrap(), ["a.pkg.sig"]);
     }
 }

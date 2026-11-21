@@ -8,9 +8,9 @@ left of that design: image records (see Images).
 
 ## Arch frontend
 
-- `@local` can't be managed: no command lists or removes imported
-  packages, and a build can't choose an older version of a name except
-  through a versioned dependency.
+- A build can't choose an older version of a name in `@local` except
+  through a versioned dependency (or by removing the newer one with
+  `skl arch local remove NAME=VERSION`).
 - `skl arch import` doesn't check a package's architecture (`arch` in
   `.PKGINFO`).
 - A command to download a build's packages without building.
