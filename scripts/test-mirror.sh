@@ -7,7 +7,8 @@
 #   serve  Start nginx (or reload it if it runs) and print export lines
 #          for eval: the mirror URLs TEST_MIRROR (http) and
 #          TEST_MIRROR_TLS (https), and what skl needs for them:
-#          SKL_CA_CERTS and SKL_KEYRING (the snapshot's keyring).
+#          SKL_CA_CERTS and SKL_KEYRING (the snapshot's keyring, for
+#          `skl arch keyring init`).
 #          SKL_CA_CERTS is a bundle of the test CA and the roots in use
 #          before (SKL_CA_CERTS if set, such as a proxy's CA, else the
 #          system's bundle), so live mirrors keep working.

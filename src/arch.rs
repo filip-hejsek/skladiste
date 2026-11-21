@@ -25,6 +25,7 @@ use crate::store::{BlobSink, Store};
 use crate::worker::{self, Args, ImportStats, Kind, NO_CAPS, RemoteSink, Workers};
 
 pub mod hooks;
+pub mod keyring;
 pub mod packages;
 pub mod repo;
 pub mod scripts;

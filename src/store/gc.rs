@@ -6,7 +6,8 @@
 //! - `synthetic/<spec>`, the synthetic cache, which keeps both the build
 //!   spec it is named by and the synthetic package it holds;
 //! - `repos/<repo>/syncs/<time>`, the sync records, of which
-//!   [`Options::keep_syncs`] can drop all but the latest.
+//!   [`Options::keep_syncs`] can drop all but the latest;
+//! - `keyrings/@FORMAT`, each format's keyring.
 //!
 //! From the roots, the GC follows the references in objects' headers
 //! ([`object::read_header`]), never reading a body, so it needs no
@@ -100,6 +101,11 @@ impl Store {
         let mut roots = Vec::new();
         self.index_roots("packages", &mut roots)?;
         self.synthetic_roots(&mut roots)?;
+        match rustix::fs::statat(&self.dir, "keyrings", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => self.index_roots("keyrings", &mut roots)?,
+            Err(Errno::NOENT) => {}
+            Err(e) => return Err(e).context("checking keyrings"),
+        }
         let dropped = self.sync_roots(options.keep_syncs, &mut roots)?;
         let live = self.mark(&roots)?;
 
@@ -133,7 +139,7 @@ impl Store {
     }
 
     /// Every file below the directory `path` as a root (the package
-    /// indexes: `packages/@FORMAT/REPO/KEY`).
+    /// indexes, `packages/@FORMAT/REPO/KEY`, and `keyrings/@FORMAT`).
     fn index_roots(&self, path: &str, roots: &mut Vec<Root>) -> Result<()> {
         for (name, kind) in self.typed_entries(path)? {
             let file = format!("{path}/{name}");

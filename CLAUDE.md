@@ -44,12 +44,14 @@ repo is on btrfs:
 dir=tmp  # any directory on btrfs
 scripts/test-mirror.sh fetch  # once; does nothing if it is there
 # Starts nginx (or reloads it) and sets TEST_MIRROR (http),
-# TEST_MIRROR_TLS (https), SKL_CA_CERTS and SKL_KEYRING.
+# TEST_MIRROR_TLS (https), SKL_CA_CERTS and SKL_KEYRING (the snapshot's
+# keyring, which `skl arch keyring init` reads).
 eval "$(scripts/test-mirror.sh serve)"
 export SKL_STORE=$dir/store
 skl() { cargo run -q --release -- "$@"; }
 mirror=$TEST_MIRROR_TLS  # or $TEST_MIRROR
-skl init && skl arch repo add core "$mirror" && skl arch repo add extra "$mirror"  # once
+skl init && skl arch keyring init  # once
+skl arch repo add core "$mirror" && skl arch repo add extra "$mirror"  # once
 # 42 packages with dependencies, downloaded into the store's downloads/.
 skl arch build --sync --fetch --repo core --repo extra -o $dir/img filesystem bash coreutils
 unshare -r chroot $dir/img /usr/bin/bash -c 'ls /'  # needs user namespaces
@@ -62,9 +64,10 @@ package files (`skl arch import FILE...`, then `skl arch build --repo
 @local`), take them from `tmp/test-cache/arch/*/{core,extra}/os/x86_64/`.
 
 Changes to downloading or syncing also need an occasional check against
-a live mirror (`https://geo.mirror.pkgbuild.com/$repo/os/$arch`, with
-`SKL_KEYRING` set to the current keyring,
-`/usr/share/pacman/keyrings/archlinux`). The `SKL_CA_CERTS` that
+a live mirror (`https://geo.mirror.pkgbuild.com/$repo/os/$arch`, in
+a store whose keyring is current: `skl arch keyring init
+/usr/share/pacman/keyrings/archlinux`, then `skl arch keyring update
+--sync --fetch --repo core`). The `SKL_CA_CERTS` that
 `serve` sets has the test CA added to the roots in use before (the
 `SKL_CA_CERTS` it found, e.g. a proxy's CA, or else the system's
 bundle), so it works for live mirrors too. For package files of other

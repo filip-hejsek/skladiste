@@ -18,9 +18,10 @@ left of that design: image records (see Images).
   that fits each dependency and reports a conflict rather than trying
   another choice.
 - `REPLACES` is read but not used; it matters for upgrades.
-- Manage the keyring in skl (from the `archlinux-keyring` package,
-  updated like other packages and verified by the current keyring)
-  instead of a path on the command line.
+- Builds don't update the keyring (`skl arch keyring update` is a step
+  of its own), so a package signed by a new packager key fails until it
+  is run. `build --sync` could update it first from the same repos.
+  Keys aren't refreshed from WKD as `archlinux-keyring-wkd-sync` does.
 - Downloads from a mirror list. Now a repo has one server, and each
   origin one worker with one connection (see Downloads in
   DECISIONS.md), so the packages of repos on one host are downloaded

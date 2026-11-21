@@ -237,7 +237,8 @@ questions are at the end.
 ## Roots
 
 - What the GC starts from: the Arch index, the synthetic cache, image
-  records (not kept yet), and repo snapshots. Sync records are objects
+  records (not kept yet), repo snapshots, and each format's keyring
+  (`keyrings/@FORMAT`, a record the frontend writes). Sync records are objects
   referring to the database (a blob), each with a named ref
   (`repos/<repo>/syncs/<time>`). Roots are small files holding an id,
   outside `objects/`. Build specs aren't roots: a synthetic cache entry

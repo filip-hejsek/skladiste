@@ -6,14 +6,17 @@ use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use clap::{Args, Subcommand};
 use rustix::fs::{Mode, OFlags};
 
-use skladiste::arch::packages::{self, Context, Event, Imported, LocalFile, LocalPackage, Source};
+use skladiste::arch::keyring::{self, NoKeyring, Outcome, Record};
+use skladiste::arch::packages::{
+    self, Chosen, Context, Event, Imported, LocalFile, LocalPackage, Source,
+};
 use skladiste::arch::repo::{self, LOCAL_REPO as LOCAL, repo_id};
 use skladiste::arch::scripts::{self, Code};
-use skladiste::arch::verify::{self, KeyringError, KeyringFiles, Verifier};
+use skladiste::arch::verify::{KeyringFiles, Verifier};
 use skladiste::http::Url;
 use skladiste::resolve::Target;
 use skladiste::store::Store;
@@ -23,12 +26,6 @@ use super::mib;
 
 #[derive(Args)]
 pub(crate) struct ArchArgs {
-    /// Arch keyring to verify package signatures with, as the path without
-    /// suffix: PREFIX.gpg, PREFIX-trusted and PREFIX-revoked are read.
-    /// Needed for importing packages.
-    #[arg(long, env = "SKL_KEYRING", value_name = "PREFIX", global = true)]
-    keyring: Option<PathBuf>,
-
     #[command(subcommand)]
     command: ArchCommand,
 }
@@ -93,6 +90,15 @@ enum ArchCommand {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Manage the keyring that package signatures are verified with.
+    ///
+    /// The keyring is kept in the store. It is set from files with `init`
+    /// and updated from the archlinux-keyring package of a repo with
+    /// `update`. Importing packages needs it.
+    Keyring {
+        #[command(subcommand)]
+        command: KeyringCommand,
+    },
     /// Download the databases of Arch repos.
     ///
     /// Every version is kept; builds use the latest. Repos synced together
@@ -141,6 +147,42 @@ enum RepoCommand {
     List,
 }
 
+#[derive(Subcommand)]
+enum KeyringCommand {
+    /// Make the Arch keyring files PREFIX.gpg, PREFIX-trusted and
+    /// PREFIX-revoked the store's keyring, replacing the one there.
+    ///
+    /// These are trusted as given: use the keyring of an Arch system
+    /// (/usr/share/pacman/keyrings/archlinux, from archlinux-keyring) or of
+    /// a package file you have checked.
+    Init {
+        /// The keyring files' path without suffix, e.g.
+        /// /usr/share/pacman/keyrings/archlinux.
+        #[arg(env = "SKL_KEYRING", value_name = "PREFIX")]
+        prefix: PathBuf,
+    },
+    /// Update the keyring from the archlinux-keyring package of a repo.
+    ///
+    /// The package is verified with the store's keyring, as builds verify
+    /// packages, and taken from the first repo that has it. Versions older
+    /// than the one the keyring is from are refused.
+    Update {
+        /// Download the databases of the repos first, as `skl arch sync`
+        /// does.
+        #[arg(long)]
+        sync: bool,
+        /// Download the package if it isn't in the store yet.
+        #[arg(long)]
+        fetch: bool,
+        /// Repo to take the package from (repeatable, in priority order),
+        /// as for `skl arch build`.
+        #[arg(long = "repo", value_name = "REPO", required = true)]
+        repos: Vec<String>,
+    },
+    /// Show where the store's keyring is from.
+    Show,
+}
+
 /// Run `skl arch`.
 pub(crate) fn run(
     args: ArchArgs,
@@ -148,14 +190,13 @@ pub(crate) fn run(
     store: &Store,
     jobs: NonZeroUsize,
 ) -> Result<()> {
-    let keyring = args.keyring.as_deref();
     match args.command {
         ArchCommand::Import { packages } => {
             let packages = packages
                 .iter()
                 .map(|arg| local_package(arg))
                 .collect::<Result<Vec<_>>>()?;
-            with_verifier(workers, keyring, jobs, |verifier| {
+            with_verifier(workers, store, jobs, |verifier| {
                 let ctx = context(workers, store, verifier, jobs);
                 packages::import_local(&ctx, packages)
             })?;
@@ -180,24 +221,7 @@ pub(crate) fn run(
                 .iter()
                 .map(|arg| parse_target(arg, &repos))
                 .collect::<Result<Vec<_>>>()?;
-            let synced: Vec<String> = repos.iter().filter(|r| *r != LOCAL).cloned().collect();
-            if sync_first && !synced.is_empty() {
-                sync(workers, store, synced, jobs)?;
-            }
-            let sources = packages::load_sources(workers, store, &repos, jobs)?;
-            for source in &sources {
-                match source {
-                    Source::Local(pkgs) => {
-                        eprintln!("using {LOCAL} ({} imported packages)", pkgs.len());
-                    }
-                    Source::Synced(s) => eprintln!(
-                        "using {} as synced at {} ({} packages)",
-                        s.repo,
-                        s.record.fetched,
-                        s.entries.len()
-                    ),
-                }
-            }
+            let sources = load_sources(workers, store, &repos, sync_first, jobs)?;
             let chosen = packages::choose(&sources, &targets)?;
             eprintln!(
                 "resolved {} packages ({} requested)",
@@ -206,7 +230,7 @@ pub(crate) fn run(
             );
             let packages = match packages::all_local(&chosen) {
                 Some(packages) => packages,
-                None => with_verifier(workers, keyring, jobs, |verifier| {
+                None => with_verifier(workers, store, jobs, |verifier| {
                     let ctx = context(workers, store, verifier, jobs);
                     packages::get_packages(&ctx, &chosen, fetch)
                 })?,
@@ -281,6 +305,7 @@ pub(crate) fn run(
                 println!("{name}\t{}\t{}\t{synced}", config.db, config.server);
             }
         }
+        ArchCommand::Keyring { command } => run_keyring(command, workers, store, jobs)?,
         ArchCommand::Sync { repos } => {
             let repos = repos
                 .iter()
@@ -290,6 +315,108 @@ pub(crate) fn run(
         }
     }
     Ok(())
+}
+
+/// Run `skl arch keyring`.
+fn run_keyring(
+    command: KeyringCommand,
+    workers: &Workers,
+    store: &Store,
+    jobs: NonZeroUsize,
+) -> Result<()> {
+    let outcome = match command {
+        KeyringCommand::Init { prefix } => {
+            let open = |suffix| {
+                let path = with_suffix(&prefix, suffix);
+                File::open(&path).with_context(|| format!("opening {}", path.display()))
+            };
+            let files = KeyringFiles {
+                certs: open(".gpg")?,
+                trusted: open("-trusted")?,
+                revoked: open("-revoked")?,
+            };
+            keyring::init(workers, store, files)
+                .with_context(|| format!("setting the keyring {}", prefix.display()))?
+        }
+        KeyringCommand::Update { sync, fetch, repos } => {
+            let repos = repos
+                .iter()
+                .map(|r| repo_id(r))
+                .collect::<Result<Vec<_>>>()?;
+            let sources = load_sources(workers, store, &repos, sync, jobs)?;
+            let chosen = packages::find(&sources, keyring::PACKAGE)?;
+            let id = match &chosen {
+                Chosen::Local(pkg) => pkg.id,
+                Chosen::Repo(_) => with_verifier(workers, store, jobs, |verifier| {
+                    let ctx = context(workers, store, verifier, jobs);
+                    packages::get_packages(&ctx, std::slice::from_ref(&chosen), fetch)
+                })?[0],
+            };
+            keyring::update(workers, store, &id)?
+        }
+        KeyringCommand::Show => {
+            match keyring::current(store)? {
+                Some((id, record)) => {
+                    println!("{id}\t{}\t{}", describe(&record), record.added);
+                }
+                None => println!("no keyring"),
+            }
+            return Ok(());
+        }
+    };
+    match outcome {
+        Outcome::Unchanged(record) => {
+            eprintln!("the keyring is already {}", describe(&record));
+        }
+        Outcome::Set { old, new } => match old {
+            Some(old) => eprintln!(
+                "the keyring is now {} (was {})",
+                describe(&new),
+                describe(&old)
+            ),
+            None => eprintln!("the keyring is now {}", describe(&new)),
+        },
+    }
+    Ok(())
+}
+
+/// Where the keyring `record` is from, for messages: `archlinux-keyring
+/// VERSION`, or `from files`.
+fn describe(record: &Record) -> String {
+    match &record.package {
+        Some(p) => format!("{} {}", keyring::PACKAGE, p.version),
+        None => "from files".to_owned(),
+    }
+}
+
+/// Load what `repos` (ids) offer, syncing those other than `@local`
+/// first if `sync_first`, and say which versions are used.
+fn load_sources(
+    workers: &Workers,
+    store: &Store,
+    repos: &[String],
+    sync_first: bool,
+    jobs: NonZeroUsize,
+) -> Result<Vec<Source>> {
+    let synced: Vec<String> = repos.iter().filter(|r| *r != LOCAL).cloned().collect();
+    if sync_first && !synced.is_empty() {
+        sync(workers, store, synced, jobs)?;
+    }
+    let sources = packages::load_sources(workers, store, repos, jobs)?;
+    for source in &sources {
+        match source {
+            Source::Local(pkgs) => {
+                eprintln!("using {LOCAL} ({} imported packages)", pkgs.len());
+            }
+            Source::Synced(s) => eprintln!(
+                "using {} as synced at {} ({} packages)",
+                s.repo,
+                s.record.fetched,
+                s.entries.len()
+            ),
+        }
+    }
+    Ok(sources)
 }
 
 /// Report what a build did about package code.
@@ -460,32 +587,25 @@ fn parse_selector(arg: &str) -> Result<packages::Selector> {
     })
 }
 
-/// Run `f` with a verifier that checks signatures with the keyring
-/// `PREFIX.gpg`, `PREFIX-trusted`, `PREFIX-revoked`, in up to `jobs`
-/// workers at once.
+/// Run `f` with a verifier that checks signatures with the store's
+/// keyring, in up to `jobs` workers at once.
 fn with_verifier<T>(
     workers: &Workers,
-    prefix: Option<&Path>,
+    store: &Store,
     jobs: NonZeroUsize,
     f: impl FnOnce(&Verifier) -> Result<T>,
 ) -> Result<T> {
-    let prefix = prefix.context("no keyring given (--keyring or SKL_KEYRING)")?;
-    let loading = || format!("loading keyring {}", prefix.display());
-    let open = |suffix| {
-        let path = with_suffix(prefix, suffix);
-        File::open(&path).with_context(|| format!("opening {}", path.display()))
-    };
-    let files = (|| -> Result<KeyringFiles> {
-        Ok(KeyringFiles {
-            certs: open(".gpg")?,
-            trusted: open("-trusted")?,
-            revoked: open("-revoked")?,
-        })
-    })()
-    .with_context(loading)?;
-    verify::with_verifier(workers, files, jobs.get(), f).map_err(|e| match e.is::<KeyringError>() {
-        true => e.context(loading()),
-        false => e,
+    keyring::with_verifier(workers, store, jobs.get(), f).map_err(|e| {
+        if e.is::<NoKeyring>() {
+            anyhow!(
+                "{e}; set one with `skl arch keyring init PREFIX` \
+                 (e.g. /usr/share/pacman/keyrings/archlinux)"
+            )
+        } else if format!("{e:#}").contains("key not in the keyring") {
+            anyhow!("{e:#}; if the keyring is outdated, `skl arch keyring update` updates it")
+        } else {
+            e
+        }
     })
 }
 

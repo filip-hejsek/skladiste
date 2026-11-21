@@ -1,6 +1,6 @@
 //! Signature verification through the sandboxed `verify-arch` workers, with
-//! a generated keyring. The rules themselves are tested in
-//! `arch::signature`.
+//! a generated keyring, and the keyring kept in the store. The rules
+//! themselves are tested in `arch::signature`.
 
 use std::fs::File;
 use std::io::{Seek, Write};
@@ -14,7 +14,12 @@ use sequoia_openpgp::packet::signature::SignatureBuilder;
 use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::MarshalInto;
 use sequoia_openpgp::types::SignatureType;
+use skladiste::arch::keyring::{self, NoKeyring, Outcome};
+use skladiste::arch::packages::{self, Context, LocalFile, LocalPackage};
+use skladiste::arch::repo::LOCAL_REPO;
 use skladiste::arch::verify::{KeyringError, KeyringFiles, with_verifier};
+use skladiste::manifest::Hash;
+use skladiste::store::{Store, gc};
 use skladiste::worker::Workers;
 
 static POLICY: StandardPolicy = StandardPolicy::new();
@@ -217,4 +222,155 @@ fn bad_keyring_fails_first() {
     assert!(!ran);
     assert!(e.is::<KeyringError>(), "{e:#}");
     assert!(format!("{e:#}").contains("master key list"), "{e:#}");
+}
+
+/// Write an `archlinux-keyring`-like package `name` of `version` with the
+/// keyring files in `keyring`, and its signature by `signer`, to `dir`;
+/// returns the package's file name.
+fn keyring_package(dir: &Path, name: &str, version: &str, keyring: &Path, signer: &Cert) -> String {
+    let mut b = tar::Builder::new(zstd::Encoder::new(Vec::new(), 3).unwrap());
+    let pkginfo = format!("pkgname = {name}\npkgver = {version}\n");
+    let mut files = vec![(".PKGINFO".to_owned(), pkginfo.into_bytes())];
+    for (file, path) in [
+        ("keyring.gpg", "archlinux.gpg"),
+        ("keyring-trusted", "archlinux-trusted"),
+        ("keyring-revoked", "archlinux-revoked"),
+    ] {
+        let data = std::fs::read(keyring.join(file)).unwrap();
+        files.push((format!("usr/share/pacman/keyrings/{path}"), data));
+    }
+    for (path, data) in files {
+        let mut h = tar::Header::new_ustar();
+        h.set_mtime(1_000_000);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mode(0o644);
+        h.set_size(data.len() as u64);
+        b.append_data(&mut h, path, data.as_slice()).unwrap();
+    }
+    let archive = b.into_inner().unwrap().finish().unwrap();
+    let file = format!("{name}-{version}-any.pkg.tar.zst");
+    std::fs::write(dir.join(&file), &archive).unwrap();
+    std::fs::write(dir.join(format!("{file}.sig")), sign(signer, &archive)).unwrap();
+    file
+}
+
+/// Import the package file `name` in `dir` into `@local`, verified with
+/// the store's keyring, returning the package's id.
+fn import_local(store: &Store, dir: &Path, name: &str) -> anyhow::Result<Hash> {
+    let workers = workers();
+    let path = dir.join(name);
+    let sig = dir.join(format!("{name}.sig"));
+    let before = store.package_index(LOCAL_REPO)?;
+    keyring::with_verifier(&workers, store, 1, |verifier| {
+        let ctx = Context {
+            workers: &workers,
+            store,
+            verifier,
+            jobs: 1.try_into().unwrap(),
+            report: &|_| {},
+        };
+        let file = LocalFile {
+            name: name.to_owned(),
+            size: 0,
+            open: Box::new(move || Ok((File::open(&path)?, File::open(&sig)?))),
+        };
+        packages::import_local(&ctx, vec![LocalPackage::File(file)])
+    })?;
+    let after = store.package_index(LOCAL_REPO)?;
+    Ok(after.into_iter().find(|e| !before.contains(e)).unwrap().1)
+}
+
+/// Check `signature` of `data` with the store's keyring.
+fn store_verifies(store: &Store, signature: &[u8], data: &[u8]) -> anyhow::Result<()> {
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(data).unwrap();
+    keyring::with_verifier(&workers(), store, 1, |v| v.verify(signature, &file))
+}
+
+#[test]
+fn keyring_in_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let [old_dir, new_dir, store_dir] = ["old", "new", "store"].map(|d| dir.path().join(d));
+    for d in [&old_dir, &new_dir, &store_dir] {
+        std::fs::create_dir(d).unwrap();
+    }
+    let old = setup(&old_dir);
+    let new = setup(&new_dir);
+    let store = Store::init_path(&store_dir).unwrap();
+    let w = workers();
+    let data = b"package";
+
+    let e = store_verifies(&store, b"", data).unwrap_err();
+    assert!(e.is::<NoKeyring>(), "{e:#}");
+
+    // Files the user gives; giving them again changes nothing.
+    match keyring::init(&w, &store, keyring(&old_dir)).unwrap() {
+        Outcome::Set { old: None, new } => assert_eq!(new.package, None),
+        other => panic!("{other:?}"),
+    }
+    let first = keyring::current(&store).unwrap().unwrap();
+    let outcome = keyring::init(&w, &store, keyring(&old_dir)).unwrap();
+    assert_eq!(outcome, Outcome::Unchanged(first.1.clone()));
+
+    // The GC keeps the keyring's record and blobs.
+    drop(store);
+    let exclusive = Store::open_exclusive_path(&store_dir).unwrap();
+    exclusive.gc(&gc::Options::default()).unwrap();
+    drop(exclusive);
+    let store = Store::open_path(&store_dir).unwrap();
+    assert_eq!(keyring::current(&store).unwrap().unwrap(), first);
+    store_verifies(&store, &sign(&old.packager, data), data).unwrap();
+    let e = store_verifies(&store, &sign(&new.packager, data), data).unwrap_err();
+    assert!(format!("{e:#}").contains("not in the keyring"), "{e:#}");
+
+    // An update from a package signed by a key of the store's keyring.
+    let pkgs = dir.path();
+    let file = keyring_package(
+        pkgs,
+        "archlinux-keyring",
+        "20260101-1",
+        &new_dir,
+        &old.packager,
+    );
+    let id = import_local(&store, pkgs, &file).unwrap();
+    match keyring::update(&w, &store, &id).unwrap() {
+        Outcome::Set { old: Some(o), new } => {
+            assert_eq!(o, first.1);
+            let from = new.package.unwrap();
+            assert_eq!((from.id, from.version.as_str()), (id, "20260101-1"));
+        }
+        other => panic!("{other:?}"),
+    }
+    store_verifies(&store, &sign(&new.packager, data), data).unwrap();
+    let e = store_verifies(&store, &sign(&old.packager, data), data).unwrap_err();
+    assert!(format!("{e:#}").contains("not in the keyring"), "{e:#}");
+    // The same version again changes nothing.
+    let current = keyring::current(&store).unwrap().unwrap().1;
+    let outcome = keyring::update(&w, &store, &id).unwrap();
+    assert_eq!(outcome, Outcome::Unchanged(current.clone()));
+
+    // An older version is refused, though its signature is good.
+    let file = keyring_package(
+        pkgs,
+        "archlinux-keyring",
+        "20250101-1",
+        &old_dir,
+        &new.packager,
+    );
+    let older = import_local(&store, pkgs, &file).unwrap();
+    let e = keyring::update(&w, &store, &older).unwrap_err();
+    assert!(format!("{e:#}").contains("older"), "{e:#}");
+    // So is a package of another name.
+    let file = keyring_package(pkgs, "other-keyring", "20270101-1", &old_dir, &new.packager);
+    let other = import_local(&store, pkgs, &file).unwrap();
+    let e = keyring::update(&w, &store, &other).unwrap_err();
+    assert!(format!("{e:#}").contains("not archlinux-keyring"), "{e:#}");
+    assert_eq!(keyring::current(&store).unwrap().unwrap().1, current);
+
+    // Files that don't load as a keyring aren't set.
+    std::fs::write(old_dir.join("keyring-trusted"), "nothex:4:\n").unwrap();
+    let e = keyring::init(&w, &store, keyring(&old_dir)).unwrap_err();
+    assert!(format!("{e:#}").contains("master key list"), "{e:#}");
+    assert_eq!(keyring::current(&store).unwrap().unwrap().1, current);
 }

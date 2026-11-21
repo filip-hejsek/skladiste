@@ -25,7 +25,7 @@ are in BUGS.md.
 - Commands of a package format are under a subcommand named for its
   frontend (`skl arch import|build|repo|sync`); format-independent ones
   (`skl run`, `skl repo list`) are at the top level. Options only a frontend uses
-  (`--keyring`) are its subcommand's. Rejected: flat commands (`skl
+  are its subcommand's. Rejected: flat commands (`skl
   build`), which give the generic verbs to Arch; core verbs that
   dispatch to a frontend by the repo's format, premature with one
   frontend (and a build can't mix formats).
@@ -52,7 +52,8 @@ are in BUGS.md.
   PACKAGES.md: a header of references and a canonical JSON body),
   `packages/<repo>/<key>` for each repo's index of imported packages,
   `downloads/<repo>/` for downloaded packages, `repos/<repo>/` for repos
-  (see Repos), `tmp/` for blobs and manifests being written.
+  (see Repos), `keyrings/@FORMAT` for a format's keyring (see Package
+  signatures), `tmp/` for blobs and manifests being written.
 - A store is set up explicitly (`skl init`, `Store::init`); other
   commands only open an existing one and fail if it has no store
   manifest or a directory of the layout is missing, so a mistyped
@@ -125,7 +126,7 @@ are in BUGS.md.
 - `skl gc` (`Store::gc`, `src/store/gc.rs`) removes every blob and
   object not reachable from the roots (PACKAGES.md, Roots: package
   indexes, the synthetic cache by both its name and its content, sync
-  records), following only objects' headers.
+  records, keyrings), following only objects' headers.
 - Concurrency by a lock: an open store holds a `flock` on its directory,
   shared normally, exclusive for the GC (`Store::open_exclusive`) and
   migrations. Exclusive takers fail with `InUse` instead of waiting
@@ -479,10 +480,40 @@ are in BUGS.md.
   packages from synced repos this is repeated by every build, from the
   kept download (the keyring may have changed since); `@local` packages
   are checked only when imported.
-  There's no option to skip it. The keyring is given as a path prefix
-  (`--keyring`, `SKL_KEYRING`): `PREFIX.gpg`, `PREFIX-trusted`,
-  `PREFIX-revoked`, as in `/usr/share/pacman/keyrings/`. skl is meant
-  to manage the keyring itself later.
+  There's no option to skip it.
+- The keyring is kept in the store (`arch::keyring`): a record, an
+  object referring to the three files of `/usr/share/pacman/keyrings/`
+  as blobs and, if they came from a package, to the `archlinux-keyring`
+  package with its version, and the time it was set. `keyrings/@arch`
+  holds the record's id (`Store::keyring`; a GC root). Only the current
+  keyring is kept; a replaced record is garbage (the package stays in
+  its repo's index). Rejected: a path prefix on every command
+  (`--keyring`, as before), which trusts whatever each run is given and
+  can't be updated through skl.
+- `skl arch keyring init PREFIX` (`SKL_KEYRING`) sets the keyring from
+  `PREFIX.gpg`, `PREFIX-trusted` and `PREFIX-revoked`, trusted as
+  given: this is the trust anchor, like installing pacman's keyring.
+  Files equal to the current keyring's keep its record (and the version
+  it is from); others replace any keyring, also a newer one from a
+  package, since it is the user's explicit choice. The files must load
+  in a verifier before they are set.
+- `skl arch keyring update --repo REPO...` (`--sync`, `--fetch` as for
+  `build`) takes the package `archlinux-keyring` by name (not a
+  provide) from the first repo that has it, without its dependencies
+  (it depends on `pacman`), and gets it as builds get packages:
+  verified with the current keyring, against the database's size,
+  SHA-256, name and version. Its three files become the keyring once
+  they load. An older version than the current keyring's package (by
+  `vercmp`) is refused and the same version keeps the current record,
+  so a mirror can hold back keyring updates but not roll back below a
+  version skl has taken; a keyring from files has no version, so any
+  version replaces it. From `@local` the package is taken as imported,
+  verified then. Builds don't update the keyring (TODO.md); when a
+  signature is by a key not in the keyring, the CLI suggests `update`.
+- `keyrings/` is created when the first keyring is set, so stores from
+  before open unchanged, without a new development version. Accepted:
+  a GC by an older skl doesn't know the root and removes the record
+  (and the blobs of a keyring from files).
 - OpenPGP library: Sequoia (`sequoia-openpgp`) with its pure-Rust
   crypto backend (`crypto-rust`, which needs `allow-experimental-crypto`
   and `allow-variable-time-crypto`; timing doesn't matter, only public

@@ -20,6 +20,9 @@
 //! - `repos/<repo>/syncs/<time>` — the id of a record of each version of
 //!   the repo's database that was fetched ([`SyncRecord`], an object); the
 //!   database itself is a blob
+//! - `keyrings/@FORMAT` — the id of the record of a format's keyring, the
+//!   keys its packages are verified with (an object of the frontend's,
+//!   e.g. [`crate::arch::keyring`]); created when the first is set
 //! - `tmp/` — staging area for files being written: unnamed
 //!   (`O_TMPFILE`) until complete and checked, except files that are
 //!   replaced (index entries, the store manifest)
@@ -317,6 +320,12 @@ fn object_name(hash: &Hash) -> String {
 
 /// Largest object accepted when reading.
 const MAX_OBJECT: u64 = 1 << 30;
+
+/// `keyrings/@<format>`.
+fn keyring_name(format: &str) -> Result<String> {
+    repo::check_format(format)?;
+    Ok(format!("keyrings/@{format}"))
+}
 
 /// `packages/<repo>/<key>`.
 fn index_name(repo: &str, key: &Hash) -> Result<String> {
@@ -710,6 +719,20 @@ impl Store {
     /// replacing what was recorded before.
     pub fn save_synthetic(&self, spec: &Hash, id: &Hash) -> Result<()> {
         self.write_replace(&format!("synthetic/{spec}"), format!("{id}\n").as_bytes())
+    }
+
+    /// The id of the record of package format `format`'s keyring, if one
+    /// was set.
+    pub fn keyring(&self, format: &str) -> Result<Option<Hash>> {
+        self.read_id(&keyring_name(format)?)
+    }
+
+    /// Make the object `id` the record of `format`'s keyring, replacing the
+    /// one before.
+    pub fn set_keyring(&self, format: &str, id: &Hash) -> Result<()> {
+        let name = keyring_name(format)?;
+        mkdir_exist_ok(&self.dir, "keyrings").context("creating keyrings")?;
+        self.write_replace(&name, format!("{id}\n").as_bytes())
     }
 
     /// The keys in `repo`'s package index with the ids they hold, sorted

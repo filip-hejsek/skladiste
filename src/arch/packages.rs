@@ -1,7 +1,7 @@
 //! Getting Arch packages into the store: importing package files into
 //! `@local` ([`import_local`]), and choosing packages for a build from
-//! repos ([`load_sources`], [`choose`]) and importing those
-//! ([`get_packages`]).
+//! repos ([`load_sources`], [`choose`], or [`find`] for one package) and
+//! importing those ([`get_packages`]).
 //!
 //! Each import runs in its own worker (so a compromised worker can't
 //! change another package's manifest), after the archive's signature was
@@ -394,24 +394,49 @@ pub fn choose<'a>(sources: &'a [Source], targets: &[Target]) -> Result<Vec<Chose
         .into_iter()
         .map(|(r, i)| match &sources[r] {
             Source::Local(pkgs) => Ok(Chosen::Local(&pkgs[i])),
-            Source::Synced(snapshot) => {
-                let entry = &snapshot.entries[i];
-                ensure!(
-                    entry.arch == repo::ARCH || entry.arch == "any",
-                    "package {}/{} is for {}, not {}",
-                    snapshot.repo,
-                    entry.name,
-                    entry.arch,
-                    repo::ARCH
-                );
-                Ok(Chosen::Repo(RepoPackage {
-                    repo: &snapshot.repo,
-                    url: snapshot.config.package_url(&entry.filename)?,
-                    entry,
-                }))
-            }
+            Source::Synced(snapshot) => repo_package(snapshot, i),
         })
         .collect()
+}
+
+/// The package named `name` (not one that provides it) from the first of
+/// `sources` that has one, without its dependencies: the newest version
+/// in `@local`.
+pub fn find<'a>(sources: &'a [Source], name: &str) -> Result<Chosen<'a>> {
+    for source in sources {
+        match source {
+            Source::Local(pkgs) => {
+                if let Some(pkg) = pkgs.iter().find(|p| p.package.name == name) {
+                    return Ok(Chosen::Local(pkg));
+                }
+            }
+            Source::Synced(snapshot) => {
+                if let Some(i) = snapshot.entries.iter().position(|e| e.name == name) {
+                    return repo_package(snapshot, i);
+                }
+            }
+        }
+    }
+    bail!("no package {name} in the repos")
+}
+
+/// Entry `i` of `snapshot` as a package to get, if it is for this
+/// architecture.
+fn repo_package(snapshot: &Snapshot, i: usize) -> Result<Chosen<'_>> {
+    let entry = &snapshot.entries[i];
+    ensure!(
+        entry.arch == repo::ARCH || entry.arch == "any",
+        "package {}/{} is for {}, not {}",
+        snapshot.repo,
+        entry.name,
+        entry.arch,
+        repo::ARCH
+    );
+    Ok(Chosen::Repo(RepoPackage {
+        repo: &snapshot.repo,
+        url: snapshot.config.package_url(&entry.filename)?,
+        entry,
+    }))
 }
 
 /// The ids of `chosen` if all of them are imported packages, which

@@ -14,6 +14,9 @@ formats can be added as frontends.
 - Imports Arch `.pkg.tar.zst` packages into the store, after checking
   each package's signature (`.sig` next to it) against the Arch keyring:
   the signing key must be certified by at least 3 of the master keys
+- Keeps the keyring in the store, set once from files and updated from
+  the `archlinux-keyring` package of a repo, which the keyring before
+  verifies (`skl arch keyring`); older versions are refused
 - Builds a new image subvolume from a list of package names, looked up
   in repos and among package files imported before (`skl arch import`)
 - Keeps Arch repo databases (`skl arch repo add`, `skl arch sync`), every
@@ -43,11 +46,12 @@ The store and images must be on the same btrfs filesystem.
 ```sh
 export SKL_STORE=/path/on/btrfs/store
 skl init
-export SKL_KEYRING=/usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
+skl arch keyring init /usr/share/pacman/keyrings/archlinux  # from archlinux-keyring
 mirror='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
 skl arch repo add core "$mirror"
 skl arch repo add extra "$mirror"
 skl arch sync
+skl arch keyring update --fetch --repo core
 skl arch build --fetch --repo core --repo extra -o image filesystem bash coreutils
 skl run image bash
 ```
@@ -65,6 +69,18 @@ one repo) and uses the repos given with `--repo`, in priority order. It
 uses the network only when asked: `--sync` downloads the repos'
 databases first (as `skl arch sync`), and `--fetch` downloads packages
 that aren't in the store yet.
+
+The keyring that signatures are checked with is kept in the store.
+`skl arch keyring init PREFIX` trusts the files `PREFIX.gpg`,
+`PREFIX-trusted` and `PREFIX-revoked` as given (those of an Arch system,
+or of an `archlinux-keyring` package you have checked). After that,
+`skl arch keyring update --repo REPO...` takes the keyring from the
+`archlinux-keyring` package of the first repo that has it, once the
+current keyring has verified the package, as builds verify packages; it
+refuses a version older than the one the keyring is from. `skl arch
+keyring show` says where the keyring is from. Builds don't update the
+keyring: run `update` (with `--sync --fetch`) when packages are signed
+by a key the keyring doesn't have yet.
 
 Package files and URLs (with their signatures as `.sig` next to them)
 are imported in a step of their own, and are then available to builds as
@@ -104,6 +120,9 @@ directory they can write to, with all its contents.
 - `synthetic/<spec>` — the id of the package that holds what install
   scripts and hooks changed in a build of the packages of a build spec
 - `downloads/<repo>/` — downloaded packages and their signatures
+- `keyrings/@FORMAT` — the id of the record of a format's keyring (for
+  Arch: an object referring to the keyring files and the
+  `archlinux-keyring` package they are from)
 - `repos/<repo>/` — a repo's configuration and a record of each version of
   its database that was synced (the database itself is a blob)
 - `tmp/` — staging area for new files
