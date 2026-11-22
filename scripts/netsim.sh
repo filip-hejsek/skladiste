@@ -38,9 +38,10 @@
 #
 # The second form makes the files of a synthetic workload: SIZES has a
 # size in bytes at the start of each line (the rest is ignored, as are
-# empty lines and lines starting with #). DIR gets sparse files f/NNNNN of
-# those sizes and a list of "SIZE PATH" lines (largest first), for
-# examples/download.rs. The content doesn't matter: nothing on the way
+# empty lines and lines starting with #). DIR gets sparse files of those
+# sizes, named as packages (f/pNNNNN-1-1-any.pkg.tar.zst), a pacman repo
+# of them (f/netsim.db) and a list of "SIZE PATH" lines (largest first),
+# for examples/download.rs. The content doesn't matter: nothing on the way
 # compresses it.
 set -euo pipefail
 
@@ -54,7 +55,8 @@ usage() {
 }
 
 files() {
-	local sizes=$1 dir=$2
+	local sizes=$1 dir
+	dir=$(realpath -m "$2")
 	rm -rf "$dir/f" "$dir/list"
 	mkdir -p "$dir/f"
 	local size rest n=0 path
@@ -66,10 +68,27 @@ files() {
 			exit 1
 		fi
 		n=$((n + 1))
-		path=$(printf 'f/%05d' "$n")
+		path=$(printf 'f/p%05d-1-1-any.pkg.tar.zst' "$n")
 		truncate -s "$size" "$dir/$path"
 		echo "$size $path"
 	done <"$sizes" | sort -rn >"$dir/list.part"
+
+	# A pacman repo of them, f/netsim.db, for scripts/pacman-bench.sh.
+	local descs=$dir/descs sum file name
+	rm -rf "$descs"
+	mkdir "$descs"
+	(cd "$dir/f" && find . -name '*.pkg.tar.zst' -print0 | xargs -0 sha256sum) |
+		while read -r sum file; do
+			file=${file#./}
+			name=${file%-1-1-any.pkg.tar.zst}
+			mkdir "$descs/$name-1-1"
+			printf '%%FILENAME%%\n%s\n\n%%NAME%%\n%s\n\n%%VERSION%%\n1-1\n\n%%CSIZE%%\n%s\n\n%%ARCH%%\nany\n\n%%SHA256SUM%%\n%s\n\n' \
+				"$file" "$name" "$(stat -c %s "$dir/f/$file")" "$sum" >"$descs/$name-1-1/desc"
+		done
+	# Entries named NAME-VERSION/desc, without "./", which pacman rejects.
+	(cd "$descs" && find . -mindepth 1 -maxdepth 1 -printf '%P\0' |
+		tar -czf "$dir/f/netsim.db" --null -T -)
+	rm -rf "$descs"
 	mv "$dir/list.part" "$dir/list"
 	echo "$(wc -l <"$dir/list") files in $dir" >&2
 }

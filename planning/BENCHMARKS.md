@@ -88,6 +88,16 @@ each origin's connections, strikes and `404`s (the example only sees
 finishes). Baseline: `curl --parallel --parallel-max N` on the same
 URLs.
 
+pacman as a comparison: `netsim.sh files` also writes a pacman repo of
+the files (`f/netsim.db`, with their SHA-256), and
+`scripts/pacman-bench.sh DIR N`, run in `netsim.sh`, times `pacman -Sw`
+of all of them with `ParallelDownloads = N`, a database and cache of
+its own, root of the user namespace without download user and sandbox,
+and the netsim CA bind-mounted over the system's bundle. Its time
+includes checking the SHA-256 after the downloads. pacman takes each
+file from the first server that has it, so its parallel downloads are
+connections to one origin.
+
 ## Sweeps
 
 `N` = 1, 2, 3, 5, 8; for a given `N`, its split into mirrors and
@@ -100,6 +110,22 @@ First check of the setup (one run each, current scheduling): the small
 files at 20 ms RTT and 500 Mbit/s take 24.0 s from one mirror with
 `-j1` and 12.05 s from two equal mirrors with `-j2`, as the round trips
 predict.
+
+Against pacman 7.1 (3 rounds, interleaved; the small files, 20 ms
+RTT; skl with the current scheduling):
+
+| link     | mirrors | skl              | pacman `ParallelDownloads`               |
+|----------|---------|------------------|------------------------------------------|
+| 500 Mbit | 1       | `-j1` 23.9-24.0 s | 1: 24.4-24.5 s, 2: 21.7-22.0 s, 5: 6.3-6.5 s, 8: 4.74-4.75 s |
+| 500 Mbit | 2       | `-j2` 12.1 s      | 5: 6.3-6.4 s                              |
+| 50 Mbit  | 1       | `-j1` 53.4 s      | 5: 33.3 s (46.6 Mbit/s)                   |
+
+Over one connection both pay a round trip per file. pacman takes all
+files from the first server, so a second mirror doesn't change its
+time. At 50 Mbit/s its 5 connections almost fill the link, while skl
+loses about 20 s to round trips. Unexplained: pacman with 2 is barely
+faster than with 1 (nginx's access log, with connection numbers, would
+show how it uses its connections; netsim.sh removes it on exit).
 
 ## Real mirrors
 
