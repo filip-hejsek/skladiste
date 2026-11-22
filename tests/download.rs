@@ -9,14 +9,26 @@ use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use skladiste::download::{self, Request, Sink, Unless};
+use skladiste::download::{self, Parallel, Request, Sink, Unless};
 use skladiste::http::{RootCerts, Url};
 use skladiste::worker::Workers;
 
+/// Workers with one connection per server: four servers at once, and a
+/// repo's files shared by two mirrors.
 fn workers() -> Workers {
+    workers_with(4, 2, 1)
+}
+
+fn workers_with(downloads: usize, mirrors: usize, per_origin: usize) -> Workers {
+    let n = |n| NonZeroUsize::new(n).unwrap();
     let mut workers = Workers::new(env!("CARGO_BIN_EXE_skl"));
     // Tests of connections that get nothing shouldn't take seconds.
     workers.set_retry_delay(Duration::from_millis(10));
+    workers.set_downloads(Parallel {
+        downloads: n(downloads),
+        mirrors: n(mirrors),
+        per_origin: n(per_origin),
+    });
     workers
 }
 
@@ -257,8 +269,7 @@ fn download_all(urls: &[String], restart_if_changed: bool) -> anyhow::Result<Vec
         .collect();
     let bodies: Vec<Mutex<Option<Body>>> = urls.iter().map(|_| Mutex::default()).collect();
     let failed = AtomicBool::new(false);
-    let jobs = NonZeroUsize::new(4).unwrap();
-    download::download_all(&workers(), requests, jobs, &failed, |i, body, d| {
+    download::download_all(&workers(), requests, &failed, |i, body, d| {
         assert_eq!(d.size, body.data.len() as u64);
         assert!(bodies[i].lock().unwrap().replace(body).is_none());
         Ok(())
@@ -352,17 +363,11 @@ fn https_with_custom_roots() {
         .collect();
     let done = AtomicUsize::new(0);
     let before = connections.load(Ordering::Relaxed);
-    download::download_all(
-        &custom,
-        requests,
-        NonZeroUsize::MIN,
-        &AtomicBool::new(false),
-        |_, body, _| {
-            assert_eq!(body, b"secret");
-            done.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        },
-    )
+    download::download_all(&custom, requests, &AtomicBool::new(false), |_, body, _| {
+        assert_eq!(body, b"secret");
+        done.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
     .unwrap();
     assert_eq!(done.into_inner(), 3);
     assert_eq!(connections.load(Ordering::Relaxed) - before, 1);
@@ -586,23 +591,17 @@ fn download_unless(server: &Server, files: &[(&str, Option<&str>)]) -> Vec<Optio
     let bodies: Vec<Mutex<Option<Option<Vec<u8>>>>> =
         files.iter().map(|_| Mutex::default()).collect();
     let failed = AtomicBool::new(false);
-    download::download_all(
-        &workers(),
-        requests,
-        NonZeroUsize::MIN,
-        &failed,
-        |i, body, d| {
-            let body = if d.not_modified {
-                assert!(body.is_empty() && d.size == 0 && d.validator.is_none());
-                None
-            } else {
-                assert_eq!(d.validator.as_deref(), Some("\"v2\""));
-                Some(body)
-            };
-            assert!(bodies[i].lock().unwrap().replace(body).is_none());
-            Ok(())
-        },
-    )
+    download::download_all(&workers(), requests, &failed, |i, body, d| {
+        let body = if d.not_modified {
+            assert!(body.is_empty() && d.size == 0 && d.validator.is_none());
+            None
+        } else {
+            assert_eq!(d.validator.as_deref(), Some("\"v2\""));
+            Some(body)
+        };
+        assert!(bodies[i].lock().unwrap().replace(body).is_none());
+        Ok(())
+    })
     .unwrap();
     bodies
         .into_iter()
@@ -795,13 +794,9 @@ fn stops_after_a_failure() {
         sink: Vec::new(),
     };
     let failed = AtomicBool::new(true);
-    download::download_all(
-        &workers(),
-        vec![request("/small/a")],
-        NonZeroUsize::MIN,
-        &failed,
-        |_, _, _| panic!("downloaded after a failure"),
-    )
+    download::download_all(&workers(), vec![request("/small/a")], &failed, |_, _, _| {
+        panic!("downloaded after a failure")
+    })
     .unwrap();
     assert_eq!(server.connections(), 0);
 
@@ -810,17 +805,11 @@ fn stops_after_a_failure() {
     let failed = AtomicBool::new(false);
     let requests = (0..10).map(|i| request(&format!("/small/{i}"))).collect();
     let done = AtomicUsize::new(0);
-    let err = download::download_all(
-        &workers(),
-        requests,
-        NonZeroUsize::MIN,
-        &failed,
-        |i, _, _| {
-            done.fetch_add(1, Ordering::Relaxed);
-            anyhow::ensure!(i != 2, "file {i} is no good");
-            Ok(())
-        },
-    )
+    let err = download::download_all(&workers(), requests, &failed, |i, _, _| {
+        done.fetch_add(1, Ordering::Relaxed);
+        anyhow::ensure!(i != 2, "file {i} is no good");
+        Ok(())
+    })
     .unwrap_err();
     assert_eq!(err.to_string(), "file 2 is no good");
     assert!(failed.into_inner());
@@ -839,6 +828,13 @@ fn stops_after_a_failure() {
 /// Download files from mirrors: each request lists a file's URLs, in
 /// order of preference. Returns each body with the URL it came from.
 fn download_mirrored(requests: &[Vec<String>]) -> anyhow::Result<Vec<(Body, String)>> {
+    download_mirrored_with(&workers(), requests)
+}
+
+fn download_mirrored_with(
+    workers: &Workers,
+    requests: &[Vec<String>],
+) -> anyhow::Result<Vec<(Body, String)>> {
     let bodies: Vec<Mutex<Option<(Body, String)>>> =
         requests.iter().map(|_| Mutex::default()).collect();
     let requests = requests
@@ -852,8 +848,7 @@ fn download_mirrored(requests: &[Vec<String>]) -> anyhow::Result<Vec<(Body, Stri
         })
         .collect();
     let failed = AtomicBool::new(false);
-    let jobs = NonZeroUsize::new(4).unwrap();
-    download::download_all(&workers(), requests, jobs, &failed, |i, body, d| {
+    download::download_all(workers, requests, &failed, |i, body, d| {
         let done = (body, d.url.to_string());
         assert!(bodies[i].lock().unwrap().replace(done).is_none());
         Ok(())
@@ -890,6 +885,77 @@ fn mirrors_share_files() {
     assert_eq!(a.requests().len() + b.requests().len(), 20);
     let from_a = bodies.iter().filter(|(_, url)| url.starts_with(&a.base));
     assert_eq!(from_a.count(), a.requests().len());
+}
+
+/// Check that each of `bodies` is the file `/small/{i}` and that each file
+/// was requested once, from any of `servers`.
+fn check_small(bodies: &[(Body, String)], servers: &[&Server]) {
+    for (i, (body, url)) in bodies.iter().enumerate() {
+        assert_eq!(body.data, i.to_string().as_bytes());
+        assert!(url.ends_with(&format!("/small/{i}")), "{url}");
+    }
+    let requests: usize = servers.iter().map(|s| s.requests().len()).sum();
+    assert_eq!(requests, bodies.len());
+}
+
+#[test]
+fn several_connections_to_a_server() {
+    // Limited by the downloads at once, and by the connections per
+    // server.
+    for (workers, expected) in [(workers_with(3, 1, 8), 3), (workers_with(8, 1, 2), 2)] {
+        let server = serve_files();
+        let requests: Vec<_> = (0..30)
+            .map(|i| vec![server.url(&format!("/small/{i}"))])
+            .collect();
+        let bodies = download_mirrored_with(&workers, &requests).unwrap();
+        check_small(&bodies, &[&server]);
+        assert_eq!(server.connections(), expected);
+        let conns: std::collections::HashSet<_> =
+            server.requests().iter().map(|r| r.conn).collect();
+        assert_eq!(conns.len(), expected);
+    }
+}
+
+#[test]
+fn connections_spread_over_mirrors() {
+    // Each mirror gets a connection before the first gets a second.
+    let (a, b) = (serve_files(), serve_files());
+    let mirrors = [&*a.base, &*b.base];
+    let requests: Vec<_> = (0..30)
+        .map(|i| on(&mirrors, &format!("/small/{i}")))
+        .collect();
+    let bodies = download_mirrored_with(&workers_with(3, 2, 3), &requests).unwrap();
+    check_small(&bodies, &[&a, &b]);
+    assert_eq!((a.connections(), b.connections()), (2, 1));
+
+    // With one mirror at once, the second isn't used while the first
+    // works.
+    let (a, b) = (serve_files(), serve_files());
+    let mirrors = [&*a.base, &*b.base];
+    let requests: Vec<_> = (0..30)
+        .map(|i| on(&mirrors, &format!("/small/{i}")))
+        .collect();
+    let bodies = download_mirrored_with(&workers_with(3, 1, 3), &requests).unwrap();
+    check_small(&bodies, &[&a, &b]);
+    assert_eq!((a.connections(), b.connections()), (3, 0));
+}
+
+#[test]
+fn strikes_count_for_all_connections_to_a_server() {
+    // Three connections that get nothing give the server up; no
+    // connection to it is opened after that, but those under way then
+    // end too: at most 2 + 3 of them. The files come from the other
+    // mirror.
+    let silent = serve(|_| Reply::Close(Vec::new()));
+    let full = serve_files();
+    let mirrors = [&*silent.base, &*full.base];
+    let requests: Vec<_> = (0..30)
+        .map(|i| on(&mirrors, &format!("/small/{i}")))
+        .collect();
+    let bodies = download_mirrored_with(&workers_with(3, 1, 3), &requests).unwrap();
+    check_small(&bodies, &[&full]);
+    let silent = silent.connections();
+    assert!((3..=5).contains(&silent), "{silent}");
 }
 
 #[test]
@@ -973,17 +1039,11 @@ fn validator_only_for_its_mirror() {
         sink: Vec::new(),
     };
     let failed = AtomicBool::new(false);
-    download::download_all(
-        &workers(),
-        vec![request],
-        NonZeroUsize::MIN,
-        &failed,
-        |_, body, d| {
-            assert!(!d.not_modified);
-            assert_eq!(body, b"x");
-            Ok(())
-        },
-    )
+    download::download_all(&workers(), vec![request], &failed, |_, body, d| {
+        assert!(!d.not_modified);
+        assert_eq!(body, b"x");
+        Ok(())
+    })
     .unwrap();
     let unless: Vec<_> = other.requests().into_iter().map(|r| r.unless).collect();
     assert_eq!(unless, [None]);

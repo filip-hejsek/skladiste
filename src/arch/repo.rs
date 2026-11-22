@@ -442,7 +442,6 @@ pub fn fetch_db(workers: &Workers, store: &Store, config: &Config) -> Result<Syn
     download::download_all(
         workers,
         vec![db_request(config, None)?],
-        NonZeroUsize::MIN,
         &AtomicBool::new(false),
         |_, data, downloaded| {
             *result.lock().unwrap() = Some(db_record(store, &data, downloaded)?);

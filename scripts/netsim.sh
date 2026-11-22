@@ -21,6 +21,10 @@
 #   --root DIR      directory every mirror serves (default
 #                   tmp/netsim/files)
 #   --http          plain HTTP instead of HTTPS
+#   --logs DIR      keep each mirror's access log as DIR/mN.log: per
+#                   request the time it ended, nginx's connection number,
+#                   the request's number on it, status, body bytes, the
+#                   request's time and the request line
 #   --mirror SPEC   a mirror (repeatable; default one with no options).
 #                   SPEC is KEY=VALUE pairs separated by commas:
 #                     rtt=MS        round trip added behind the access link
@@ -127,6 +131,7 @@ certs() {
 # Holders of the namespaces, and nginx pid files, for cleanup.
 holders=()
 run=
+logs=
 
 cleanup() {
 	local pid
@@ -139,6 +144,13 @@ cleanup() {
 		kill "$pid" 2>/dev/null
 	done
 	wait 2>/dev/null
+	if [[ -n $run && -n $logs ]]; then
+		mkdir -p "$logs"
+		local log
+		for log in "$run"/m*/access.log; do
+			[[ -f $log ]] && cp "$log" "$logs/$(basename "$(dirname "$log")").log"
+		done
+	fi
 	[[ -z $run ]] || rm -rf "$run"
 }
 
@@ -211,7 +223,9 @@ pid $dir/nginx.pid;
 worker_processes 2;
 events {}
 http {
-	access_log $dir/access.log;
+	log_format timing '\$msec \$connection \$connection_requests \$status '
+		'\$body_bytes_sent \$request_time "\$request"';
+	access_log $dir/access.log timing;
 	client_body_temp_path $dir/temp/body;
 	proxy_temp_path $dir/temp/proxy;
 	fastcgi_temp_path $dir/temp/fastcgi;
@@ -236,10 +250,11 @@ simulate() {
 	local down=500mbit up=50mbit rtt=10 jitter=0 loss=0 queue=1000
 	root=$state/files
 	http=0
+	logs=
 	local mirrors=()
 	while (($#)); do
 		case $1 in
-		--down | --up | --rtt | --jitter | --loss | --queue | --root | --mirror)
+		--down | --up | --rtt | --jitter | --loss | --queue | --root | --mirror | --logs)
 			(($# >= 2)) || usage
 			case $1 in
 			--down) down=$2 ;;
@@ -250,6 +265,7 @@ simulate() {
 			--queue) queue=$2 ;;
 			--root) root=$(realpath "$2") ;;
 			--mirror) mirrors+=("$2") ;;
+			--logs) logs=$(realpath -m "$2") ;;
 			esac
 			shift 2
 			;;

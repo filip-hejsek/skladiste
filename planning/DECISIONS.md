@@ -364,21 +364,42 @@ are in BUGS.md.
   connect anywhere; Landlock can restrict only TCP ports); an HTTP
   client library such as ureq (it opens its own connections; its
   transport API is unstable).
-- One worker per origin (scheme, host, port), with one connection that
-  is kept open between requests: the files of an origin are downloaded
-  one after another, in the order given. Parallelism comes from
-  downloading from several origins at once (at most `-j`), not from
-  several connections to one host, which is gentler on mirrors.
+- Parallel downloads (`download::Parallel`, set on `Workers` by
+  `--parallel-downloads`, `--mirrors-at-once` and
+  `--connections-per-server`): up to N downloads at once (default 5,
+  as pacman's default `ParallelDownloads`), each a connection with a
+  worker of its own that is kept open between requests and downloads
+  files one after another. Not tied to `-j`: downloads are bound by
+  round trips and bandwidth, not CPUs. The connections are spread over
+  the first usable mirrors (up to `--mirrors-at-once`, default N) before
+  an origin gets a second one, up to `--connections-per-server`
+  (default N); so with one mirror all N go to it, as with pacman. On
+  `Workers` rather than a parameter, as it is configuration of how
+  downloads run like the root certificates, and reaches every download
+  without passing it through the frontends. Why several connections to
+  an origin: requests aren't pipelined (below), so one connection moves
+  at most one file per round trip, which bounds many small files long
+  before bandwidth (planning/BENCHMARKS.md). Rejected: one connection per
+  origin with parallelism only across mirrors (no gain with a single
+  server, such as a CDN or a custom repo, and mirrors further down a
+  list tend to be further away). Measured in simulation (planning/BENCHMARKS.md;
+  997 files under 1 MB, 185 MiB, 20 ms RTT, 500 Mbit/s): one connection
+  24.0 s, 2 12.1 s, 5 5.6 s, 8 4.4 s; pacman 7.1 with the same
+  `ParallelDownloads` 24.4, 21.9, 6.3-6.5 and 4.75 s. At 50 Mbit/s,
+  5 at once 33.0 s against 53.4 s over one connection. The defaults
+  are provisional until checked on real mirrors (TODO.md).
 - Mirrors: a request has a list of URLs, the same file on each mirror,
   in order of preference. The files wait in one pool, in request order
-  (largest first), and each origin's thread takes the first file it
-  may serve: one whose first two usable mirrors include it (usable:
-  not given up, and not failed that file). So two mirrors of a repo
-  share its files, a third is used only once one of them drops out,
-  and `-j` still caps the origins at once. A thread starts for an
-  origin that a waiting file may go to, and ends when none may; a
-  coordinator in `download_all` starts them and fails the stage when a
-  file has no usable mirror left. A file that fails for good on a
+  (largest first), and each connection's thread takes the first file it
+  may serve: one whose first `--mirrors-at-once` usable mirrors include
+  its origin (usable: not given up, and not failed that file). A
+  coordinator in `download_all` starts the threads, each with its first
+  file, so none starts without one: while fewer than N run, it picks of
+  the origins that a waiting file may go to and that have fewer than
+  `--connections-per-server` the one with fewest threads, first in the
+  order the waiting files prefer them. A thread ends when no file is
+  left for it. The coordinator fails the stage when a file has no usable
+  mirror left. A file that fails for good on a
   mirror (`End::Failed`, e.g. `404` on a mirror that isn't in sync)
   goes back to the pool for the others. A mirror is given up when it
   can't be connected to, reaches 3 strikes, serves more than a file's
@@ -390,15 +411,18 @@ are in BUGS.md.
   still fail the run. A file cut off mid-body stays with its mirror to
   be continued: a validator means nothing to another mirror, where the
   file starts again, and progress (for strikes) is counted per mirror.
-  Rejected: all mirrors at once up to `-j` (a mirror list of 50 would
-  open up to `-j` connections to hosts further down the list, for a
-  few files each); falling back only after the first mirror failed, as
-  pacman does (one connection, see the numbers below). Measured with
-  `build --fetch` of the 42 packages below (downloads emptied, packages
-  already imported), from `geo.mirror.pkgbuild.com` alone 9.6-10.1 s,
-  with `london.mirror.pkgbuild.com` as the second mirror 9.1-9.2 s, on
-  a link that is bandwidth-bound at about 4.5 MB/s; two is not
-  measured on a faster link. Not done: starting a
+  Strikes count for all connections to the origin; once it has 3, no
+  connection to it is opened, but those under way still end, so it may
+  get up to 2 + `--connections-per-server` connections that got
+  nothing. Rejected: all mirrors of a list at once (a mirror list of 50
+  would open connections to hosts far down the list, for a few files
+  each; N bounds it now); falling back only after the first mirror
+  failed, as pacman does (its parallel downloads all go to the first
+  server). Measured with one connection per origin, `build --fetch` of
+  the 42 packages below (downloads emptied, packages already imported):
+  from `geo.mirror.pkgbuild.com` alone 9.6-10.1 s, with
+  `london.mirror.pkgbuild.com` as the second mirror 9.1-9.2 s, on a link
+  that is bandwidth-bound at about 4.5 MB/s. Not done: starting a
   slow file on a second mirror (WORKERS.md, Fallback) and fetching a
   file that fails validation again elsewhere (TODO.md).
   Requests aren't pipelined: the worker waits for each response before
@@ -473,9 +497,9 @@ are in BUGS.md.
   4.6-5.3 s whatever `-j`. `curl` took 4.1 s for the same files over
   one connection and 19.1 s with a connection per file; verifying,
   importing and installing them without downloading takes 1.35 s. So
-  on such a link several connections to the host would still gain a
-  little (the `-j8` above); that is left to downloading from several
-  mirrors. On a link of about 2.4 MB/s a worker per file was
+  on such a link several connections to the host gain even with a new
+  one per file (the `-j8` above), which led to keeping connections
+  open and running several at once. On a link of about 2.4 MB/s a worker per file was
   bandwidth-bound (43 packages, 43 MiB: 32.7 s with `-j1`, 19.8 s
   `-j4`, 18.0 s `-j8` and `-j16`; sequential `curl` 28.6 s), where one
   connection isn't measured. Syncing core and extra took 1.3-1.4 s

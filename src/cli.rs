@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 
 use skladiste::btrfs;
 use skladiste::diff::Change;
+use skladiste::download::Parallel;
 use skladiste::http::RootCerts;
 use skladiste::jobs::default_jobs;
 use skladiste::store::{InUse, NotAStore, Store, VersionProblem, WrongVersion, gc};
@@ -34,10 +35,25 @@ pub(crate) struct Cli {
     #[arg(long, env = "SKL_CA_CERTS", value_name = "FILE")]
     ca_certs: Option<PathBuf>,
 
-    /// Number of packages to import (or repo databases to read) at once,
-    /// and of servers to download from at once [default: number of CPUs].
+    /// Number of packages to import (or repo databases to read) at once
+    /// [default: number of CPUs].
     #[arg(short, long, global = true)]
     jobs: Option<NonZeroUsize>,
+
+    /// Number of downloads at once, each over a connection of its own
+    /// [default: 5].
+    #[arg(long, global = true, value_name = "N")]
+    parallel_downloads: Option<NonZeroUsize>,
+
+    /// Number of a repo's mirrors that its files are spread over: the first
+    /// ones of its servers that work [default: --parallel-downloads].
+    #[arg(long, global = true, value_name = "N")]
+    mirrors_at_once: Option<NonZeroUsize>,
+
+    /// Number of connections to one server at once [default:
+    /// --parallel-downloads].
+    #[arg(long, global = true, value_name = "N")]
+    connections_per_server: Option<NonZeroUsize>,
 
     /// Run workers without new namespaces and bubblewrap (INSECURE).
     #[cfg(feature = "insecure")]
@@ -156,6 +172,16 @@ pub(crate) fn run(cli: Cli) -> Result<ExitCode> {
             .with_context(|| format!("loading root certificates from {}", path.display()))?;
         workers.set_root_certs(roots);
     }
+    let mut downloads = cli
+        .parallel_downloads
+        .map_or_else(Parallel::default, Parallel::new);
+    if let Some(n) = cli.mirrors_at_once {
+        downloads.mirrors = n;
+    }
+    if let Some(n) = cli.connections_per_server {
+        downloads.per_origin = n;
+    }
+    workers.set_downloads(downloads);
     let store_path = cli
         .store
         .as_deref()

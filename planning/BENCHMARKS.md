@@ -37,6 +37,10 @@ network namespace behind simulated mirrors, all under `unshare -rn`
   `keepalive_requests`, or `404` for every Kth file (a mirror that
   isn't in sync).
 
+`--logs DIR` keeps each mirror's access log, with nginx's connection
+number and the request's number on it, to see how a client uses its
+connections.
+
 Static neighbour entries, so the first connection pays no ARP round
 trip. HTTPS by default, as the handshake is part of what a new
 connection costs; the script's own CA (in `tmp/netsim/tls`) has the
@@ -79,7 +83,8 @@ kept in the repo.
 `download_all`, largest first as skl does, into sinks that only count,
 so a sweep measures the network and not importing. It prints the time,
 and files, bytes and the last finish per origin; `--trace FILE` writes
-each file's finish time, size and origin.
+each file's finish time, size and origin. `-n`, `--mirrors-at-once` and
+`--connections-per-server` are skl's options of the same names.
 
 ## Instrumentation
 
@@ -101,18 +106,19 @@ connections to one origin.
 ## Sweeps
 
 `N` = 1, 2, 3, 5, 8; for a given `N`, its split into mirrors and
-connections per origin (for 4: 4×1, 2×2, 1×4); the current behaviour
-as baseline. Each configuration about 5 times, interleaved with the
+connections per origin (for 4: 4×1, 2×2, 1×4); one connection per
+origin (the scheduling before `--parallel-downloads`) as baseline. Each configuration about 5 times, interleaved with the
 others; median and range are recorded, with the decision, in
 DECISIONS.md.
 
-First check of the setup (one run each, current scheduling): the small
+First check of the setup (one run each, one connection per origin): the small
 files at 20 ms RTT and 500 Mbit/s take 24.0 s from one mirror with
 `-j1` and 12.05 s from two equal mirrors with `-j2`, as the round trips
 predict.
 
 Against pacman 7.1 (3 rounds, interleaved; the small files, 20 ms
-RTT; skl with the current scheduling):
+RTT; skl with one connection per origin, as before
+`--parallel-downloads`):
 
 | link     | mirrors | skl              | pacman `ParallelDownloads`               |
 |----------|---------|------------------|------------------------------------------|
@@ -123,9 +129,25 @@ RTT; skl with the current scheduling):
 Over one connection both pay a round trip per file. pacman takes all
 files from the first server, so a second mirror doesn't change its
 time. At 50 Mbit/s its 5 connections almost fill the link, while skl
-loses about 20 s to round trips. Unexplained: pacman with 2 is barely
-faster than with 1 (nginx's access log, with connection numbers, would
-show how it uses its connections; netsim.sh removes it on exit).
+loses about 20 s to round trips. pacman with 2 is barely faster than with
+1: its access log shows each of the two connections making a request
+per two round trips for the first 12 s (about 23 a second each), and
+then one going on alone; from 3 on (10.5 s with 3, 7.7 s with 4) it
+uses all its connections evenly.
+
+With `--parallel-downloads N` (3 rounds; same files and network):
+
+| link     | mirrors | skl `-n N`                                       | pacman, same N |
+|----------|---------|--------------------------------------------------|----------------|
+| 500 Mbit | 1       | 1: 24.0 s, 2: 12.1 s, 5: 5.61-5.63 s, 8: 4.42-4.44 s | 24.4, 21.9, 6.3-6.5, 4.75 s |
+| 500 Mbit | 2       | 2: 12.1 s (1+1), 5: 5.62-5.63 s (3+2)            | 5: 6.3-6.4 s   |
+| 50 Mbit  | 1       | 5: 32.95-32.96 s (47.1 Mbit/s)                   | 33.3 s         |
+
+Equal mirrors at the same RTT make no difference to the time, as
+expected; the split (3 and 2 connections, about 200 requests each) is
+from the access logs. Up to 5, time falls with N about as round trips
+predict; from 5 to 8 it gains less, as transfer (3 s at 500 Mbit/s)
+starts to dominate.
 
 ## Real mirrors
 

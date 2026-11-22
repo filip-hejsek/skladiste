@@ -37,6 +37,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::bwrap::{self, Mount, Namespaces};
+use crate::download::Parallel;
 use crate::http::RootCerts;
 use crate::manifest::{BlobId, Content};
 use crate::sandbox::Layers;
@@ -156,6 +157,7 @@ pub struct Workers {
     layers: Layers,
     roots: RootCerts,
     retry_delay: Duration,
+    downloads: Parallel,
 }
 
 impl Workers {
@@ -167,7 +169,14 @@ impl Workers {
             layers: Layers::default(),
             roots: RootCerts::default(),
             retry_delay: RETRY_DELAY,
+            downloads: Parallel::default(),
         }
+    }
+
+    /// How many downloads run at once, and where ([`Parallel::default`]
+    /// by default).
+    pub fn set_downloads(&mut self, downloads: Parallel) {
+        self.downloads = downloads;
     }
 
     /// Check TLS server certificates of downloads against `roots` (the
@@ -209,6 +218,11 @@ impl Workers {
     /// See [`Workers::set_retry_delay`].
     pub(crate) fn retry_delay(&self) -> Duration {
         self.retry_delay
+    }
+
+    /// See [`Workers::set_downloads`].
+    pub(crate) fn downloads(&self) -> Parallel {
+        self.downloads
     }
 
     /// Start a worker of `kind` with `stdin` and `stdout` as fds 0 and 1,

@@ -1,5 +1,6 @@
-//! Downloads, and the worker that does them: [`download_all`] runs one
-//! worker per origin, and moves files between mirrors.
+//! Downloads, and the worker that does them: [`download_all`] runs a
+//! worker per connection, several at once, and moves files between
+//! mirrors.
 //!
 //! A download worker serves one origin (scheme, host and port) over one
 //! connection, which the supervisor opened: fd 0 is that TCP connection,
@@ -69,11 +70,39 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// sending them never blocks.
 const WINDOW: usize = 2;
 
-/// Mirrors of a file that it may be downloaded from at once, at most:
-/// the first ones among its URLs that neither failed it nor were given
-/// up. More of them share the files of a repo, but each takes a
-/// connection and a worker.
-pub const MIRRORS_AT_ONCE: usize = 2;
+/// How many downloads run at once, and where. Each download is a
+/// connection with a worker of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Parallel {
+    /// Connections at once, at most, in all.
+    pub downloads: NonZeroUsize,
+    /// Mirrors that a file may go to: the first ones among its URLs that
+    /// neither failed it nor were given up. The files of a repo are
+    /// shared by that many of its mirrors.
+    pub mirrors: NonZeroUsize,
+    /// Connections to one origin at once, at most.
+    pub per_origin: NonZeroUsize,
+}
+
+impl Parallel {
+    /// `downloads` at once, spread over that many mirrors where there are
+    /// as many, else with more connections to each.
+    pub fn new(downloads: NonZeroUsize) -> Self {
+        Parallel {
+            downloads,
+            mirrors: downloads,
+            per_origin: downloads,
+        }
+    }
+}
+
+impl Default for Parallel {
+    /// Five downloads at once, as pacman's `ParallelDownloads` in Arch's
+    /// default configuration.
+    fn default() -> Self {
+        Parallel::new(NonZeroUsize::new(5).unwrap())
+    }
+}
 
 /// Connections to an origin that may end without progress before the
 /// origin is given up.
@@ -361,14 +390,19 @@ impl<S: Sink> Job<S> {
     }
 
     /// Positions in `urls` of the mirrors that may take the file now: the
-    /// first [`MIRRORS_AT_ONCE`] that neither failed it nor were given up.
-    fn eligible<'a>(&'a self, mirrors: &'a [Mirror]) -> impl Iterator<Item = usize> + 'a {
+    /// first `at_once` ([`Parallel::mirrors`]) that neither failed it nor
+    /// were given up.
+    fn eligible<'a>(
+        &'a self,
+        mirrors: &'a [Mirror],
+        at_once: NonZeroUsize,
+    ) -> impl Iterator<Item = usize> + 'a {
         (0..self.urls.len())
             .filter(|&at| {
                 let m = self.urls[at].0;
                 !mirrors[m].given_up && !self.failures.iter().any(|&(f, _)| f == m)
             })
-            .take(MIRRORS_AT_ONCE)
+            .take(at_once.get())
     }
 
     /// Download the file from the mirror at `at` in `urls` from now on.
@@ -401,8 +435,8 @@ impl std::error::Error for TooLarge {}
 /// server of a file.
 struct Mirror {
     origin: Origin,
-    /// Whether a thread serves it now.
-    running: bool,
+    /// Threads that serve it now, each over a connection of its own.
+    threads: usize,
     /// Connections that ended without progress, in this run. Not reset by
     /// connections that get somewhere in between.
     strikes: u32,
@@ -418,7 +452,8 @@ struct Stage<S> {
     /// Files that no thread has, by their position among the requests.
     pool: Vec<Job<S>>,
     mirrors: Vec<Mirror>,
-    /// Threads serving a mirror.
+    parallel: Parallel,
+    /// Threads serving a mirror, in all.
     running: usize,
     /// The first failure of the stage itself.
     error: Option<anyhow::Error>,
@@ -429,7 +464,7 @@ impl<S: Sink> Stage<S> {
     fn take(&mut self, mirror: usize) -> Option<Job<S>> {
         let (i, at) = self.pool.iter().enumerate().find_map(|(i, job)| {
             let at = job
-                .eligible(&self.mirrors)
+                .eligible(&self.mirrors, self.parallel.mirrors)
                 .find(|&at| job.urls[at].0 == mirror)?;
             Some((i, at))
         })?;
@@ -448,7 +483,7 @@ impl<S: Sink> Stage<S> {
     fn failed_on_mirror(&mut self, mut job: Job<S>, why: anyhow::Error) {
         let mirror = job.urls[job.at].0;
         if job
-            .eligible(&self.mirrors)
+            .eligible(&self.mirrors, self.parallel.mirrors)
             .any(|at| job.urls[at].0 != mirror)
         {
             warn(&format!("{why:#} (trying another mirror)"));
@@ -457,13 +492,19 @@ impl<S: Sink> Stage<S> {
         self.put_back(job);
     }
 
-    /// Give up `mirror` for `why`. Its files go to other mirrors, if they
-    /// have any left.
+    /// Give up `mirror` for `why`, unless another of its threads did. Its
+    /// files go to other mirrors, if they have any left.
     fn give_up(&mut self, mirror: usize, why: anyhow::Error) {
+        if self.mirrors[mirror].given_up {
+            return;
+        }
         self.mirrors[mirror].given_up = true;
         let elsewhere = self.pool.iter().any(|job| {
             job.urls.iter().any(|&(m, _)| m == mirror)
-                && job.eligible(&self.mirrors).next().is_some()
+                && job
+                    .eligible(&self.mirrors, self.parallel.mirrors)
+                    .next()
+                    .is_some()
         });
         if elsewhere {
             warn(&format!("{why:#} (trying other mirrors)"));
@@ -480,10 +521,11 @@ impl<S: Sink> Stage<S> {
     /// The error for a file in the pool that no mirror is left for, if
     /// there is one: why its mirrors failed it.
     fn stranded(&mut self) -> Option<anyhow::Error> {
-        let i = self
-            .pool
-            .iter()
-            .position(|job| job.eligible(&self.mirrors).next().is_none())?;
+        let i = self.pool.iter().position(|job| {
+            job.eligible(&self.mirrors, self.parallel.mirrors)
+                .next()
+                .is_none()
+        })?;
         let job = &mut self.pool[i];
         let mut causes = Vec::new();
         for &(m, _) in &job.urls {
@@ -508,19 +550,29 @@ impl<S: Sink> Stage<S> {
         })
     }
 
-    /// Mirrors that files in the pool may go to and that have no thread,
-    /// in the order of the files that want them.
-    fn wanted(&self) -> Vec<usize> {
-        let mut wanted = Vec::new();
+    /// The mirror to start another thread for, if one may have it, with
+    /// the first file for it, moved out of the pool: of the mirrors that
+    /// files in the pool may go to and that have fewer than
+    /// [`Parallel::per_origin`] threads, the one with fewest, and of
+    /// those, the one that the first file wanting one prefers. So threads
+    /// are spread over the mirrors before any gets a second one.
+    fn next_start(&mut self) -> Option<(usize, Job<S>)> {
+        let mut best: Option<usize> = None;
         for job in &self.pool {
-            for at in job.eligible(&self.mirrors) {
+            for at in job.eligible(&self.mirrors, self.parallel.mirrors) {
                 let m = job.urls[at].0;
-                if !self.mirrors[m].running && !wanted.contains(&m) {
-                    wanted.push(m);
+                let threads = self.mirrors[m].threads;
+                // One at its strikes is about to be given up.
+                if threads < self.parallel.per_origin.get()
+                    && self.mirrors[m].strikes < MAX_STRIKES
+                    && best.is_none_or(|b| threads < self.mirrors[b].threads)
+                {
+                    best = Some(m);
                 }
             }
         }
-        wanted
+        let m = best?;
+        Some((m, self.take(m)?))
     }
 }
 
@@ -578,13 +630,16 @@ fn gone(e: io::Error) -> anyhow::Error {
 /// Download `requests` in workers, and call `done` with each one's
 /// index, sink and result when it is complete.
 ///
-/// Each origin (scheme, host and port) has one worker at a time, with
-/// one connection, over which it downloads files one after another;
-/// up to `jobs` origins at once. A file goes to the first mirror among
-/// its URLs that is free, of the first [`MIRRORS_AT_ONCE`] that haven't
-/// failed it, in the order of `requests`: so the mirrors of a repo
-/// share its files, and a file that fails on one (e.g. `404`) goes to
-/// the next. The connections are opened here and handed to the
+/// How many downloads run at once is [`Workers::set_downloads`]: up to
+/// [`Parallel::downloads`] connections in all, each with a worker of its
+/// own, over which it downloads files one after another. They are
+/// spread over the mirrors that files may go to before an origin
+/// (scheme, host and port) gets a second one, up to
+/// [`Parallel::per_origin`] each. A file goes to the first free
+/// connection of the first [`Parallel::mirrors`] among its URLs that
+/// haven't failed it, in the order of `requests`: so the mirrors of a
+/// repo share its files, and a file that fails on one (e.g. `404`) goes
+/// to the next. The connections are opened here and handed to the
 /// workers, which have no network access of their own. When a
 /// connection ends before its files are done, a new one continues,
 /// also in the middle of a file where the server allows. A mirror is
@@ -603,7 +658,6 @@ fn gone(e: io::Error) -> anyhow::Error {
 pub fn download_all<S: Sink>(
     workers: &Workers,
     requests: Vec<Request<S>>,
-    jobs: NonZeroUsize,
     failed: &AtomicBool,
     done: impl Fn(usize, S, Downloaded) -> Result<()> + Sync,
 ) -> Result<()> {
@@ -625,7 +679,7 @@ pub fn download_all<S: Sink>(
                 None => {
                     mirrors.push(Mirror {
                         origin: url.origin.clone(),
-                        running: false,
+                        threads: 0,
                         strikes: 0,
                         given_up: false,
                         why: None,
@@ -641,6 +695,7 @@ pub fn download_all<S: Sink>(
         stage: Mutex::new(Stage {
             pool,
             mirrors,
+            parallel: workers.downloads(),
             running: 0,
             error: None,
         }),
@@ -656,13 +711,13 @@ pub fn download_all<S: Sink>(
                     stage.fail(e, failed);
                     continue;
                 }
-                for m in stage.wanted() {
-                    if stage.running == jobs.get() {
+                while stage.running < stage.parallel.downloads.get() {
+                    let Some((m, job)) = stage.next_start() else {
                         break;
-                    }
-                    stage.mirrors[m].running = true;
+                    };
+                    stage.mirrors[m].threads += 1;
                     stage.running += 1;
-                    s.spawn(move || run_mirror(workers, shared, m, failed, done));
+                    s.spawn(move || run_mirror(workers, shared, m, job, failed, done));
                 }
             }
             if stage.running == 0 && (stopping || stage.pool.is_empty()) {
@@ -695,31 +750,26 @@ pub fn download<S: Sink>(
     };
     let result = Mutex::new(None);
     let failed = AtomicBool::new(false);
-    download_all(
-        workers,
-        vec![request],
-        NonZeroUsize::MIN,
-        &failed,
-        |_, sink, downloaded| {
-            *result.lock().unwrap() = Some((sink, downloaded));
-            Ok(())
-        },
-    )?;
+    download_all(workers, vec![request], &failed, |_, sink, downloaded| {
+        *result.lock().unwrap() = Some((sink, downloaded));
+        Ok(())
+    })?;
     let result = result.into_inner().unwrap();
     result.with_context(|| format!("downloading {url} didn't finish"))
 }
 
-/// The thread that serves `mirror` (an index into [`Stage::mirrors`]):
-/// see [`serve_mirror`]. When it ends, the files it has go back to the
-/// pool, and the mirror is given up if it is to be.
+/// A thread that serves `mirror` (an index into [`Stage::mirrors`]),
+/// starting with `first`: see [`serve_mirror`]. When it ends, the files
+/// it has go back to the pool, and the mirror is given up if it is to be.
 fn run_mirror<S: Sink>(
     workers: &Workers,
     shared: &Shared<S>,
     mirror: usize,
+    first: Job<S>,
     failed: &AtomicBool,
     done: &impl Fn(usize, S, Downloaded) -> Result<()>,
 ) {
-    let mut mine = VecDeque::new();
+    let mut mine = VecDeque::from([first]);
     let exit = std::panic::catch_unwind(AssertUnwindSafe(|| {
         serve_mirror(workers, shared, mirror, &mut mine, failed, done)
     }));
@@ -727,7 +777,7 @@ fn run_mirror<S: Sink>(
     for job in mine {
         stage.put_back(job);
     }
-    stage.mirrors[mirror].running = false;
+    stage.mirrors[mirror].threads -= 1;
     stage.running -= 1;
     let panic = match exit {
         Ok(Ok(None)) => None,
@@ -755,6 +805,10 @@ fn run_mirror<S: Sink>(
 /// further ones while they make progress: those in `mine`, and then
 /// those it may take from the pool. Returns when there are none, or with
 /// the reason to give the mirror up. Files that are left stay in `mine`.
+///
+/// Other threads may serve the same mirror; strikes count for all of
+/// them, and none connects again once it is given up or has had
+/// [`MAX_STRIKES`].
 fn serve_mirror<S: Sink>(
     workers: &Workers,
     shared: &Shared<S>,
@@ -765,11 +819,18 @@ fn serve_mirror<S: Sink>(
 ) -> Result<Option<anyhow::Error>> {
     let origin = shared.lock().mirrors[mirror].origin.clone();
     while !failed.load(Ordering::Relaxed) {
-        // A connection is opened only for a file.
-        if mine.is_empty() {
-            match shared.lock().take(mirror) {
-                Some(job) => mine.push_back(job),
-                None => break,
+        {
+            let mut stage = shared.lock();
+            let m = &stage.mirrors[mirror];
+            if m.given_up || m.strikes >= MAX_STRIKES {
+                break;
+            }
+            // A connection is opened only for a file.
+            if mine.is_empty() {
+                match stage.take(mirror) {
+                    Some(job) => mine.push_back(job),
+                    None => break,
+                }
             }
         }
         match connection(workers, &origin, shared, mirror, mine, failed, done)? {
@@ -784,7 +845,7 @@ fn serve_mirror<S: Sink>(
                     stage.mirrors[mirror].strikes += 1;
                     stage.mirrors[mirror].strikes
                 };
-                if strikes == MAX_STRIKES {
+                if strikes >= MAX_STRIKES {
                     let url = mine.front().context("no file is left")?.url();
                     return Ok(Some(anyhow::anyhow!(
                         "downloading {url}: {reason} (giving up on {origin} \
@@ -1022,10 +1083,10 @@ const MAX_WAITING: usize = 64;
 /// and on the items in `ready`, in their order. Returns the results of
 /// `job` in no particular order.
 ///
-/// Downloads go one after another per server, in the order of `requests`
-/// (see [`download_all`]). `downloaded` is called with the index
-/// of the request, on the thread that downloads from its server, so the
-/// next download from there waits for it. Finished downloads are taken
+/// Downloads start in the order of `requests`, over the connections of
+/// [`download_all`]. `downloaded` is called with the index of the
+/// request, on the thread of the connection that downloaded it, so the
+/// next download over that connection waits for it. Finished downloads are taken
 /// before items of `ready`, so that the download stage isn't held up.
 ///
 /// Once something fails, no new downloads or jobs start; those under way
@@ -1048,7 +1109,7 @@ pub fn fetch_and_run<S: Sink, T: Send, R: Send>(
     let (downloads, results) = std::thread::scope(|s| {
         // Owns the sender, so the jobs end when the downloads have.
         let stage = s.spawn(move || {
-            download_all(workers, requests, jobs, failed, |i, sink, download| {
+            download_all(workers, requests, failed, |i, sink, download| {
                 if let Some(item) = downloaded(i, sink, download)? {
                     // Fails only once the jobs have stopped for a failure.
                     let _ = tx.send(item);

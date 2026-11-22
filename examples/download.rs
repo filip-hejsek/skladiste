@@ -23,16 +23,22 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 
-use skladiste::download::{Request, Sink, download_all};
+use skladiste::download::{Parallel, Request, Sink, download_all};
 use skladiste::http::{RootCerts, Url};
-use skladiste::jobs::default_jobs;
 use skladiste::worker::{self, Workers};
 
 #[derive(Parser)]
 struct Args {
-    /// Origins at once, as skl's `-j` (default: the number of CPUs).
-    #[arg(short, long)]
-    jobs: Option<NonZeroUsize>,
+    /// Downloads at once, as skl's `--parallel-downloads` [default: 5].
+    #[arg(short = 'n', long, value_name = "N")]
+    parallel_downloads: Option<NonZeroUsize>,
+    /// As skl's `--mirrors-at-once` [default: --parallel-downloads].
+    #[arg(long, value_name = "N")]
+    mirrors_at_once: Option<NonZeroUsize>,
+    /// As skl's `--connections-per-server` [default:
+    /// --parallel-downloads].
+    #[arg(long, value_name = "N")]
+    connections_per_server: Option<NonZeroUsize>,
     /// Root certificates, as skl's `--ca-certs`.
     #[arg(long, env = "SKL_CA_CERTS", value_name = "FILE")]
     ca_certs: Option<PathBuf>,
@@ -107,13 +113,21 @@ fn run(args: Args) -> Result<()> {
         });
     }
 
-    let jobs = args.jobs.unwrap_or_else(default_jobs);
+    let mut parallel = args
+        .parallel_downloads
+        .map_or_else(Parallel::default, Parallel::new);
+    if let Some(n) = args.mirrors_at_once {
+        parallel.mirrors = n;
+    }
+    if let Some(n) = args.connections_per_server {
+        parallel.per_origin = n;
+    }
+    workers.set_downloads(parallel);
     let done = Mutex::new(Vec::new());
     let start = Instant::now();
     download_all(
         &workers,
         requests,
-        jobs,
         &AtomicBool::new(false),
         |index, sink, downloaded| {
             let at = start.elapsed();
@@ -135,11 +149,14 @@ fn run(args: Args) -> Result<()> {
 
     let total: u64 = files.iter().map(|f| f.0).sum();
     println!(
-        "{} files, {:.1} MiB in {:.2} s ({:.1} Mbit/s), -j{jobs}",
+        "{} files, {:.1} MiB in {:.2} s ({:.1} Mbit/s), {} at once, {} mirrors, {} per server",
         files.len(),
         total as f64 / (1 << 20) as f64,
         elapsed.as_secs_f64(),
-        total as f64 * 8.0 / 1e6 / elapsed.as_secs_f64()
+        total as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
+        parallel.downloads,
+        parallel.mirrors,
+        parallel.per_origin
     );
     let mut origins: BTreeMap<&str, (usize, u64, Duration)> = BTreeMap::new();
     for d in &done {

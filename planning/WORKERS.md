@@ -1,7 +1,7 @@
 # Workers that handle many items
 
 Design for workers that process a queue of items instead of one input.
-The download worker, one per origin, is the only one so far
+The download worker, one per connection, is the only one so far
 (`src/download.rs`; what was decided for it is under Downloads
 in DECISIONS.md). The signature verification workers also serve many
 items, but one at a time, as each caller waits for its verdict (see
