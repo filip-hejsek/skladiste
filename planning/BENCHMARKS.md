@@ -151,15 +151,22 @@ starts to dominate.
 
 ## Real mirrors
 
-- Calibration (little traffic): from each place, handshake times
-  (`curl -w`: TCP connect, TLS, first byte) and one transfer of about
-  10 MB over one connection, to `geo.mirror.pkgbuild.com` and a few of
-  the nearest mirrors on the mirror status page.
+- Calibration: `scripts/calibrate.sh LABEL [SERVER...]` (only bash,
+  curl, tar and awk, so it runs on a host, in a container and on a
+  server alike) measures per server new connections (TCP, TLS, first
+  byte), requests over a kept connection, one package of about 10 MB
+  over one connection and 4 at once, about 50 MB in all, and records
+  the local link (WiFi band and signal where `iw` sees them; a
+  container's virtual device is marked as such). Results with median
+  and range go to `tmp/calibrate/LABEL-DATE.txt`. To run from each
+  place, against `geo.mirror.pkgbuild.com` (the default) and a few of
+  the nearest mirrors (`--mirrorlist FILE --top N` takes them from a
+  mirror list).
 - pasta: the container reaches the internet through pasta. TCP connect
   takes a real round trip (about 23-26 ms to geo over WiFi), so pasta
   doesn't complete handshakes locally; its effect on throughput is
-  unknown. On ethernet, the same curl measurements on the host and in
-  the container; if they differ beyond noise, validation runs on the
+  unknown. On ethernet, `calibrate.sh` on the host and in the
+  container; if they differ beyond noise, validation runs on the
   host or the server instead.
 - Validation: only a few configurations chosen from the sweeps (the
   current behaviour, the chosen default, its closest alternative), from
