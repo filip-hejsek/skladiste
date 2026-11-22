@@ -30,7 +30,6 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroUsize;
-use std::os::fd::FromRawFd;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -42,12 +41,11 @@ use rustls::pki_types::CertificateDer;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::http::{self, Connection, End, Event, Origin, Resume, RootCerts, Start, Url};
+use crate::http::{self, End, Origin, Resume, Start, Url};
 use crate::jobs::{both, par_map_iter};
-use crate::sandbox::{self, Policy};
 use crate::worker::{
-    self, Args, BUF_SIZE, CHUNK, DONE, ERROR, Kind, MAX_CHUNK, MAX_ERROR, NO_CAPS, WorkerError,
-    Workers, read_error, read_header, read_payload, sanitize, write_frame,
+    self, BUF_SIZE, CHUNK, DONE, ERROR, MAX_CHUNK, MAX_ERROR, WorkerError, Workers, read_error,
+    read_header, sanitize, write_frame,
 };
 
 const CERT: u8 = 5;
@@ -61,9 +59,6 @@ const MAX_CERT: usize = 64 << 10;
 const MAX_ITEM: usize = 16 << 10;
 /// Largest `START` or `END` the supervisor accepts.
 const MAX_MESSAGE: usize = MAX_ERROR;
-
-/// Address space limit of the worker (TLS and a few buffers).
-const MAX_MEMORY: u64 = 256 << 20;
 
 /// Timeout for connecting, and for each read and write once connected.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,13 +81,6 @@ const MAX_STRIKES: u32 = 3;
 
 /// Longest `Last-Modified` value kept from a worker.
 const MAX_LAST_MODIFIED: usize = 100;
-/// The worker; see the module documentation.
-pub(crate) const DOWNLOAD_WORKER: Kind = Kind {
-    name: "download",
-    dirs: &[],
-    caps: NO_CAPS,
-    main: worker,
-};
 
 /// Longest `ETag` value kept from a worker.
 const MAX_ETAG: usize = 256;
@@ -838,7 +826,7 @@ fn connection<S: Sink>(
     if custom.is_some() {
         args.push("custom-roots");
     }
-    let worker = workers.spawn(&DOWNLOAD_WORKER, conn.into(), theirs, &[], &args)?;
+    let worker = workers.spawn(&download_worker::KIND, conn.into(), theirs, &[], &args)?;
     let sock = File::from(ours);
     // The worker reads all certificates before it writes anything but
     // an error, which then explains a failure to send them.
@@ -1025,76 +1013,6 @@ fn send_certs(sock: &File, certs: &[CertificateDer]) -> Result<()> {
     w.flush().context("sending root certificates to worker")
 }
 
-/// Worker side of [`send_certs`].
-fn receive_certs(mut input: impl Read) -> Result<RootCerts> {
-    let mut certs = Vec::new();
-    loop {
-        match read_header(&mut input).context("reading root certificates")? {
-            (CERT, len) => certs.push(read_payload(&mut input, len, MAX_CERT)?.into()),
-            (DONE, 0) => return RootCerts::from_der(certs),
-            (tag, len) => bail!("unexpected message {tag} ({len} bytes) from supervisor"),
-        }
-    }
-}
-
-/// The worker: the origin that fd 0 is connected to is its argument; with
-/// a second argument `custom-roots`, the root certificates come first on
-/// the socket, fd 1.
-fn worker(args: Args) -> Result<Vec<u8>> {
-    let (origin, custom_roots) = match &args.extra[..] {
-        [origin] => (origin, false),
-        [origin, roots] if roots == "custom-roots" => (origin, true),
-        _ => bail!("unexpected arguments {:?}", args.extra),
-    };
-    let origin = Origin::parse(origin)?;
-    let out = args.out;
-    // SAFETY: the supervisor passes the connection as fd 0.
-    let net = unsafe { File::from_raw_fd(0) };
-    // Items come over the socket that results go to. The fd is duplicated
-    // here because confined, the worker can't do that any more.
-    let input = out.get_ref().try_clone().context("duplicating socket")?;
-    let policy = Policy {
-        max_memory: Some(MAX_MEMORY),
-        ..Policy::default()
-    };
-    sandbox::confine(args.layers, &policy)?;
-    // One reader for all input, so nothing is lost in a buffer.
-    let mut input = BufReader::new(input);
-    let roots = if custom_roots {
-        receive_certs(&mut input)?
-    } else {
-        RootCerts::default()
-    };
-    let mut conn = Connection::new(net, &origin, &roots)?;
-    while conn.is_open() {
-        let item: Item = match read_header(&mut input) {
-            Ok((ITEM, len)) => serde_json::from_slice(&read_payload(&mut input, len, MAX_ITEM)?)
-                .context("parsing item")?,
-            Ok((tag, len)) => bail!("unexpected message {tag} ({len} bytes) from supervisor"),
-            // The supervisor has no more files.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e).context("reading from supervisor"),
-        };
-        let end = conn
-            .get(
-                &item.path,
-                item.resume.as_ref(),
-                item.restart,
-                item.unless.as_deref(),
-                &mut |event| match event {
-                    Event::Start(start) => write_frame(out, START, &serde_json::to_vec(start)?),
-                    Event::Data(data) => write_frame(out, CHUNK, data),
-                },
-            )
-            .context("sending to supervisor")?;
-        write_frame(out, END, &serde_json::to_vec(&end)?)?;
-        // The supervisor acts on the end of a file (and reads the head of
-        // a short one) while the next request is under way.
-        out.flush().context("sending to supervisor")?;
-    }
-    Ok(Vec::new())
-}
-
 /// Downloads that wait for a job, at most; the download stage waits when
 /// there are more. Each can keep a file open.
 const MAX_WAITING: usize = 64;
@@ -1161,6 +1079,104 @@ impl<T> Iterator for Feed<T> {
             return Some(item);
         }
         self.ready.next().or_else(|| self.downloads.recv().ok())
+    }
+}
+
+pub(crate) mod download_worker {
+    //! The worker's side (see [`KIND`]).
+
+    use std::fs::File;
+    use std::io::{self, BufReader, Read, Write};
+    use std::os::fd::FromRawFd;
+
+    use anyhow::{Context, Result, bail};
+
+    use super::{CERT, END, ITEM, Item, MAX_CERT, MAX_ITEM, START};
+    use crate::http::{Connection, Event, Origin, RootCerts};
+    use crate::sandbox::{self, Policy};
+    use crate::worker::{Args, CHUNK, DONE, Kind, NO_CAPS, read_header, read_payload, write_frame};
+
+    /// Address space limit of the worker (TLS and a few buffers).
+    const MAX_MEMORY: u64 = 256 << 20;
+
+    /// The worker; see the documentation of [`super`].
+    pub(crate) const KIND: Kind = Kind {
+        name: "download",
+        dirs: &[],
+        caps: NO_CAPS,
+        main,
+    };
+
+    /// Worker side of [`super::send_certs`].
+    fn receive_certs(mut input: impl Read) -> Result<RootCerts> {
+        let mut certs = Vec::new();
+        loop {
+            match read_header(&mut input).context("reading root certificates")? {
+                (CERT, len) => certs.push(read_payload(&mut input, len, MAX_CERT)?.into()),
+                (DONE, 0) => return RootCerts::from_der(certs),
+                (tag, len) => bail!("unexpected message {tag} ({len} bytes) from supervisor"),
+            }
+        }
+    }
+
+    /// The worker: the origin that fd 0 is connected to is its argument; with
+    /// a second argument `custom-roots`, the root certificates come first on
+    /// the socket, fd 1.
+    fn main(args: Args) -> Result<Vec<u8>> {
+        let (origin, custom_roots) = match &args.extra[..] {
+            [origin] => (origin, false),
+            [origin, roots] if roots == "custom-roots" => (origin, true),
+            _ => bail!("unexpected arguments {:?}", args.extra),
+        };
+        let origin = Origin::parse(origin)?;
+        let out = args.out;
+        // SAFETY: the supervisor passes the connection as fd 0.
+        let net = unsafe { File::from_raw_fd(0) };
+        // Items come over the socket that results go to. The fd is duplicated
+        // here because confined, the worker can't do that any more.
+        let input = out.get_ref().try_clone().context("duplicating socket")?;
+        let policy = Policy {
+            max_memory: Some(MAX_MEMORY),
+            ..Policy::default()
+        };
+        sandbox::confine(args.layers, &policy)?;
+        // One reader for all input, so nothing is lost in a buffer.
+        let mut input = BufReader::new(input);
+        let roots = if custom_roots {
+            receive_certs(&mut input)?
+        } else {
+            RootCerts::default()
+        };
+        let mut conn = Connection::new(net, &origin, &roots)?;
+        while conn.is_open() {
+            let item: Item = match read_header(&mut input) {
+                Ok((ITEM, len)) => {
+                    serde_json::from_slice(&read_payload(&mut input, len, MAX_ITEM)?)
+                        .context("parsing item")?
+                }
+                Ok((tag, len)) => bail!("unexpected message {tag} ({len} bytes) from supervisor"),
+                // The supervisor has no more files.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e).context("reading from supervisor"),
+            };
+            let end = conn
+                .get(
+                    &item.path,
+                    item.resume.as_ref(),
+                    item.restart,
+                    item.unless.as_deref(),
+                    &mut |event| match event {
+                        Event::Start(start) => write_frame(out, START, &serde_json::to_vec(start)?),
+                        Event::Data(data) => write_frame(out, CHUNK, data),
+                    },
+                )
+                .context("sending to supervisor")?;
+            write_frame(out, END, &serde_json::to_vec(&end)?)?;
+            // The supervisor acts on the end of a file (and reads the head of
+            // a short one) while the next request is under way.
+            out.flush().context("sending to supervisor")?;
+        }
+        Ok(Vec::new())
     }
 }
 

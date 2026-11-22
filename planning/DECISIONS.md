@@ -729,9 +729,15 @@ are in BUGS.md.
   and the working directory is `/`.
 - Each kind of worker is a `worker::Kind` (name, directories,
   capabilities, entry point) defined with the code it runs: the Arch
-  ones in `arch`, the others in `download`, `diff` and `install`. Their
-  supervisor sides are functions there that take `&Workers`, which only
-  starts workers and holds settings. `worker::KINDS` lists every kind
+  ones in `arch`, the others in `download`, `diff` and `install`. The
+  worker's side (its `Kind` as `KIND`, entry point `main`, sandbox
+  policy and the code it runs) is a module `<name>_worker` of its own,
+  in which only `KIND` is visible, so supervisor code can't call
+  worker code by mistake. Their supervisor sides are functions outside
+  it that take `&Workers`, which only starts workers and holds
+  settings; they are named for what they do (`arch::import`,
+  `diff::diff`), and their docs say what the worker can access.
+  `worker::KINDS` lists every kind
   (the only place the generic module names them);
   `__worker` runs only those, with the directories the kind declares.
   Rejected: a method on `Workers` per kind (the generic module grows

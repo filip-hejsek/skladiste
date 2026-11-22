@@ -49,12 +49,12 @@ pub const SUBCOMMAND: &str = "__worker";
 
 /// Every kind of worker there is.
 const KINDS: &[&Kind] = &[
-    &arch::IMPORT_WORKER,
-    &arch::repo::READ_DB_WORKER,
-    &arch::verify::VERIFY_WORKER,
-    &download::DOWNLOAD_WORKER,
-    &diff::DIFF_WORKER,
-    &install::INSTALL_WORKER,
+    &arch::import_worker::KIND,
+    &arch::repo::read_db_worker::KIND,
+    &arch::verify::verify_worker::KIND,
+    &download::download_worker::KIND,
+    &diff::diff_worker::KIND,
+    &install::install_worker::KIND,
 ];
 
 pub(crate) const BEGIN: u8 = 1;

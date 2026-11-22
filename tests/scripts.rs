@@ -170,7 +170,7 @@ fn build(store: &Store, dir: &Path, name: &str, ids: &[Hash], rerun: bool) -> Co
 }
 
 fn import(store: &Store, path: &Path) -> Hash {
-    let pkg = arch::import_in_worker(&workers(), store, File::open(path).unwrap())
+    let pkg = arch::import(&workers(), store, File::open(path).unwrap())
         .unwrap()
         .0;
     store.add_package(&pkg).unwrap()

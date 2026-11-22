@@ -2,7 +2,7 @@
 //! package signatures for the supervisor.
 //!
 //! A worker checks Arch package signatures with
-//! [`Keyring`]: fd 0 is a `SOCK_SEQPACKET` socket for its
+//! [`Keyring`](crate::arch::signature::Keyring): fd 0 is a `SOCK_SEQPACKET` socket for its
 //! input, fd 1 a pipe for its results. Each input message is a tag byte and
 //! a payload, with fds attached (`SCM_RIGHTS`):
 //!
@@ -25,22 +25,18 @@
 //! and its certification checks cached, so it serves a whole run.
 
 use std::fs::File;
-use std::io::{self, BufReader, IoSlice, IoSliceMut, Read, Write};
+use std::io::{BufReader, IoSlice};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result, bail, ensure};
-use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags,
-};
+use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 
-use crate::arch::signature::{Keyring, MAX_SIGNATURE_SIZE};
-use crate::sandbox::{self, Policy};
+use crate::arch::signature::MAX_SIGNATURE_SIZE;
 use crate::worker::{
-    Args, DONE, ERROR, Kind, MAX_ERROR, NO_CAPS, Shared, Spawner, Worker, Workers, read_error,
-    read_header, read_payload, read_result, sanitize, write_frame,
+    DONE, ERROR, MAX_ERROR, Shared, Spawner, Worker, Workers, read_error, read_header,
+    read_payload, read_result, sanitize,
 };
 
 const KEYRING: u8 = 1;
@@ -48,21 +44,6 @@ const ITEM: u8 = 2;
 const READY: u8 = 5;
 const GOOD: u8 = 6;
 const BAD: u8 = 7;
-
-/// Address space limit of the worker: the keyring (the Arch keyring is
-/// 1.8 MB) and a buffer.
-const MAX_MEMORY: u64 = 256 << 20;
-
-/// System calls the worker makes besides [`sandbox`]'s basic set.
-const SYSCALLS: &[i64] = &[libc::SYS_recvmsg];
-
-/// The worker; see the module documentation.
-pub(crate) const VERIFY_WORKER: Kind = Kind {
-    name: "verify-arch",
-    dirs: &[],
-    caps: NO_CAPS,
-    main: worker,
-};
 
 /// The files of an Arch keyring, as in `/usr/share/pacman/keyrings/`.
 pub struct KeyringFiles {
@@ -197,7 +178,9 @@ impl<'a> Verifier<'a> {
         .context("creating socket")?;
         let (results_r, results_w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
         let mut worker = VerifyWorker {
-            worker: self.spawner.spawn(&VERIFY_WORKER, theirs, results_w)?,
+            worker: self
+                .spawner
+                .spawn(&verify_worker::KIND, theirs, results_w)?,
             input,
             results: BufReader::new(File::from(results_r)),
         };
@@ -321,102 +304,136 @@ fn send(socket: &OwnedFd, tag: u8, payload: &[u8], fds: &[BorrowedFd]) -> Result
     Ok(())
 }
 
-/// A message to the worker: tag, payload and attached fds.
-type Message<'b> = (u8, &'b [u8], Vec<OwnedFd>);
+pub(crate) mod verify_worker {
+    //! The worker's side (see [`KIND`]).
 
-/// Worker side: the next message, as its tag and payload, with the fds
-/// attached to it, or `None` when the input ends. Messages with more than
-/// `max_fds` fds or a longer payload than `buf` holds are an error.
-fn receive<'b>(
-    socket: BorrowedFd,
-    buf: &'b mut [u8],
-    max_fds: usize,
-) -> Result<Option<Message<'b>>> {
-    // Room for more fds than expected, so extra ones are seen and refused
-    // rather than cut off.
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
-    let mut control = RecvAncillaryBuffer::new(&mut space);
-    let msg = loop {
-        let mut iov = [IoSliceMut::new(buf)];
-        match rustix::net::recvmsg(socket, &mut iov, &mut control, RecvFlags::CMSG_CLOEXEC) {
-            Err(rustix::io::Errno::INTR) => continue,
-            r => break r.context("reading from supervisor")?,
-        }
-    };
-    let mut fds = Vec::new();
-    for message in control.drain() {
-        if let RecvAncillaryMessage::ScmRights(received) = message {
-            fds.extend(received);
-        }
-    }
-    ensure!(
-        !msg.flags
-            .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC),
-        "message from supervisor too large"
-    );
-    ensure!(fds.len() <= max_fds, "too many fds from supervisor");
-    // Every message has a tag, so an empty one is the end of input.
-    let Some((&tag, payload)) = buf[..msg.bytes].split_first() else {
-        return Ok(None);
-    };
-    Ok(Some((tag, payload, fds)))
-}
+    use std::fs::File;
+    use std::io::{self, BufReader, IoSliceMut, Read, Write};
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 
-/// Entry point of the worker.
-fn worker(args: Args) -> Result<Vec<u8>> {
-    args.no_extra()?;
-    let out = args.out;
-    // SAFETY: the supervisor passes the input socket as fd 0.
-    let input = unsafe { OwnedFd::from_raw_fd(0) };
-    let policy = Policy {
-        syscalls: SYSCALLS,
-        max_memory: Some(MAX_MEMORY),
-        ..Policy::default()
+    use anyhow::{Context, Result, bail, ensure};
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+
+    use super::{BAD, GOOD, ITEM, KEYRING, READY};
+    use crate::arch::signature::{Keyring, MAX_SIGNATURE_SIZE};
+    use crate::sandbox::{self, Policy};
+    use crate::worker::{Args, Kind, MAX_ERROR, NO_CAPS, write_frame};
+
+    /// Address space limit of the worker: the keyring (the Arch keyring is
+    /// 1.8 MB) and a buffer.
+    const MAX_MEMORY: u64 = 256 << 20;
+
+    /// System calls the worker makes besides [`sandbox`]'s basic set.
+    const SYSCALLS: &[i64] = &[libc::SYS_recvmsg];
+
+    /// The worker; see the documentation of [`super`].
+    pub(crate) const KIND: Kind = Kind {
+        name: "verify-arch",
+        dirs: &[],
+        caps: NO_CAPS,
+        main,
     };
-    sandbox::confine(args.layers, &policy)?;
-    let mut buf = vec![0; MAX_SIGNATURE_SIZE as usize + 2];
-    let keyring = match receive(input.as_fd(), &mut buf, 3)? {
-        Some((KEYRING, [], fds)) => {
-            let [certs, trusted, revoked] = <[OwnedFd; 3]>::try_from(fds)
-                .map_err(|_| anyhow::anyhow!("keyring needs three files"))?;
-            let open = |fd: OwnedFd| BufReader::new(NoHints(File::from(fd)));
-            Keyring::load(open(certs), open(trusted), open(revoked))?
-        }
-        _ => bail!("expected the keyring from supervisor"),
-    };
-    write_frame(out, READY, &[])?;
-    out.flush()?;
-    while let Some((tag, signature, fds)) = receive(input.as_fd(), &mut buf, 1)? {
-        let archive = match (tag, <[OwnedFd; 1]>::try_from(fds)) {
-            (ITEM, Ok([archive])) => File::from(archive),
-            _ => bail!("unexpected message {tag} from supervisor"),
+
+    /// A message to the worker: tag, payload and attached fds.
+    type Message<'b> = (u8, &'b [u8], Vec<OwnedFd>);
+
+    /// Worker side: the next message, as its tag and payload, with the fds
+    /// attached to it, or `None` when the input ends. Messages with more than
+    /// `max_fds` fds or a longer payload than `buf` holds are an error.
+    fn receive<'b>(
+        socket: BorrowedFd,
+        buf: &'b mut [u8],
+        max_fds: usize,
+    ) -> Result<Option<Message<'b>>> {
+        // Room for more fds than expected, so extra ones are seen and refused
+        // rather than cut off.
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let msg = loop {
+            let mut iov = [IoSliceMut::new(buf)];
+            match rustix::net::recvmsg(socket, &mut iov, &mut control, RecvFlags::CMSG_CLOEXEC) {
+                Err(rustix::io::Errno::INTR) => continue,
+                r => break r.context("reading from supervisor")?,
+            }
         };
-        match keyring.verify(signature, NoHints(archive)) {
-            Ok(_) => write_frame(out, GOOD, &[])?,
-            Err(e) => {
-                let mut msg = format!("{e:#}").into_bytes();
-                msg.truncate(MAX_ERROR);
-                write_frame(out, BAD, &msg)?;
+        let mut fds = Vec::new();
+        for message in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(received) = message {
+                fds.extend(received);
             }
         }
-        out.flush()?;
+        ensure!(
+            !msg.flags
+                .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC),
+            "message from supervisor too large"
+        );
+        ensure!(fds.len() <= max_fds, "too many fds from supervisor");
+        // Every message has a tag, so an empty one is the end of input.
+        let Some((&tag, payload)) = buf[..msg.bytes].split_first() else {
+            return Ok(None);
+        };
+        Ok(Some((tag, payload, fds)))
     }
-    Ok(Vec::new())
-}
 
-/// Reads with plain `read` calls only, without the size hints (`statx`,
-/// `lseek`) that [`File`]'s `read_to_end` asks for, which seccomp doesn't
-/// allow.
-struct NoHints(File);
+    /// Entry point of the worker.
+    fn main(args: Args) -> Result<Vec<u8>> {
+        args.no_extra()?;
+        let out = args.out;
+        // SAFETY: the supervisor passes the input socket as fd 0.
+        let input = unsafe { OwnedFd::from_raw_fd(0) };
+        let policy = Policy {
+            syscalls: SYSCALLS,
+            max_memory: Some(MAX_MEMORY),
+            ..Policy::default()
+        };
+        sandbox::confine(args.layers, &policy)?;
+        let mut buf = vec![0; MAX_SIGNATURE_SIZE as usize + 2];
+        let keyring = match receive(input.as_fd(), &mut buf, 3)? {
+            Some((KEYRING, [], fds)) => {
+                let [certs, trusted, revoked] = <[OwnedFd; 3]>::try_from(fds)
+                    .map_err(|_| anyhow::anyhow!("keyring needs three files"))?;
+                let open = |fd: OwnedFd| BufReader::new(NoHints(File::from(fd)));
+                Keyring::load(open(certs), open(trusted), open(revoked))?
+            }
+            _ => bail!("expected the keyring from supervisor"),
+        };
+        write_frame(out, READY, &[])?;
+        out.flush()?;
+        while let Some((tag, signature, fds)) = receive(input.as_fd(), &mut buf, 1)? {
+            let archive = match (tag, <[OwnedFd; 1]>::try_from(fds)) {
+                (ITEM, Ok([archive])) => File::from(archive),
+                _ => bail!("unexpected message {tag} from supervisor"),
+            };
+            match keyring.verify(signature, NoHints(archive)) {
+                Ok(_) => write_frame(out, GOOD, &[])?,
+                Err(e) => {
+                    let mut msg = format!("{e:#}").into_bytes();
+                    msg.truncate(MAX_ERROR);
+                    write_frame(out, BAD, &msg)?;
+                }
+            }
+            out.flush()?;
+        }
+        Ok(Vec::new())
+    }
 
-impl Read for NoHints {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+    /// Reads with plain `read` calls only, without the size hints (`statx`,
+    /// `lseek`) that [`File`]'s `read_to_end` asks for, which seccomp doesn't
+    /// allow.
+    struct NoHints(File);
+
+    impl Read for NoHints {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+
     use super::*;
 
     #[test]

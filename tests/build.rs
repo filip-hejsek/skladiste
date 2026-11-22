@@ -98,7 +98,7 @@ fn build(store: &Store, pkgs: &[Hash], img: &Path) -> anyhow::Result<install::Re
 
 /// Import the package file at `path`, returning the package's id.
 fn import(store: &Store, path: &Path) -> Hash {
-    let pkg = arch::import_in_worker(&workers(), store, File::open(path).unwrap())
+    let pkg = arch::import(&workers(), store, File::open(path).unwrap())
         .unwrap()
         .0;
     store.add_package(&pkg).unwrap()
@@ -138,8 +138,7 @@ fn build_image() {
     );
 
     let base = import(&store, &base);
-    let (tools, stats) =
-        arch::import_in_worker(&workers(), &store, File::open(&tools).unwrap()).unwrap();
+    let (tools, stats) = arch::import(&workers(), &store, File::open(&tools).unwrap()).unwrap();
     assert_eq!(stats.files, 4);
     assert_eq!(stats.new_blobs, 3, "identical files share one blob");
     let tools = store.add_package(&tools).unwrap();
@@ -289,7 +288,7 @@ fn worker_errors_are_reported() {
     let store = Store::init_path(&tmp.path().join("store")).unwrap();
     let path = tmp.path().join("bad.pkg.tar.zst");
     fs::write(&path, "not an archive").unwrap();
-    let err = arch::import_in_worker(&workers(), &store, File::open(&path).unwrap()).unwrap_err();
+    let err = arch::import(&workers(), &store, File::open(&path).unwrap()).unwrap_err();
     assert!(
         err.to_string().contains("unsupported compression"),
         "{err:#}"
@@ -315,9 +314,7 @@ fn concurrent_imports_share_blobs() {
     let workers = workers();
     let results: Vec<_> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..4)
-            .map(|_| {
-                s.spawn(|| arch::import_in_worker(&workers, &store, File::open(&path).unwrap()))
-            })
+            .map(|_| s.spawn(|| arch::import(&workers, &store, File::open(&path).unwrap())))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });

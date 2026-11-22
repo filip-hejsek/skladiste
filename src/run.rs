@@ -165,7 +165,7 @@ pub fn run_captured(
     wait_for_coarse_clock();
     let status = run(image, program, args, options)?;
     let (changes, stats) =
-        diff::diff_in_worker(workers, store, snapshot.dir(), image).context("finding changes")?;
+        diff::diff(workers, store, snapshot.dir(), image).context("finding changes")?;
     let snapshot_removal = snapshot.remove()?;
     Ok(Captured {
         status,

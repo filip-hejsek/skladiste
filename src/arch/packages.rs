@@ -579,8 +579,7 @@ fn import_archive(
     }
     file.seek(SeekFrom::Start(0))?;
     let importing = || format!("importing {what}");
-    let (pkg, stats) =
-        arch::import_in_worker(ctx.workers, ctx.store, file).with_context(importing)?;
+    let (pkg, stats) = arch::import(ctx.workers, ctx.store, file).with_context(importing)?;
     // The metadata must be usable for dependency resolution.
     repo::package_candidate(&pkg).with_context(importing)?;
     ArchSection::of(&pkg)?.validate().with_context(importing)?;
