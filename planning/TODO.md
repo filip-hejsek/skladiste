@@ -30,8 +30,12 @@ left of that design: image records (see Images).
     order is largest `%CSIZE%` first, across all mirrors.
   - Fall back when a download is slow: sketched in WORKERS.md
     (Fallback). Now only failures move a file to another mirror.
-  - Measure how many mirrors should share a repo's files (now 2) on a
-    fast link.
+  - Parallel downloads: `-j` (the number of CPUs) caps the origins at
+    once, and `MIRRORS_AT_ONCE` (2) is fixed, though downloads are
+    I/O-bound and many small files are bound by a round trip each.
+    Proposed: `N` parallel downloads over the first `N` mirrors, with
+    further connections per origin when there are fewer. To be
+    measured first: planning/BENCHMARKS.md.
   - A sync's database can go to the other of the two mirrors than the
     one its latest record is from, which then sends all of it instead
     of a `304`. The record's mirror should get it first.
