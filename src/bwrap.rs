@@ -10,7 +10,6 @@
 //! [`image_command`] runs package code instead: the root is an image.
 
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -149,7 +148,7 @@ pub(crate) fn command(
 /// for the process to load (fds of a file or pipe holding raw BPF).
 /// `files` are put read-only at their paths, with the content read from
 /// the fds. The child must inherit `image`, `filters` and the fds of
-/// `files` (see [`inherit`]).
+/// `files` (see [`crate::fds::inherit`]).
 ///
 /// New pid, net, ipc, uts and cgroup namespaces, as for workers. The
 /// process runs as root with only `caps`: when skl runs as root, in the
@@ -221,21 +220,6 @@ pub(crate) fn image_command(
     Ok(cmd)
 }
 
-/// Make the child of `cmd` inherit `fds` under their numbers, by clearing
-/// CLOEXEC on them between fork and exec.
-pub(crate) fn inherit(cmd: &mut Command, fds: Vec<RawFd>) {
-    // SAFETY: fcntl is async-signal-safe, and only the child's fd table is
-    // changed.
-    unsafe {
-        cmd.pre_exec(move || {
-            for &fd in &fds {
-                rustix::io::fcntl_setfd(BorrowedFd::borrow_raw(fd), rustix::io::FdFlags::empty())?;
-            }
-            Ok(())
-        });
-    }
-}
-
 /// `bwrap` with new namespaces other than the user namespace.
 fn new_namespaces(bwrap: &Path) -> Command {
     let mut cmd = Command::new(bwrap);
@@ -303,7 +287,7 @@ mod tests {
         ])
         .env_clear()
         .env(CHILD_VAR, "1");
-        inherit(&mut cmd, fds);
+        crate::fds::inherit(&mut cmd, fds);
         let status = cmd.status().unwrap();
         assert!(status.success(), "child {status}");
         assert_eq!(std::fs::read(rw.path().join("new")).unwrap(), b"y");

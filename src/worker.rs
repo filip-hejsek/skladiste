@@ -41,7 +41,7 @@ use crate::http::RootCerts;
 use crate::manifest::{BlobId, Content};
 use crate::sandbox::Layers;
 use crate::store::{BlobSink, Store};
-use crate::{arch, diff, download, install};
+use crate::{arch, diff, download, fds, install};
 
 /// First argument that makes `skl` run as a worker. `main` must check for
 /// it before doing anything else.
@@ -330,7 +330,7 @@ impl Workers {
             .stdin(stdin)
             .stdout(stdout)
             .stderr(stderr_w);
-        bwrap::inherit(&mut cmd, raw);
+        fds::inherit(&mut cmd, raw);
         let child = cmd
             .spawn()
             .with_context(|| format!("starting {kind} worker ({})", self.exe.display()))?;

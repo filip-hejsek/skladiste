@@ -27,6 +27,7 @@ use rustix::fs::{Mode, OFlags};
 use crate::btrfs;
 use crate::bwrap;
 use crate::diff::{self, Change};
+use crate::fds;
 use crate::sandbox;
 use crate::store::Store;
 use crate::worker::{self, ImportStats, Workers};
@@ -73,7 +74,7 @@ pub fn run(
     let mut fds = vec![image.as_raw_fd()];
     fds.extend(filters.iter().map(|f| f.as_raw_fd()));
     fds.extend(options.files.iter().map(|(fd, _)| fd.as_raw_fd()));
-    bwrap::inherit(&mut cmd, fds);
+    fds::inherit(&mut cmd, fds);
     cmd.env_clear().env("PATH", PATH).current_dir("/");
     let running = || format!("running {}", bwrap.display());
     if !options.escape_output {
