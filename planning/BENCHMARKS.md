@@ -48,10 +48,14 @@ mirrors' IPs as SANs. Checked: TCP connect and TLS each take one round
 trip of the configured RTT, and two mirrors share a 20 Mbit/s downlink
 at 18.7 Mbit/s in all.
 
-Network profiles, to be calibrated from real measurements (below):
-fiber over ethernet (about 500 Mbit/s), WiFi on 5 GHz and on 2.4 GHz
-(lower rate, jitter, loss), a server (1 Gbit/s or more, low RTT), a
-slow link (10-20 Mbit/s, 40-50 ms).
+Network profiles (`--profile`), from the calibration below: `fiber`
+(730/720 Mbit/s, 19 ms), `router` (90 Mbit/s, 19 ms), `wifi-5ghz`
+(60 Mbit/s, 20 ms), `wifi-24ghz` (45 Mbit/s, 20 ms), `wifi-weak`
+(12 Mbit/s, 20 ms); the RTT is the whole round trip to geo, and
+uplinks other than fiber's are guesses. One connection gets 638 Mbit/s
+of `fiber` over HTTPS for a 200 MB file (653 over HTTP; netem's rate
+includes headers), 528 for 50 MB (slow start). Still to add: a server,
+and the jitter and retransmissions of weak WiFi.
 
 Mirror sets: one origin; 2-5 equal mirrors; one near mirror and farther
 ones; one slow or rate-limited mirror among good ones; one that isn't
@@ -149,6 +153,20 @@ from the access logs. Up to 5, time falls with N about as round trips
 predict; from 5 to 8 it gains less, as transfer (3 s at 500 Mbit/s)
 starts to dominate.
 
+On the calibrated profiles (2 rounds, within 0.2 s; the small files,
+one mirror):
+
+| profile     | skl `-n`: 1 | 2      | 3     | 5      | 8      | 12     | 16     | pacman 5, 8, 16       |
+|-------------|-------------|--------|-------|--------|--------|--------|--------|-----------------------|
+| `fiber`     | 22.0 s      | 11.1 s | 7.5 s | 4.8 s  | 3.55 s | 2.97 s | 2.71 s | 5.5-5.7, 3.9, 3.0 s   |
+| `wifi-5ghz` | 47.9 s      | 31.1 s |       | 27.6 s |        |        |        | 28.0 s                |
+| `wifi-weak` | 156.9 s     |        |       | 136.1 s |       |        |        |                       |
+
+The transfer alone takes about 2.3 s on `fiber`, 26 s on `wifi-5ghz`
+and 130 s on `wifi-weak`. On fiber, more connections keep paying off
+up to about 8 (5 to 8 saves 27 %, 8 to 16 another 24 %); over WiFi 2
+already come within 20 % of the link, and 5 within 6 %.
+
 ## Real mirrors
 
 - Calibration: `scripts/calibrate.sh LABEL [SERVER...]` (only bash,
@@ -168,6 +186,28 @@ starts to dominate.
   unknown. On ethernet, `calibrate.sh` on the host and in the
   container; if they differ beyond noise, validation runs on the
   host or the server instead.
+- Calibration done so far (2026-11-22, the host, geo only, 10 samples
+  each; medians):
+
+  | place                        | request on a kept connection | TCP, TLS | 10 MB alone, 4 at once |
+  |------------------------------|------------|----------|-----------------|
+  | ethernet without the router  | 19.2 ms    | 16, 28 ms | 347, 387 Mbit/s |
+  | ethernet through the router  | 18.9 ms    | 18, 28 ms | 88, 92 Mbit/s   |
+  | WiFi 5 GHz, -67 dBm          | 20.0 ms    | 19, 31 ms | 63, 54 Mbit/s   |
+  | WiFi 2.4 GHz, -21 dBm        | 19.0 ms    | 18, 34 ms | 50, 44 Mbit/s   |
+  | WiFi 2.4 GHz, -58 dBm        | 20.5 ms    | 22, 94 ms | 44, 42 Mbit/s   |
+  | WiFi 2.4 GHz, -73 dBm        | 21.4 ms    | 20, 32 ms | 24, 23 Mbit/s   |
+  | WiFi 5 GHz, -86 dBm          | 19.2 ms    | 21, 33 ms | 14, 11 Mbit/s   |
+
+  A web speed test without the router: 730 Mbit/s down, 721 up, 14 ms
+  to a server in Prague, 3.7 ms jitter. The round trip to geo is the
+  same everywhere (WiFi adds a millisecond or two); bandwidth varies
+  50-fold. The router's port negotiates 100 Mbit/s. 4 at once gain
+  nothing except on the direct link, so the link is the limit, not a
+  limit per connection; there 10 MB is too short for slow start
+  (`--size 50` instead). WiFi at -58 dBm on 2.4 GHz had handshakes up to
+  240 ms (retransmissions, probably). Still to do: other mirrors than
+  geo, a server, and the container on the direct link (pasta).
 - Validation: only a few configurations chosen from the sweeps (the
   current behaviour, the chosen default, its closest alternative), from
   WiFi (place in the room and band recorded), ethernet (fiber, about

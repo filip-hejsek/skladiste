@@ -11,6 +11,16 @@
 #                   order of the --mirror options
 #   SKL_CA_CERTS    the CA that signed the mirrors' certificate
 # and removes the namespaces when it exits. Options:
+#   --profile NAME  rates and RTT of a measured place (calibrate.sh; see
+#                   planning/BENCHMARKS.md), which later options override.
+#                   The RTT is the whole round trip to
+#                   geo.mirror.pkgbuild.com; uplinks other than fiber's
+#                   weren't measured:
+#                     fiber      730mbit down, 720mbit up, 19 ms
+#                     router     90mbit, 90mbit, 19 ms (a 100 Mbit/s port)
+#                     wifi-5ghz  60mbit, 40mbit, 20 ms
+#                     wifi-24ghz 45mbit, 40mbit, 20 ms
+#                     wifi-weak  12mbit, 10mbit, 20 ms
 #   --down RATE     downlink of the access link (default 500mbit)
 #   --up RATE       uplink (default 50mbit)
 #   --rtt MS        round trip of the access link (default 10)
@@ -254,9 +264,22 @@ simulate() {
 	local mirrors=()
 	while (($#)); do
 		case $1 in
-		--down | --up | --rtt | --jitter | --loss | --queue | --root | --mirror | --logs)
+		--profile | --down | --up | --rtt | --jitter | --loss | --queue | --root | --mirror | --logs)
 			(($# >= 2)) || usage
 			case $1 in
+			--profile)
+				case $2 in
+				fiber) down=730mbit up=720mbit rtt=19 ;;
+				router) down=90mbit up=90mbit rtt=19 ;;
+				wifi-5ghz) down=60mbit up=40mbit rtt=20 ;;
+				wifi-24ghz) down=45mbit up=40mbit rtt=20 ;;
+				wifi-weak) down=12mbit up=10mbit rtt=20 ;;
+				*)
+					echo "unknown profile: $2" >&2
+					exit 1
+					;;
+				esac
+				;;
 			--down) down=$2 ;;
 			--up) up=$2 ;;
 			--rtt) rtt=$2 ;;
