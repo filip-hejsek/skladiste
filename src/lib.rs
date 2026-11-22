@@ -4,6 +4,7 @@ pub mod arch;
 pub mod btrfs;
 mod bwrap;
 pub mod diff;
+mod dir;
 pub mod download;
 mod fds;
 pub mod http;

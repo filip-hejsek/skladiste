@@ -5,9 +5,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, FileType, Mode};
 use rustix::io::Errno;
 use rustix::ioctl::{Setter, ioctl, opcode};
+
+use crate::dir::open_dir;
 
 const BTRFS_IOCTL_MAGIC: u8 = 0x94;
 const BTRFS_PATH_NAME_MAX: usize = 4087;
@@ -82,12 +84,6 @@ pub fn remove_subvolume_at(parent: BorrowedFd, name: &OsStr) -> Result<Removal> 
     drop(dir);
     rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).context("removing subvolume")?;
     Ok(Removal::EntryByEntry)
-}
-
-fn open_dir(parent: BorrowedFd, name: &OsStr) -> Result<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    rustix::fs::openat(parent, name, flags, Mode::empty())
-        .with_context(|| format!("opening {}", name.display()))
 }
 
 /// Remove everything in `dir`, making directories writable where needed

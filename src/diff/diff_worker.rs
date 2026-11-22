@@ -12,6 +12,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use super::Change;
+use crate::dir::open_dir;
 use crate::manifest::{BlobId, Entry, EntryKind, XattrValue};
 use crate::sandbox::{self, Policy};
 use crate::store::BlobSink;
@@ -70,10 +71,7 @@ fn main(mut args: Args) -> Result<Vec<u8>> {
     };
     sandbox::confine(args.layers, &policy)?;
     // The directories were opened with O_PATH; reading them needs real fds.
-    let reopen = |fd: OwnedFd| {
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        rustix::fs::openat(&fd, ".", flags, Mode::empty()).context("opening directory")
-    };
+    let reopen = |fd: OwnedFd| open_dir(fd.as_fd(), OsStr::new("."));
     let changes = diff(reopen(old)?, reopen(new)?, &mut RemoteSink::new(args.out))?;
     Ok(serde_json::to_vec(&changes)?)
 }
@@ -256,12 +254,6 @@ fn list(dir: &OwnedFd) -> Result<Vec<Box<OsStr>>> {
     }
     names.sort();
     Ok(names)
-}
-
-fn open_dir(dir: BorrowedFd, name: &OsStr) -> Result<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    rustix::fs::openat(dir, name, flags, Mode::empty())
-        .with_context(|| format!("opening {}", name.display()))
 }
 
 fn join(dir: &str, name: &OsStr) -> Result<String> {

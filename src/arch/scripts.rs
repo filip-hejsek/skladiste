@@ -21,13 +21,13 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::ExitStatus;
 
 use anyhow::{Context, Result};
-use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::arch::hooks::{self, Hook, When};
 use crate::arch::{ArchSection, SECTION, repo, version};
 use crate::btrfs;
 use crate::diff::{self, Change};
+use crate::dir::open_dir;
 use crate::fds;
 use crate::install;
 use crate::manifest::{EntryKind, Hash, Package, Section};
@@ -297,13 +297,7 @@ pub fn build(
         });
     }
     let report = install::build(workers, store, &ids, parent, name)?;
-    let image = rustix::fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .context("opening the new image")?;
+    let image = open_dir(parent, name).context("opening the new image")?;
     let ran = run_code(workers, store, &plan, image)?;
     if ran.status.success() {
         store.save_synthetic(&spec, &ran.synthetic)?;

@@ -22,11 +22,11 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rustix::fs::{Mode, OFlags};
 
 use crate::btrfs;
 use crate::bwrap;
 use crate::diff::{self, Change};
+use crate::dir::open_dir;
 use crate::fds;
 use crate::sandbox;
 use crate::store::Store;
@@ -215,8 +215,7 @@ impl Snapshot {
             name,
             dir: None,
         };
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let dir = rustix::fs::openat(&snapshot.tmp, snapshot.name.as_str(), flags, Mode::empty())
+        let dir = open_dir(snapshot.tmp.as_fd(), OsStr::new(&snapshot.name))
             .context("opening snapshot")?;
         snapshot.dir = Some(dir);
         Ok(snapshot)
