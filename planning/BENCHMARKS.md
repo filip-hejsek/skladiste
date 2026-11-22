@@ -23,27 +23,31 @@ before bandwidth does.
 
 ## Simulated network
 
-`scripts/netsim.sh`, run under `unshare -r` (no root needed; veth,
-netem and ifb work in a user namespace here). Network namespaces:
+`scripts/netsim.sh` (usage in its header) runs a command in a client
+network namespace behind simulated mirrors, all under `unshare -rn`
+(no root needed: veth, bridges and netem work in a user namespace):
 
-- client: runs skl;
-- router: the access link, shared by all mirrors (netem on both
-  directions: rate, base RTT, jitter, loss; the queue size is set
-  explicitly, as it shapes TCP at the bottleneck);
-- one per mirror: nginx on its own IP, with the mirror's extra RTT and
-  bandwidth (netem), and optionally a rate limit per connection, a
-  connection limit, `keepalive_requests`, or `404` for some files (a
-  mirror that isn't in sync).
+- the namespace of the script is the router: a bridge, whose port to
+  the client is the access link shared by all mirrors (netem on both
+  directions: rate, base RTT, jitter, loss, queue size);
+- one namespace per mirror: nginx on its own IP (10.77.0.11 on), with
+  the mirror's extra RTT and bandwidth (netem), and optionally
+  `limit_rate` (per request, and only after the first write, so it
+  slows large files only), a connection limit (`503` beyond it),
+  `keepalive_requests`, or `404` for every Kth file (a mirror that
+  isn't in sync).
 
-Static neighbour entries, so the first connection doesn't pay an ARP
-round trip. The test CA's certificate for the mirrors has their IPs as
-SANs. Runs over HTTPS, as the handshake is part of what a new
-connection costs.
+Static neighbour entries, so the first connection pays no ARP round
+trip. HTTPS by default, as the handshake is part of what a new
+connection costs; the script's own CA (in `tmp/netsim/tls`) has the
+mirrors' IPs as SANs. Checked: TCP connect and TLS each take one round
+trip of the configured RTT, and two mirrors share a 20 Mbit/s downlink
+at 18.7 Mbit/s in all.
 
-Network profiles, calibrated from real measurements (below): fiber over
-ethernet (about 500 Mbit/s), WiFi on 5 GHz and on 2.4 GHz (lower rate,
-jitter, loss), a server (1 Gbit/s or more, low RTT), a slow link
-(10-20 Mbit/s, 40-50 ms).
+Network profiles, to be calibrated from real measurements (below):
+fiber over ethernet (about 500 Mbit/s), WiFi on 5 GHz and on 2.4 GHz
+(lower rate, jitter, loss), a server (1 Gbit/s or more, low RTT), a
+slow link (10-20 Mbit/s, 40-50 ms).
 
 Mirror sets: one origin; 2-5 equal mirrors; one near mirror and farther
 ones; one slow or rate-limited mirror among good ones; one that isn't
@@ -51,29 +55,38 @@ in sync.
 
 ## Workloads
 
-- Small files: the sizes of 997 packages under 1 MB from a pacman cache
-  after several upgrades (185 MiB, median 100 KB, 10th percentile
-  23 KB, 90th 540 KB; most are Haskell rebuilds). Sizes only are kept
-  in the repo; the names aren't needed. At 25 ms RTT the round trips
-  alone are about 25 s over one connection, against 3 s of transfer at
-  500 Mbit/s and 31 s at 50 Mbit/s.
-- Mixed: the `%CSIZE%` distribution of core and extra in the snapshot,
-  for upgrades that include large packages.
+Lists of sizes, which `netsim.sh files SIZES DIR` turns into sparse
+files and the list the example reads. No list of anyone's packages is
+kept in the repo.
+
+- Upgrades: `scripts/upgrade-sizes.sh OLD_DAY NEW_DAY [NAMES]`, the
+  packages of core and extra whose version changed between two days of
+  the archive, optionally only those in NAMES (e.g. `pacman -Qq` of a
+  real system, kept locally). Unfiltered, a week (2026/11/08 to
+  2026/11/15) is 3190 packages and 29.7 GiB (median 300 KB, 2276 under
+  1 MB), far more than one system downloads.
+- Small files: a pacman cache's packages under 1 MB from 30 days
+  (`find /var/cache/pacman/pkg -mtime -30 -size -1000k`): 997 files,
+  185 MiB, median 100 KB, 10th percentile 23 KB, 90th 540 KB, most of
+  them Haskell rebuilds. Not a whole upgrade (no large files), but the
+  case where round trips dominate: at 25 ms RTT about 25 s over one
+  connection, against 3 s of transfer at 500 Mbit/s.
 - End to end: the 42 packages of `build --fetch filesystem bash
   coreutils` from the snapshot, which includes the overlap of
   downloading and importing.
 
-The synthetic workloads are random files of those sizes, downloaded by
-a download-only example (`examples/`): `download_all` with sinks that
-discard, so a sweep measures the network and not importing. It
-dispatches to `worker::main` as `main.rs` does.
+`examples/download.rs` downloads a list from the mirrors given through
+`download_all`, largest first as skl does, into sinks that only count,
+so a sweep measures the network and not importing. It prints the time,
+and files, bytes and the last finish per origin; `--trace FILE` writes
+each file's finish time, size and origin.
 
 ## Instrumentation
 
-An environment variable makes the download stage trace each file
-(start, end, origin, bytes) and each origin (connections opened,
-strikes, `404`s), to see idle gaps and stragglers, not only the total.
-Baseline: `curl --parallel --parallel-max N` on the same URLs.
+Still to do: the download stage itself tracing each file's start and
+each origin's connections, strikes and `404`s (the example only sees
+finishes). Baseline: `curl --parallel --parallel-max N` on the same
+URLs.
 
 ## Sweeps
 
@@ -82,6 +95,11 @@ connections per origin (for 4: 4×1, 2×2, 1×4); the current behaviour
 as baseline. Each configuration about 5 times, interleaved with the
 others; median and range are recorded, with the decision, in
 DECISIONS.md.
+
+First check of the setup (one run each, current scheduling): the small
+files at 20 ms RTT and 500 Mbit/s take 24.0 s from one mirror with
+`-j1` and 12.05 s from two equal mirrors with `-j2`, as the round trips
+predict.
 
 ## Real mirrors
 
