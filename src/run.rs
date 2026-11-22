@@ -66,7 +66,7 @@ pub fn run(
     let filters = sandbox::package_code_filters()
         .context("building seccomp filters")?
         .iter()
-        .map(|program| pipe_holding(program))
+        .map(|program| fds::holding("skl-seccomp", program))
         .collect::<Result<Vec<OwnedFd>>>()?;
     let filter_fds: Vec<BorrowedFd> = filters.iter().map(|f| f.as_fd()).collect();
     let mut cmd = bwrap::image_command(&bwrap, image, CAPS, &filter_fds, options.files)?;
@@ -249,17 +249,6 @@ impl Drop for Snapshot {
             eprintln!("warning: {e:#}");
         }
     }
-}
-
-/// A pipe that holds `data`, with the write end closed. `data` must fit in
-/// the pipe's buffer (64 KiB by default).
-fn pipe_holding(data: &[u8]) -> Result<OwnedFd> {
-    use rustix::pipe::{PipeFlags, pipe_with};
-    let (r, w) = pipe_with(PipeFlags::CLOEXEC).context("creating pipe")?;
-    std::fs::File::from(w)
-        .write_all(data)
-        .context("writing to pipe")?;
-    Ok(r)
 }
 
 #[cfg(test)]

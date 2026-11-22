@@ -751,6 +751,9 @@ are in BUGS.md.
   uses to report exec errors. The worker closes every other fd except
   stdio before confining itself, since Landlock and seccomp don't affect
   fds already open.
+- Data that bwrap reads from an fd (seccomp filters, files put in the
+  image) is in a memfd (`fds::holding`). Rejected: a pipe, which holds
+  only 64 KiB unless something reads it while it is written.
 - A worker's stderr (panic messages) is a pipe, non-blocking on the
   worker's side, that the supervisor reads after the worker exits. It
   prints the output with control characters escaped and each line

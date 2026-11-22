@@ -145,7 +145,7 @@ pub(crate) fn command(
 /// A command that runs `bwrap` with the directory `image` (an fd) as the
 /// root, read-write, and executes the arguments appended to it there
 /// (searched in the `PATH` given to bwrap). `filters` are seccomp programs
-/// for the process to load (fds of a file or pipe holding raw BPF).
+/// for the process to load (fds holding raw BPF, such as [`crate::fds::holding`]).
 /// `files` are put read-only at their paths, with the content read from
 /// the fds. The child must inherit `image`, `filters` and the fds of
 /// `files` (see [`crate::fds::inherit`]).

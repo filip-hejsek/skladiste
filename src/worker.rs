@@ -709,7 +709,9 @@ fn run(args: impl Iterator<Item = OsString>, out: &mut BufWriter<File>) -> Resul
         }
     }
     let inherited: Vec<RawFd> = dirs.iter().filter_map(|d| d.clone().err()).collect();
-    close_other_fds(&inherited)?;
+    // Landlock and seccomp don't restrict fds that are already open, so a
+    // stray inherited one could bypass the sandbox.
+    fds::close_other(&inherited)?;
     let dirs = dirs
         .into_iter()
         .map(|dir| match dir {
@@ -749,30 +751,6 @@ fn insecure_option() -> Result<bool> {
     } else {
         bail!("this build of skl can't turn off sandboxing (needs the `insecure` feature)")
     }
-}
-
-/// Close every fd except stdio and `keep`. Landlock and seccomp don't
-/// restrict fds that are already open, so a stray inherited one could
-/// bypass the sandbox.
-fn close_other_fds(keep: &[RawFd]) -> Result<()> {
-    let close = |first: u32, last: u32| {
-        // SAFETY: no Rust object owns these fds yet.
-        let r = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
-        if r != 0 {
-            return Err(io::Error::last_os_error()).context("closing inherited fds");
-        }
-        Ok(())
-    };
-    let mut keep: Vec<u32> = keep.iter().map(|&fd| fd as u32).collect();
-    keep.sort_unstable();
-    let mut first = 3;
-    for fd in keep {
-        if fd > first {
-            close(first, fd - 1)?;
-        }
-        first = fd + 1;
-    }
-    close(first, u32::MAX)
 }
 
 /// Worker side of streaming blobs: sends contents to the supervisor

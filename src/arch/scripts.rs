@@ -17,8 +17,6 @@
 //! hooks from the system before installing, and a new image has none.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::{Seek, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::ExitStatus;
 
@@ -30,6 +28,7 @@ use crate::arch::hooks::{self, Hook, When};
 use crate::arch::{ArchSection, SECTION, repo, version};
 use crate::btrfs;
 use crate::diff::{self, Change};
+use crate::fds;
 use crate::install;
 use crate::manifest::{EntryKind, Hash, Package, Section};
 use crate::resolve;
@@ -318,7 +317,7 @@ pub fn build(
 /// Run the code of `plan` in the image whose root is `image`, and save
 /// what it changed as a synthetic package.
 fn run_code(workers: &Workers, store: &Store, plan: &Plan, image: OwnedFd) -> Result<Ran> {
-    let driver = memfd_holding(plan.driver().as_bytes())?;
+    let driver = fds::holding("skl-driver", plan.driver().as_bytes())?;
     let scripts = plan
         .scripts
         .iter()
@@ -379,16 +378,6 @@ fn run_code(workers: &Workers, store: &Store, plan: &Plan, image: OwnedFd) -> Re
         stats: captured.stats,
         snapshot_removal: captured.snapshot_removal,
     })
-}
-
-/// A memfd holding `data`, at offset 0.
-fn memfd_holding(data: &[u8]) -> Result<File> {
-    let fd = rustix::fs::memfd_create("skl-driver", rustix::fs::MemfdFlags::CLOEXEC)
-        .context("creating a memfd")?;
-    let mut file = File::from(fd);
-    file.write_all(data)?;
-    file.rewind()?;
-    Ok(file)
 }
 
 #[cfg(test)]
